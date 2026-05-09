@@ -1,4 +1,14 @@
-"""교실 및 특별실 관리 화면"""
+"""
+교실 및 특별실 관리 화면
+
+Room 테이블의 CRUD 를 제공합니다.
+교실명·유형·수용인원·층·비고를 입력해 추가하고, 목록에서 선택해 삭제합니다.
+
+교실 유형 (ROOM_TYPES):
+  일반교실을 기본으로, 과학실·음악실·미술실·체육관·컴퓨터실·어학실·도서관·기타를 지원합니다.
+  교과목의 needs_special_room=True 이면 특별실이 필요하다는 의미이지만,
+  현재 자동 생성 알고리즘에서는 preferred_room 을 통한 배정만 지원합니다.
+"""
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QSpinBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -10,12 +20,15 @@ from database.connection import get_session
 from database.models import Room
 
 BTN_PRIMARY = "background:#1B4F8A; color:white; border-radius:4px; padding:6px 14px; font-weight:bold;"
-BTN_DANGER = "background:#C0392B; color:white; border-radius:4px; padding:6px 14px;"
+BTN_DANGER  = "background:#C0392B; color:white; border-radius:4px; padding:6px 14px;"
 
+# 지원하는 교실 유형 목록
 ROOM_TYPES = ["일반", "과학실", "음악실", "미술실", "체육관", "컴퓨터실", "어학실", "도서관", "기타"]
 
 
 class RoomSetupWidget(QWidget):
+    """교실·특별실 관리 위젯."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
@@ -36,8 +49,10 @@ class RoomSetupWidget(QWidget):
         f_layout = QVBoxLayout(frame)
         f_layout.setContentsMargins(12, 10, 12, 10)
 
+        # ── 입력 폼 행 ────────────────────────────────────────────────
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("교실명:"))
+
         self.edit_name = QLineEdit()
         self.edit_name.setPlaceholderText("예: 1-1교실, 과학1실")
         self.edit_name.setFixedWidth(140)
@@ -45,6 +60,7 @@ class RoomSetupWidget(QWidget):
 
         row1.addSpacing(8)
         row1.addWidget(QLabel("유형:"))
+
         self.cb_type = QComboBox()
         for t in ROOM_TYPES:
             self.cb_type.addItem(t)
@@ -53,6 +69,7 @@ class RoomSetupWidget(QWidget):
 
         row1.addSpacing(8)
         row1.addWidget(QLabel("수용인원:"))
+
         self.spin_cap = QSpinBox()
         self.spin_cap.setRange(1, 200)
         self.spin_cap.setValue(30)
@@ -61,6 +78,7 @@ class RoomSetupWidget(QWidget):
 
         row1.addSpacing(8)
         row1.addWidget(QLabel("층:"))
+
         self.spin_floor = QSpinBox()
         self.spin_floor.setRange(1, 10)
         self.spin_floor.setValue(1)
@@ -69,6 +87,7 @@ class RoomSetupWidget(QWidget):
 
         row1.addSpacing(8)
         row1.addWidget(QLabel("비고:"))
+
         self.edit_notes = QLineEdit()
         self.edit_notes.setFixedWidth(140)
         row1.addWidget(self.edit_notes)
@@ -80,6 +99,7 @@ class RoomSetupWidget(QWidget):
         row1.addStretch()
         f_layout.addLayout(row1)
 
+        # ── 교실 목록 테이블 ──────────────────────────────────────────
         self.tbl = QTableWidget(0, 6)
         self.tbl.setHorizontalHeaderLabels(["ID", "교실명", "유형", "수용", "층", "비고"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -97,8 +117,10 @@ class RoomSetupWidget(QWidget):
         layout.addStretch()
 
     def _load_data(self):
+        """DB 에서 교실 목록을 읽어 테이블을 갱신합니다."""
         session = get_session()
         try:
+            # 유형 → 교실명 순으로 정렬해 특별실과 일반교실을 구분해 표시합니다.
             rooms = session.query(Room).order_by(Room.room_type, Room.name).all()
             self.tbl.setRowCount(len(rooms))
             for row, r in enumerate(rooms):
@@ -112,13 +134,16 @@ class RoomSetupWidget(QWidget):
             session.close()
 
     def refresh(self):
+        """외부에서 호출해 데이터를 갱신합니다."""
         self._load_data()
 
     def _add_room(self):
+        """입력 폼으로 교실을 DB 에 추가합니다."""
         name = self.edit_name.text().strip()
         if not name:
             QMessageBox.warning(self, "입력 오류", "교실명을 입력해 주세요.")
             return
+
         session = get_session()
         try:
             r = Room(
@@ -137,10 +162,12 @@ class RoomSetupWidget(QWidget):
             session.close()
 
     def _del_room(self):
+        """선택된 교실을 삭제합니다."""
         row = self.tbl.currentRow()
         if row < 0:
             QMessageBox.information(self, "안내", "삭제할 교실을 선택해 주세요.")
             return
+
         rid = int(self.tbl.item(row, 0).text())
         session = get_session()
         try:

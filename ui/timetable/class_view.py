@@ -1,4 +1,20 @@
-"""반별 시간표 조회 화면 (Mode A + Mode B 탭)"""
+"""
+반별 시간표 조회 화면
+
+두 개의 탭으로 구성됩니다:
+  Mode A — 요일×교시 (TimetableGridA):
+    선택한 반의 주간 시간표를 5열(요일) × N행(교시) 그리드로 표시합니다.
+    셀 더블클릭 시 EditDialog 를 열어 직접 수정 또는 변경 신청을 처리합니다.
+
+  Mode B — 교시×학반 (TimetableGridB):
+    선택한 요일의 모든 반 시간표를 교시별로 비교할 수 있습니다.
+    (편집 기능 없음)
+
+편집 처리 흐름:
+  1. 셀 더블클릭 → EditDialog 표시
+  2. '직접 수정' 선택 → TimetableEntry 즉시 업데이트 + 변경 이력 기록
+  3. '변경 신청' 선택 → TimetableChangeRequest 생성 (pending 상태)
+"""
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QPushButton, QTabWidget, QFrame, QMessageBox
@@ -7,20 +23,22 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from database.connection import get_session
 from database.models import (
-    SchoolClass, Grade, TimetableEntry, AcademicTerm
+    SchoolClass, Grade, TimetableEntry, AcademicTerm,
 )
 from .neis_grid import TimetableGridA, TimetableGridB
 from .edit_dialog import EditDialog
 from core.change_logger import log_entry_update
-import json
 
 DAYS_KR = ["월", "화", "수", "목", "금"]
 
 
 class ClassTimetableView(QWidget):
+    """반별 시간표 조회 및 편집 위젯."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._entries_by_slot: dict = {}  # (day, period) -> TimetableEntry
+        # (day, period) → TimetableEntry 매핑. 더블클릭 시 빠른 조회에 사용합니다.
+        self._entries_by_slot: dict = {}
         self._init_ui()
 
     def _init_ui(self):
@@ -28,13 +46,12 @@ class ClassTimetableView(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # 타이틀
         title = QLabel("시간표 조회")
         title.setFont(QFont("", 14, QFont.Weight.Bold))
         title.setStyleSheet("color: #1B4F8A;")
         layout.addWidget(title)
 
-        # 필터 바
+        # ── 필터 바 ───────────────────────────────────────────────────
         filter_bar = QFrame()
         filter_bar.setStyleSheet("background:#F0F4FA; border-radius:6px; padding:4px;")
         fb_layout = QHBoxLayout(filter_bar)
@@ -69,17 +86,19 @@ class ClassTimetableView(QWidget):
 
         layout.addWidget(filter_bar)
 
-        # 탭
+        # ── 탭 위젯 ───────────────────────────────────────────────────
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
             QTabBar::tab { min-width:120px; padding:8px 12px; }
             QTabBar::tab:selected { background:#1B4F8A; color:white; font-weight:bold; }
         """)
 
+        # Mode A: 요일×교시 그리드 (편집 가능)
         self.grid_a = TimetableGridA()
         self.grid_a.slot_double_clicked.connect(self._on_slot_double_clicked)
         self.tabs.addTab(self.grid_a, "모드 A  — 요일×교시 (학반별 주간)")
 
+        # Mode B: 교시×학반 그리드 (조회 전용)
         self.grid_b = TimetableGridB()
         self.tabs.addTab(self.grid_b, "모드 B  — 교시×학반 (1일 전체)")
 
@@ -88,9 +107,9 @@ class ClassTimetableView(QWidget):
         self._populate_combos()
 
     def _populate_combos(self):
+        """DB 에서 학기·학반 목록을 읽어 콤보박스를 채웁니다."""
         session = get_session()
         try:
-            # 학기
             self.cb_term.clear()
             terms = session.query(AcademicTerm).order_by(
                 AcademicTerm.year.desc(), AcademicTerm.semester.desc()
@@ -100,7 +119,6 @@ class ClassTimetableView(QWidget):
             if not terms:
                 self.cb_term.addItem("(학기 없음)", None)
 
-            # 학반
             self.cb_class.clear()
             classes = (
                 session.query(SchoolClass)
@@ -116,10 +134,12 @@ class ClassTimetableView(QWidget):
             session.close()
 
     def refresh(self):
+        """메인 윈도우에서 페이지 전환 시 호출됩니다. 콤보박스를 최신 데이터로 갱신합니다."""
         self._populate_combos()
 
     def _load(self):
-        term_id = self.cb_term.currentData()
+        """'조회' 버튼 클릭 시 선택된 학기·학반의 시간표를 두 탭 모두에 표시합니다."""
+        term_id  = self.cb_term.currentData()
         class_id = self.cb_class.currentData()
         if not term_id or not class_id:
             QMessageBox.warning(self, "조회 오류", "학기와 학반을 선택해 주세요.")
@@ -138,22 +158,30 @@ class ClassTimetableView(QWidget):
             session.close()
 
     def _load_mode_a(self, entries: list):
+        """
+        Mode A 그리드에 데이터를 로드합니다.
+        동시에 _entries_by_slot 딕셔너리를 갱신해 더블클릭 시 빠른 조회를 지원합니다.
+        """
         self._entries_by_slot.clear()
         data = []
         for e in entries:
             self._entries_by_slot[(e.day_of_week, e.period)] = e
             data.append({
-                "day": e.day_of_week,
-                "period": e.period,
+                "day":          e.day_of_week,
+                "period":       e.period,
                 "subject_name": e.subject.short_name if e.subject else "",
                 "teacher_name": e.teacher.name if e.teacher else "",
-                "color_hex": e.subject.color_hex if e.subject else "#FFFFFF",
-                "entry_id": e.id,
+                "color_hex":    e.subject.color_hex if e.subject else "#FFFFFF",
+                "entry_id":     e.id,
             })
         self.grid_a.load(data)
 
     def _load_mode_b(self, session, term_id: int):
-        day_idx = self.cb_day.currentIndex() + 1   # 1~5
+        """
+        Mode B 그리드에 선택 요일의 전체 학반 데이터를 로드합니다.
+        cb_day 콤보박스의 선택 인덱스(0~4)를 요일(1~5)로 변환합니다.
+        """
+        day_idx = self.cb_day.currentIndex() + 1   # 0-indexed → 1-indexed
 
         classes = (
             session.query(SchoolClass)
@@ -175,41 +203,48 @@ class ClassTimetableView(QWidget):
                 period_map[e.period] = {
                     "subject_name": e.subject.short_name if e.subject else "",
                     "teacher_name": e.teacher.name if e.teacher else "",
-                    "color_hex": e.subject.color_hex if e.subject else "#FFFFFF",
+                    "color_hex":    e.subject.color_hex if e.subject else "#FFFFFF",
                 }
             entries_by_class[cls.display_name] = period_map
 
         self.grid_b.load(class_names, entries_by_class)
 
     def _on_slot_double_clicked(self, day: int, period: int):
+        """
+        Mode A 셀 더블클릭 시 처리합니다.
+        EditDialog 에서 직접 수정 또는 변경 신청 중 하나를 선택합니다.
+        """
         entry = self._entries_by_slot.get((day, period))
         if entry is None:
-            return
+            return  # 빈 슬롯은 편집하지 않습니다.
 
         dlg = EditDialog(entry, self)
         if dlg.exec() != EditDialog.DialogCode.Accepted:
             return
 
         changes = dlg.get_changes()
-        if not any([changes["new_subject_id"], changes["new_teacher_id"],
-                    changes["new_room_id"]]):
+        # 아무 항목도 변경하지 않았으면 처리하지 않습니다.
+        if not any([changes["new_subject_id"], changes["new_teacher_id"], changes["new_room_id"]]):
             return
 
         session = get_session()
         try:
-            e = session.query(TimetableEntry).get(entry.id)
+            # SQLAlchemy 2.0 방식: session.get(Model, pk)
+            e = session.get(TimetableEntry, entry.id)
             if e is None:
                 return
 
+            # 변경 전 스냅샷을 이력 기록용으로 저장합니다.
             old_data = {
-                "day": e.day_of_week,
-                "period": e.period,
+                "day":        e.day_of_week,
+                "period":     e.period,
                 "subject_id": e.subject_id,
                 "teacher_id": e.teacher_id,
-                "room_id": e.room_id,
+                "room_id":    e.room_id,
             }
 
             if dlg.direct_edit:
+                # 직접 수정: 선택된 변경 항목만 즉시 반영합니다.
                 if changes["new_subject_id"] is not None:
                     e.subject_id = changes["new_subject_id"]
                 if changes["new_teacher_id"] is not None:
@@ -221,6 +256,8 @@ class ClassTimetableView(QWidget):
                 session.commit()
                 QMessageBox.information(self, "수정 완료", "시간표가 수정되었습니다.")
             else:
+                # 변경 신청: TimetableChangeRequest 를 생성합니다.
+                # new_*_id 가 None 이면 현재 값을 유지합니다.
                 from database.models import TimetableChangeRequest
                 req = TimetableChangeRequest(
                     timetable_entry_id=e.id,
@@ -234,6 +271,6 @@ class ClassTimetableView(QWidget):
                 session.commit()
                 QMessageBox.information(self, "신청 완료", "변경이 신청되었습니다. 승인 후 반영됩니다.")
 
-            self._load()
+            self._load()  # 화면을 최신 상태로 갱신합니다.
         finally:
             session.close()

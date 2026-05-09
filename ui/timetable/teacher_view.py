@@ -1,4 +1,13 @@
-"""교사별 시간표 조회 화면 (Mode A)"""
+"""
+교사별 시간표 조회 화면 (Mode A)
+
+선택한 교사의 주간 시간표를 TimetableGridA 로 표시합니다.
+교사 시간표에서는 '교사명' 대신 '학반명'이 셀 하단에 표시됩니다.
+(해당 교사가 어느 반을 가르치는지 한눈에 파악할 수 있습니다.)
+
+편집 흐름은 ClassTimetableView 와 동일합니다:
+  셀 더블클릭 → EditDialog → 직접 수정 또는 변경 신청
+"""
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QPushButton, QFrame, QMessageBox
@@ -12,8 +21,11 @@ from core.change_logger import log_entry_update
 
 
 class TeacherTimetableView(QWidget):
+    """교사별 시간표 조회 및 편집 위젯."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        # (day, period) → TimetableEntry 매핑
         self._entries_by_slot: dict = {}
         self._init_ui()
 
@@ -27,6 +39,7 @@ class TeacherTimetableView(QWidget):
         title.setStyleSheet("color: #1B4F8A;")
         layout.addWidget(title)
 
+        # ── 필터 바 ───────────────────────────────────────────────────
         filter_bar = QFrame()
         filter_bar.setStyleSheet("background:#F0F4FA; border-radius:6px;")
         fb = QHBoxLayout(filter_bar)
@@ -53,6 +66,7 @@ class TeacherTimetableView(QWidget):
 
         layout.addWidget(filter_bar)
 
+        # ── 시간표 그리드 ─────────────────────────────────────────────
         self.grid = TimetableGridA()
         self.grid.slot_double_clicked.connect(self._on_slot_double_clicked)
         layout.addWidget(self.grid)
@@ -60,6 +74,7 @@ class TeacherTimetableView(QWidget):
         self._populate_combos()
 
     def _populate_combos(self):
+        """DB 에서 학기·교사 목록을 읽어 콤보박스를 채웁니다."""
         session = get_session()
         try:
             self.cb_term.clear()
@@ -79,10 +94,12 @@ class TeacherTimetableView(QWidget):
             session.close()
 
     def refresh(self):
+        """메인 윈도우에서 페이지 전환 시 호출됩니다."""
         self._populate_combos()
 
     def _load(self):
-        term_id = self.cb_term.currentData()
+        """'조회' 버튼 클릭 시 선택된 학기·교사의 시간표를 표시합니다."""
+        term_id    = self.cb_term.currentData()
         teacher_id = self.cb_teacher.currentData()
         if not term_id or not teacher_id:
             QMessageBox.warning(self, "조회 오류", "학기와 교사를 선택해 주세요.")
@@ -100,18 +117,23 @@ class TeacherTimetableView(QWidget):
             for e in entries:
                 self._entries_by_slot[(e.day_of_week, e.period)] = e
                 data.append({
-                    "day": e.day_of_week,
-                    "period": e.period,
+                    "day":          e.day_of_week,
+                    "period":       e.period,
                     "subject_name": e.subject.short_name if e.subject else "",
+                    # 교사 시간표에서는 교사명 대신 담당 학반명을 표시합니다.
                     "teacher_name": e.school_class.display_name if e.school_class else "",
-                    "color_hex": e.subject.color_hex if e.subject else "#FFFFFF",
-                    "entry_id": e.id,
+                    "color_hex":    e.subject.color_hex if e.subject else "#FFFFFF",
+                    "entry_id":     e.id,
                 })
             self.grid.load(data)
         finally:
             session.close()
 
     def _on_slot_double_clicked(self, day: int, period: int):
+        """
+        셀 더블클릭 시 처리합니다.
+        ClassTimetableView._on_slot_double_clicked 와 동일한 로직입니다.
+        """
         entry = self._entries_by_slot.get((day, period))
         if entry is None:
             return
@@ -121,22 +143,22 @@ class TeacherTimetableView(QWidget):
             return
 
         changes = dlg.get_changes()
-        if not any([changes["new_subject_id"], changes["new_teacher_id"],
-                    changes["new_room_id"]]):
+        if not any([changes["new_subject_id"], changes["new_teacher_id"], changes["new_room_id"]]):
             return
 
         session = get_session()
         try:
-            e = session.query(TimetableEntry).get(entry.id)
+            # SQLAlchemy 2.0 방식: session.get(Model, pk)
+            e = session.get(TimetableEntry, entry.id)
             if e is None:
                 return
 
             old_data = {
-                "day": e.day_of_week,
-                "period": e.period,
+                "day":        e.day_of_week,
+                "period":     e.period,
                 "subject_id": e.subject_id,
                 "teacher_id": e.teacher_id,
-                "room_id": e.room_id,
+                "room_id":    e.room_id,
             }
 
             if dlg.direct_edit:
