@@ -16,3 +16,9 @@ feedback.json
 
 # Claude Code local settings
 .claude/
+
+# Build outputs (PyInstaller)
+build/
+dist/
+installer_output/
+*.spec

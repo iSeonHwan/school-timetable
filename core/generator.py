@@ -46,7 +46,14 @@ def generate_timetable(
         )
         if result is not None:
             # 기존 시간표 삭제 후 저장
+            from core.change_logger import log_entry_create, log_entry_delete
+
+            old_entries = session.query(TimetableEntry).filter_by(term_id=term_id).all()
+            for old_entry in old_entries:
+                log_entry_delete(session, old_entry)
             session.query(TimetableEntry).filter_by(term_id=term_id).delete()
+
+            new_entries = []
             for r in result:
                 entry = TimetableEntry(
                     term_id=term_id,
@@ -58,6 +65,12 @@ def generate_timetable(
                     period=r["period"],
                 )
                 session.add(entry)
+                new_entries.append(entry)
+            session.flush()
+
+            for entry in new_entries:
+                log_entry_create(session, entry)
+
             session.commit()
             return True, f"시간표 생성 완료 (시도 {attempt + 1}회)"
 

@@ -1,7 +1,14 @@
 PyQt6>=6.4.0
 SQLAlchemy>=2.0.0
 psycopg2-binary>=2.9.0
+reportlab>=4.0.0
+openpyxl>=3.1.0
 
 # dev / test
 pytest>=8.0.0
 pytest-qt>=4.4.0
+
+# build / installer
+pyinstaller>=6.0.0
+Pillow>=11.0.0     # for icon generation
+dmgbuild>=1.6.0    # for macOS DMG (macOS only)

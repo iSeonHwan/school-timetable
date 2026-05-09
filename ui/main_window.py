@@ -18,6 +18,11 @@ from ui.setup.subject_setup import SubjectSetupWidget
 from ui.setup.room_setup import RoomSetupWidget
 from ui.timetable.class_view import ClassTimetableView
 from ui.timetable.teacher_view import TeacherTimetableView
+from ui.timetable.request_list import ChangeRequestWidget
+from ui.calendar.calendar_widget import CalendarWidget
+from ui.history.history_view import HistoryWidget
+from ui.export.pdf_export import PDFExportDialog
+from ui.export.neis_export import NEISExportDialog
 from ui.feedback import FeedbackDialog
 
 SIDEBAR_W = 200
@@ -333,6 +338,27 @@ class MainWindow(QMainWindow):
         add_nav("반별 시간표", 4)
         add_nav("교사별 시간표", 5)
 
+        # 변경 관리
+        add_section("변경 관리")
+        add_nav("변경 신청/결재", 6)
+
+        # 기타 관리
+        add_section("기타 관리")
+        add_nav("학사일정", 7)
+        add_nav("변경 이력", 8)
+
+        # 내보내기
+        add_section("내보내기")
+        btn_pdf = QPushButton("  📄 PDF 출력")
+        btn_pdf.setStyleSheet(NAV_BTN_STYLE)
+        btn_pdf.clicked.connect(self._export_pdf)
+        sb_layout.addWidget(btn_pdf)
+
+        btn_neis = QPushButton("  📊 NEIS 내보내기")
+        btn_neis.setStyleSheet(NAV_BTN_STYLE)
+        btn_neis.clicked.connect(self._export_neis)
+        sb_layout.addWidget(btn_neis)
+
         sb_layout.addStretch()
 
         # 피드백
@@ -359,10 +385,14 @@ class MainWindow(QMainWindow):
         self.page_room = RoomSetupWidget()
         self.page_class_view = ClassTimetableView()
         self.page_teacher_view = TeacherTimetableView()
+        self.page_request_list = ChangeRequestWidget()
+        self.page_calendar = CalendarWidget()
+        self.page_history = HistoryWidget()
 
         for page in [
             self.page_class, self.page_teacher, self.page_subject, self.page_room,
             self.page_class_view, self.page_teacher_view,
+            self.page_request_list, self.page_calendar, self.page_history,
         ]:
             self.stack.addWidget(page)
 
@@ -375,11 +405,17 @@ class MainWindow(QMainWindow):
         for i, btn in enumerate(self._nav_buttons):
             btn.setChecked(i == idx)
 
-        # 조회 페이지 진입 시 콤보박스 갱신
+        # 페이지 진입 시 데이터 갱신
         if idx == 4:
             self.page_class_view.refresh()
         elif idx == 5:
             self.page_teacher_view.refresh()
+        elif idx == 6:
+            self.page_request_list.refresh()
+        elif idx == 7:
+            self.page_calendar.refresh()
+        elif idx == 8:
+            self.page_history.refresh()
 
     def _run_generate(self):
         dlg = GenerateDialog(self)
@@ -429,6 +465,12 @@ class MainWindow(QMainWindow):
             )
         finally:
             session.close()
+
+    def _export_pdf(self):
+        PDFExportDialog(self).exec()
+
+    def _export_neis(self):
+        NEISExportDialog(self).exec()
 
     def _open_feedback(self):
         FeedbackDialog(self).exec()

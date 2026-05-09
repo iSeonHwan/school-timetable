@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QLabel, QFrame, QHBoxLayout, QHeaderView, QSizePolicy
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QBrush
 
 DAYS_KR = ["월", "화", "수", "목", "금"]
@@ -72,9 +72,11 @@ def _make_empty_item() -> QTableWidgetItem:
 class TimetableGridA(QWidget):
     """Mode A: 요일(열) × 교시(행) — 특정 학반의 주간 시간표"""
 
+    slot_double_clicked = pyqtSignal(int, int)  # day, period
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._entries: dict = {}   # (day, period) -> {subject, teacher, color}
+        self._entries: list = []   # list of {day, period, ...}
         self._max_periods = 7
         self._init_ui()
 
@@ -111,9 +113,15 @@ class TimetableGridA(QWidget):
         """)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         layout.addWidget(self.table)
         self._fill_empty()
+
+    def _on_cell_double_clicked(self, row: int, col: int):
+        day = col + 1
+        period = row + 1
+        self.slot_double_clicked.emit(day, period)
 
     def _style_headers(self):
         vh = self.table.verticalHeader()
@@ -135,8 +143,9 @@ class TimetableGridA(QWidget):
 
     def load(self, entries: list[dict], max_periods: int = 7):
         """
-        entries: list of {day(1~5), period(1~N), subject_name, teacher_name, color_hex}
+        entries: list of {day(1~5), period(1~N), subject_name, teacher_name, color_hex, entry_id}
         """
+        self._entries = entries
         self._max_periods = max_periods
         self.table.setRowCount(max_periods)
         self.table.setVerticalHeaderLabels(PERIOD_LABELS[:max_periods])

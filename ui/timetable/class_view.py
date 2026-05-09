@@ -10,6 +10,9 @@ from database.models import (
     SchoolClass, Grade, TimetableEntry, AcademicTerm
 )
 from .neis_grid import TimetableGridA, TimetableGridB
+from .edit_dialog import EditDialog
+from core.change_logger import log_entry_update
+import json
 
 DAYS_KR = ["월", "화", "수", "목", "금"]
 
@@ -17,6 +20,7 @@ DAYS_KR = ["월", "화", "수", "목", "금"]
 class ClassTimetableView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._entries_by_slot: dict = {}  # (day, period) -> TimetableEntry
         self._init_ui()
 
     def _init_ui(self):
@@ -73,6 +77,7 @@ class ClassTimetableView(QWidget):
         """)
 
         self.grid_a = TimetableGridA()
+        self.grid_a.slot_double_clicked.connect(self._on_slot_double_clicked)
         self.tabs.addTab(self.grid_a, "모드 A  — 요일×교시 (학반별 주간)")
 
         self.grid_b = TimetableGridB()
@@ -133,14 +138,17 @@ class ClassTimetableView(QWidget):
             session.close()
 
     def _load_mode_a(self, entries: list):
+        self._entries_by_slot.clear()
         data = []
         for e in entries:
+            self._entries_by_slot[(e.day_of_week, e.period)] = e
             data.append({
                 "day": e.day_of_week,
                 "period": e.period,
                 "subject_name": e.subject.short_name if e.subject else "",
                 "teacher_name": e.teacher.name if e.teacher else "",
                 "color_hex": e.subject.color_hex if e.subject else "#FFFFFF",
+                "entry_id": e.id,
             })
         self.grid_a.load(data)
 
@@ -172,3 +180,60 @@ class ClassTimetableView(QWidget):
             entries_by_class[cls.display_name] = period_map
 
         self.grid_b.load(class_names, entries_by_class)
+
+    def _on_slot_double_clicked(self, day: int, period: int):
+        entry = self._entries_by_slot.get((day, period))
+        if entry is None:
+            return
+
+        dlg = EditDialog(entry, self)
+        if dlg.exec() != EditDialog.DialogCode.Accepted:
+            return
+
+        changes = dlg.get_changes()
+        if not any([changes["new_subject_id"], changes["new_teacher_id"],
+                    changes["new_room_id"]]):
+            return
+
+        session = get_session()
+        try:
+            e = session.query(TimetableEntry).get(entry.id)
+            if e is None:
+                return
+
+            old_data = {
+                "day": e.day_of_week,
+                "period": e.period,
+                "subject_id": e.subject_id,
+                "teacher_id": e.teacher_id,
+                "room_id": e.room_id,
+            }
+
+            if dlg.direct_edit:
+                if changes["new_subject_id"] is not None:
+                    e.subject_id = changes["new_subject_id"]
+                if changes["new_teacher_id"] is not None:
+                    e.teacher_id = changes["new_teacher_id"]
+                if changes["new_room_id"] is not None:
+                    e.room_id = changes["new_room_id"]
+
+                log_entry_update(session, e, old_data)
+                session.commit()
+                QMessageBox.information(self, "수정 완료", "시간표가 수정되었습니다.")
+            else:
+                from database.models import TimetableChangeRequest
+                req = TimetableChangeRequest(
+                    timetable_entry_id=e.id,
+                    new_subject_id=changes["new_subject_id"] or e.subject_id,
+                    new_teacher_id=changes["new_teacher_id"] or e.teacher_id,
+                    new_room_id=changes["new_room_id"] or e.room_id,
+                    reason=changes["reason"],
+                    requested_by="",
+                )
+                session.add(req)
+                session.commit()
+                QMessageBox.information(self, "신청 완료", "변경이 신청되었습니다. 승인 후 반영됩니다.")
+
+            self._load()
+        finally:
+            session.close()

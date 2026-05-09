@@ -1,6 +1,7 @@
+from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Boolean, ForeignKey,
-    Date, Text, CheckConstraint
+    Date, DateTime, Text, CheckConstraint, func
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -20,6 +21,7 @@ class AcademicTerm(Base):
     is_current = Column(Boolean, default=False)
 
     timetable_entries = relationship("TimetableEntry", back_populates="term", cascade="all, delete-orphan")
+    school_events = relationship("SchoolEvent", back_populates="term", cascade="all, delete-orphan")
 
     def __str__(self):
         return f"{self.year}년 {self.semester}학기"
@@ -132,6 +134,8 @@ class TimetableEntry(Base):
     day_of_week = Column(Integer, nullable=False)   # 1=월 … 5=금
     period = Column(Integer, nullable=False)         # 1~7
     is_fixed = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     term = relationship("AcademicTerm", back_populates="timetable_entries")
     school_class = relationship("SchoolClass", back_populates="timetable_entries")
@@ -150,3 +154,58 @@ class TeacherConstraint(Base):
     constraint_type = Column(String(20), nullable=False)  # unavailable / preferred / avoid
 
     teacher = relationship("Teacher", back_populates="constraints")
+
+
+class SchoolEvent(Base):
+    __tablename__ = "school_events"
+
+    id = Column(Integer, primary_key=True)
+    term_id = Column(Integer, ForeignKey("academic_terms.id"), nullable=False)
+    title = Column(String(100), nullable=False)
+    event_type = Column(String(20), nullable=False, default="기타")  # 개교기념일, 시험, 축제, 방학, 공휴일, 행사, 기타
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    description = Column(Text, default="")
+    color_hex = Column(String(7), default="#E3F2FD")
+
+    term = relationship("AcademicTerm", back_populates="school_events")
+
+    def __str__(self):
+        return self.title
+
+
+class TimetableChangeLog(Base):
+    __tablename__ = "timetable_change_logs"
+
+    id = Column(Integer, primary_key=True)
+    timetable_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
+    term_id = Column(Integer, ForeignKey("academic_terms.id"), nullable=False)
+    school_class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=False)
+    change_type = Column(String(20), nullable=False)  # created, modified, deleted
+    details = Column(Text, default="")
+    changed_at = Column(DateTime, default=datetime.now)
+
+    term = relationship("AcademicTerm")
+    school_class = relationship("SchoolClass")
+    timetable_entry = relationship("TimetableEntry")
+
+
+class TimetableChangeRequest(Base):
+    __tablename__ = "timetable_change_requests"
+
+    id = Column(Integer, primary_key=True)
+    timetable_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=False)
+    new_subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=True)
+    new_teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True)
+    new_room_id = Column(Integer, ForeignKey("rooms.id"), nullable=True)
+    status = Column(String(20), nullable=False, default="pending")  # pending, approved, rejected
+    reason = Column(Text, default="")
+    requested_by = Column(String(30), default="")
+    requested_at = Column(DateTime, default=datetime.now)
+    approved_by = Column(String(30), default="")
+    approved_at = Column(DateTime, nullable=True)
+
+    timetable_entry = relationship("TimetableEntry")
+    new_subject = relationship("Subject", foreign_keys=[new_subject_id])
+    new_teacher = relationship("Teacher", foreign_keys=[new_teacher_id])
+    new_room = relationship("Room", foreign_keys=[new_room_id])
