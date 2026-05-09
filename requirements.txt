@@ -1,0 +1,7 @@
+PyQt6>=6.4.0
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# dev / test
+pytest>=8.0.0
+pytest-qt>=4.4.0
