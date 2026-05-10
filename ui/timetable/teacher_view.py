@@ -2,10 +2,21 @@
 교사별 시간표 조회 화면 (Mode A)
 
 선택한 교사의 주간 시간표를 TimetableGridA 로 표시합니다.
-교사 시간표에서는 '교사명' 대신 '학반명'이 셀 하단에 표시됩니다.
-(해당 교사가 어느 반을 가르치는지 한눈에 파악할 수 있습니다.)
+반별 시간표와 달리, 교사 시간표에서는 '교사명' 대신 '학반명'이 셀 하단에
+표시됩니다. (해당 교사가 어느 반을 가르치는지 한눈에 파악 가능)
 
-편집 흐름은 ClassTimetableView 와 동일합니다:
+데이터 의존성:
+  - 학기 콤보박스(cb_term): TermDialog 로 등록된 AcademicTerm
+  - 교사 콤보박스(cb_teacher): TeacherSetupWidget 에서 등록된 Teacher
+  - 시간표 데이터: GenerateWorker 로 생성된 TimetableEntry
+  - 페이지 전환 시 refresh() 로 콤보박스 최신 상태 유지
+
+중요: _load() 에서 TimetableEntry.teacher_id 로 필터링할 때, 한 교사가
+      여러 반에서 같은 교과를 가르치는 경우 모든 반의 수업이 표시됩니다.
+      각 셀의 하단 텍스트(teacher_name 필드)에는 school_class.display_name 이
+      들어가므로, 교사 입장에서 '지금 어느 반 수업인지'를 바로 알 수 있습니다.
+
+편집 흐름은 ClassTimetableView 와 동일:
   셀 더블클릭 → EditDialog → 직접 수정 또는 변경 신청
 """
 from PyQt6.QtWidgets import (

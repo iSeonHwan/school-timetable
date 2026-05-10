@@ -8,12 +8,24 @@
 
   Mode B — 교시×학반 (TimetableGridB):
     선택한 요일의 모든 반 시간표를 교시별로 비교할 수 있습니다.
-    (편집 기능 없음)
+    특정 요일에 학년 전체가 어떤 수업을 듣는지 한눈에 파악 가능합니다.
+    (조회 전용, 편집 기능 없음)
+
+데이터 의존성:
+  - 학기 콤보박스(cb_term): TermDialog(학기 추가) 또는 main_window._add_term()
+  - 학반 콤보박스(cb_class): ClassSetupWidget(편제 설정)에서 등록된 SchoolClass
+  - 시간표 그리드 데이터: GenerateWorker 로 생성된 TimetableEntry
+  - 페이지 전환 시 refresh() 로 콤보박스 최신 상태 유지
 
 편집 처리 흐름:
-  1. 셀 더블클릭 → EditDialog 표시
-  2. '직접 수정' 선택 → TimetableEntry 즉시 업데이트 + 변경 이력 기록
-  3. '변경 신청' 선택 → TimetableChangeRequest 생성 (pending 상태)
+  1. 셀 더블클릭 → EditDialog 표시 (현재 과목·교사·교실 정보 포함)
+  2. '직접 수정' 선택 → TimetableEntry 즉시 업데이트 + TimetableChangeLog 기록
+     (승인 절차 없이 즉시 반영. 담당자 권한 필요)
+  3. '변경 신청' 선택 → TimetableChangeRequest 생성 (status=pending)
+     (승인자에 의한 approve/reject 이후 반영)
+
+  직접 수정/변경 신청 모두 core/change_logger.py 의 log_entry_update() 로
+  변경 이력을 TimetableChangeLog 테이블에 기록합니다.
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,

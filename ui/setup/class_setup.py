@@ -5,12 +5,21 @@
   1. 학년 관리: 학년(Grade) 추가·삭제. 학년 번호와 표시명을 입력합니다.
   2. 반 관리: 반(SchoolClass) 추가·삭제. 학년을 선택한 뒤 반 번호와 표시명을 입력합니다.
 
-데이터 흐름:
-  입력 폼 → 버튼 클릭 → DB 저장(session) → _load_data() 로 테이블 갱신
+데이터 흐름 및 연결성:
+  이 페이지에서 등록한 학년·반 데이터는 TeacherSetupWidget, SubjectSetupWidget,
+  ClassTimetableView 등 후속 페이지에서 콤보박스 옵션으로 사용됩니다.
 
-주의:
-  - 학년 삭제 시 cascade 로 해당 학년의 모든 반도 삭제됩니다.
-  - 반 삭제 시 cascade 로 해당 반의 시수 배정·시간표도 삭제됩니다.
+  페이지 전환 시 main_window 의 _switch_page() 가 refresh() → _load_data() 를
+  호출하므로, 다른 페이지에서 이리저리 이동해도 항상 최신 데이터가 표시됩니다.
+
+  입력 폼 → 버튼 클릭 → DB 저장(session.commit()) → _load_data() 로 UI 갱신
+  → 다른 페이지 이동 시에도 refresh() 로 최신 목록 자동 반영
+
+Cascade 삭제 주의:
+  - 학년 삭제 시 해당 학년의 모든 반이 cascade 로 삭제됩니다.
+  - 반 삭제 시 해당 반의 시수 배정(SubjectClassAssignment)도 cascade 로 삭제됩니다.
+  - 따라서 데이터 입력 순서와 역순으로 삭제하는 것이 안전합니다.
+    (예: 시수 배정 삭제 → 반 삭제 → 학년 삭제)
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,

@@ -1,6 +1,25 @@
 """
 SQLAlchemy ORM 모델 정의
 
+데이터 입력 순서와 의존 관계 (Data Dependency Graph):
+  앱에서 데이터를 입력해야 하는 순서는 아래 관계 화살표를 따릅니다.
+  화살표 방향 = "먼저 입력되어야 함":
+
+    ① AcademicTerm (학기)  ──→  TimetableEntry (시간표)
+    ② Grade (학년)         ──→  SchoolClass (반)
+    ③ SchoolClass (반)     ──→  Teacher.homeroom_class_id (담임 학반)
+                            ──→  SubjectClassAssignment (시수 배정)
+                            ──→  TimetableEntry (시간표)
+    ④ Room (교실)          ──→  SchoolClass.homeroom_room_id (담임 교실)
+                            ──→  SubjectClassAssignment.preferred_room_id
+                            ──→  TimetableEntry.room_id
+    ⑤ Subject (교과목)     ──→  SubjectClassAssignment (시수 배정)
+    ⑥ Teacher (교사)       ──→  SubjectClassAssignment (시수 배정)
+                            ──→  TeacherConstraint (불가 시간)
+
+  즉, 권장 입력 순서:
+    학기 추가 → 학년/반 등록 → 교실 등록 → 교과목 등록 → 교사 등록 → 시수 배정 → 시간표 생성
+
 테이블 구조 요약:
   AcademicTerm          학년도/학기 (예: 2025년 1학기)
   Grade                 학년 (1학년, 2학년, 3학년)
@@ -15,13 +34,19 @@ SQLAlchemy ORM 모델 정의
   TimetableChangeLog    시간표 변경 이력 (생성/수정/삭제)
   TimetableChangeRequest  당일 시간표 변경 신청 (pending → approved/rejected)
 
-관계 다이어그램:
+ER 관계 다이어그램:
   Grade 1─* SchoolClass 1─* SubjectClassAssignment *─1 Subject
                                                     *─1 Teacher
   AcademicTerm 1─* TimetableEntry *─1 SchoolClass
                                   *─1 Subject
                                   *─1 Teacher
                                   *─1 Room (nullable)
+  Teacher 1─* TeacherConstraint
+
+Cascade 삭제 흐름:
+  Grade 삭제 → SchoolClass 삭제 → SubjectClassAssignment 삭제, TimetableEntry 삭제
+  AcademicTerm 삭제 → TimetableEntry 삭제, SchoolEvent 삭제
+  Teacher 삭제 → TeacherConstraint 삭제
 """
 from datetime import datetime
 from sqlalchemy import (

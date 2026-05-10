@@ -4,10 +4,20 @@
 Room 테이블의 CRUD 를 제공합니다.
 교실명·유형·수용인원·층·비고를 입력해 추가하고, 목록에서 선택해 삭제합니다.
 
+데이터 의존성:
+  이 페이지는 독립적입니다. 다른 페이지의 데이터에 의존하지 않으며,
+  Room 데이터는 시간표 생성 시 교실 배정, EditDialog 의 교실 변경 등에 사용됩니다.
+  페이지 전환 시 refresh() 로 최신 목록을 유지합니다.
+
 교실 유형 (ROOM_TYPES):
   일반교실을 기본으로, 과학실·음악실·미술실·체육관·컴퓨터실·어학실·도서관·기타를 지원합니다.
   교과목의 needs_special_room=True 이면 특별실이 필요하다는 의미이지만,
-  현재 자동 생성 알고리즘에서는 preferred_room 을 통한 배정만 지원합니다.
+  현재 자동 생성 알고리즘에서는 SubjectClassAssignment.preferred_room_id 를 통한
+  배정만 지원하며, needs_special_room 플래그는 참조하지 않습니다.
+
+향후 개선 가능성:
+  - 특별실이 필요한 교과목에 대해 자동으로 해당 유형의 교실만 필터링하여 배정
+  - 교실 수용인원(capacity)과 학급 인원을 비교하여 과밀 배정 방지
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,

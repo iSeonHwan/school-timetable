@@ -6,11 +6,25 @@
   2. 반별 교과 시수 배정: 학반·교과·교사·주당 시수를 연결하는
      SubjectClassAssignment 레코드를 관리합니다.
 
-PRESET_COLORS: 교과목 추가 시 순환하며 자동 색상을 할당합니다.
-사용자가 색상 버튼을 클릭하면 QColorDialog 로 직접 선택할 수 있습니다.
+데이터 의존성:
+  이 페이지는 세 가지 선행 데이터에 의존합니다:
+    - 학반 콤보박스(cb_class): ClassSetupWidget 에서 등록된 SchoolClass
+    - 교과 콤보박스(cb_subject): 이 페이지의 상단 섹션에서 등록된 Subject
+    - 교사 콤보박스(cb_teacher): TeacherSetupWidget 에서 등록된 Teacher
+
+  페이지 전환 시 refresh() → _load_data() 가 호출되어 모든 콤보박스가
+  최신 DB 데이터로 다시 채워집니다.
+
+  즉, 편제 설정에서 학반을 추가한 뒤 이 페이지로 오면 새 학반이 cb_class 에,
+  교사 관리에서 교사를 추가한 뒤 오면 새 교사가 cb_teacher 에 나타납니다.
+
+색상 관리:
+  PRESET_COLORS: 12색 파스텔 팔레트. _next_color() 로 순환하며 자동 할당.
+  사용자가 색상 버튼을 클릭하면 QColorDialog 로 직접 선택 가능.
 
 시수 배정 중복 처리:
   같은 (학반, 교과, 교사) 조합이 이미 존재하면 weekly_hours 만 업데이트합니다.
+  이는 실수로 중복 배정되는 것을 방지하면서도 시수 수정은 허용하는 설계입니다.
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,

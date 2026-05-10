@@ -1,6 +1,12 @@
 """
 시간표 자동 생성 알고리즘 — Greedy + Random Restart
 
+입력 데이터 (이 생성기가 의존하는 선행 데이터):
+  - SubjectClassAssignment: SubjectSetupWidget 에서 배정된 학반-교과-교사-시수
+  - TeacherConstraint (unavailable): TeacherSetupWidget 에서 설정된 교사 불가 시간
+  - Teacher.max_daily_classes: TeacherSetupWidget 에서 설정된 교사 일 최대 수업 수
+  → 이 데이터들이 모두 입력된 상태에서 GenerateDialog → GenerateWorker 를 통해 실행됩니다.
+
 알고리즘 개요:
   1. SubjectClassAssignment 에서 '수업 인스턴스(lesson)' 목록을 생성합니다.
      예) 수학 주당 3시간 → 동일 lesson 딕셔너리 3개 생성
@@ -8,22 +14,29 @@
   3. 각 수업 인스턴스를 하나씩 꺼내 다음 하드/소프트 제약을 모두 통과하는
      첫 번째 슬롯에 배치합니다 (그리디).
   4. 어떤 수업 인스턴스도 배치 불가하면 해당 시도를 실패로 처리하고
-     처음부터 다시 시도합니다 (랜덤 재시작).
-  5. max_retries 이내에 성공하면 기존 시간표를 삭제하고 새 시간표를 저장합니다.
+     처음부터 다시 시도합니다 (랜덤 재시작, 최대 30회).
+  5. max_retries 이내에 성공하면 기존 시간표를 삭제(TimetableChangeLog 기록 포함)하고
+     새 시간표를 저장합니다.
 
 하드 제약 (위반 시 해당 슬롯 건너뜀):
-  - 같은 반이 같은 슬롯에 두 수업을 가질 수 없음
-  - 같은 교사가 같은 슬롯에 두 수업을 가질 수 없음
-  - 같은 교실이 같은 슬롯에 두 수업에 쓰일 수 없음
-  - 교사가 '불가' 로 설정한 슬롯에는 배치하지 않음
+  - 같은 반이 같은 슬롯에 두 수업을 가질 수 없음 (class_conflict)
+  - 같은 교사가 같은 슬롯에 두 수업을 가질 수 없음 (teacher_conflict)
+  - 같은 교실이 같은 슬롯에 두 수업에 쓰일 수 없음 (room_conflict)
+  - 교사가 '불가' 로 설정한 슬롯에는 배치하지 않음 (teacher_unavailable)
 
 소프트 제약 (위반 시 해당 슬롯 건너뜀, 하드 제약처럼 처리):
-  - 교사의 일 최대 수업 수(max_daily_classes) 초과 불가
+  - 교사의 일 최대 수업 수(max_daily_classes) 초과 불가 (teacher_daily_max)
+
+제약 체크는 _try_generate() 내부에서 set 기반 O(1) 조회로 수행되므로
+수백 개 수업 인스턴스도 수 초 내에 처리 가능합니다.
 
 알고리즘 한계:
   - 시수 합계가 전체 슬롯 수를 초과하거나 교사 제약이 너무 많으면
     max_retries 이후 실패 메시지를 반환합니다.
-  - 교사별 공평한 시간 분배 등 추가 소프트 제약은 미구현 상태입니다.
+  - 교사별 공평한 시간 분배, 특정 과목의 오전/오후 선호 등
+    추가 소프트 제약은 미구현 상태입니다.
+  - preferred_room_id 가 설정된 경우 해당 교실로만 배정을 시도하며,
+    대체 교실을 자동으로 찾지 않습니다.
 """
 import random
 from typing import Optional

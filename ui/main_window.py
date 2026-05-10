@@ -21,7 +21,19 @@
               ├── [7] CalendarWidget       — 학사일정
               └── [8] HistoryWidget        — 변경 이력
 
-페이지 전환 시 idx 4~8 은 refresh() 를 호출해 최신 데이터를 반영합니다.
+데이터 연결성 (Data Connectivity):
+  모든 페이지 전환 시 refresh() 를 호출하여 DB 의 최신 데이터를 다시 읽습니다.
+  이를 통해 선행 작업(예: 학반 등록)의 결과가 후속 페이지(예: 교사 관리의
+  담임 학반 콤보박스)에 자동으로 연동됩니다.
+
+  데이터 흐름 예시:
+    편제 설정(0): 학년·반 등록
+        ↓ (페이지 전환 시 refresh)
+    교사 관리(1): 담임 학반 콤보박스에 등록된 반 목록 표시
+    교과목/시수(2): 학반·교과·교사 콤보박스에 등록된 목록 표시
+        ↓ (시수 배정 완료 후)
+    자동 생성 → 반별 시간표(4)·교사별 시간표(5) 조회
+
 자동 생성은 GenerateWorker(QThread)에서 실행되어 UI 가 멈추지 않습니다.
 """
 from PyQt6.QtWidgets import (
@@ -29,7 +41,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QStackedWidget, QFrame,
     QDialog, QFormLayout, QLineEdit, QComboBox,
     QSpinBox, QDialogButtonBox, QMessageBox, QProgressDialog,
-    QDateEdit, QCheckBox
+    QDateEdit, QCheckBox, QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate
 from PyQt6.QtGui import QFont, QIcon
@@ -439,6 +451,17 @@ class MainWindow(QMainWindow):
         btn_neis.clicked.connect(self._export_neis)
         sb_layout.addWidget(btn_neis)
 
+        add_section("프로젝트")
+        btn_save = QPushButton("  💾 프로젝트 저장")
+        btn_save.setStyleSheet(NAV_BTN_STYLE)
+        btn_save.clicked.connect(self._save_project)
+        sb_layout.addWidget(btn_save)
+
+        btn_load = QPushButton("  📂 프로젝트 불러오기")
+        btn_load.setStyleSheet(NAV_BTN_STYLE)
+        btn_load.clicked.connect(self._load_project)
+        sb_layout.addWidget(btn_load)
+
         # 하단: 늘어나는 공간
         sb_layout.addStretch()
 
@@ -485,7 +508,12 @@ class MainWindow(QMainWindow):
     def _switch_page(self, idx: int):
         """
         QStackedWidget 페이지를 전환하고 사이드바 버튼 상태를 갱신합니다.
-        데이터 조회 페이지(4~8)로 진입할 때 refresh() 를 호출해 최신 데이터를 표시합니다.
+
+        모든 페이지(0~8) 전환 시 refresh()를 호출하여 선행 작업에서 입력된
+        최신 데이터가 후속 페이지의 콤보박스·테이블에 반영되도록 합니다.
+
+        예: 편제 설정(0)에서 학반 추가 → 교사 관리(1)로 이동하면
+            담임 학반 콤보박스에 방금 추가한 학반이 나타납니다.
         """
         self.stack.setCurrentIndex(idx)
 
@@ -493,8 +521,14 @@ class MainWindow(QMainWindow):
         for i, btn in enumerate(self._nav_buttons):
             btn.setChecked(i == idx)
 
-        # 데이터 조회·관리 페이지는 진입 시 DB 에서 최신 데이터를 다시 읽습니다.
+        # 모든 페이지 진입 시 refresh()를 호출해 DB의 최신 데이터를 반영합니다.
+        # 이렇게 하면 선행 작업(예: 학반 등록)의 결과가 후속 페이지(예: 교사 관리)의
+        # 콤보박스에 자동으로 연동됩니다.
         refresh_map = {
+            0: self.page_class.refresh,
+            1: self.page_teacher.refresh,
+            2: self.page_subject.refresh,
+            3: self.page_room.refresh,
             4: self.page_class_view.refresh,
             5: self.page_teacher_view.refresh,
             6: self.page_request_list.refresh,
@@ -571,6 +605,99 @@ class MainWindow(QMainWindow):
     def _export_neis(self):
         """NEIS(Excel) 내보내기 다이얼로그를 엽니다."""
         NEISExportDialog(self).exec()
+
+    def _save_project(self):
+        """
+        프로젝트 전체 데이터를 JSON 파일로 저장합니다.
+        QFileDialog 로 저장 경로를 선택한 뒤 core/project_manager 의
+        export_project() 를 호출합니다.
+        """
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "프로젝트 저장", "timetable_project.json",
+            "JSON Files (*.json)"
+        )
+        if not filepath:
+            return
+
+        session = get_session()
+        try:
+            from core.project_manager import export_project
+            total = export_project(session, filepath)
+            QMessageBox.information(
+                self, "저장 완료",
+                f"프로젝트가 저장되었습니다.\n"
+                f"총 {total}개 항목이 저장되었습니다.\n\n"
+                f"파일: {filepath}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "저장 실패",
+                f"프로젝트 저장 중 오류가 발생했습니다:\n{e}"
+            )
+        finally:
+            session.close()
+
+    def _load_project(self):
+        """
+        JSON 프로젝트 파일을 불러와 DB를 대체합니다.
+
+        흐름:
+          1. QFileDialog 로 파일 선택
+          2. validate_project_file() 로 파일 검증
+          3. 경고 다이얼로그로 사용자 확인 (기존 데이터 삭제됨)
+          4. import_project() 실행 (실패 시 자동 rollback)
+          5. 전체 페이지 refresh() 로 UI 갱신
+        """
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "프로젝트 불러오기", "",
+            "JSON Files (*.json)"
+        )
+        if not filepath:
+            return
+
+        from core.project_manager import validate_project_file, import_project
+
+        valid, error = validate_project_file(filepath)
+        if not valid:
+            QMessageBox.critical(self, "파일 오류", error)
+            return
+
+        reply = QMessageBox.warning(
+            self, "프로젝트 불러오기",
+            "기존 모든 데이터가 삭제되고\n"
+            "파일 내용으로 대체됩니다.\n\n"
+            f"파일: {filepath}\n\n"
+            "계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        session = get_session()
+        try:
+            summary = import_project(session, filepath)
+            total = sum(summary.values())
+
+            lines = [f" · {t}: {n}개" for t, n in summary.items() if n > 0]
+            lines.insert(0, f"프로젝트를 성공적으로 불러왔습니다.\n총 {total}개 항목:\n")
+            QMessageBox.information(self, "불러오기 완료", "\n".join(lines))
+
+            # 모든 페이지를 최신 데이터로 갱신
+            for page in [
+                self.page_class, self.page_teacher, self.page_subject, self.page_room,
+                self.page_class_view, self.page_teacher_view,
+                self.page_request_list, self.page_calendar, self.page_history,
+            ]:
+                page.refresh()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "불러오기 실패",
+                f"프로젝트 불러오기 중 오류가 발생했습니다.\n"
+                f"데이터는 복구되었습니다.\n\n{e}"
+            )
+        finally:
+            session.close()
 
     def _open_feedback(self):
         """피드백 다이얼로그를 엽니다."""

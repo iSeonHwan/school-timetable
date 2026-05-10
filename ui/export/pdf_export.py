@@ -3,14 +3,28 @@ PDF 출력 기능
 
 ReportLab 을 사용해 시간표를 A4 가로 방향 PDF 로 출력합니다.
 한국어 폰트를 OS 별로 자동 탐색하며, 찾지 못하면 Helvetica 로 대체합니다.
+(한글 폰트가 없으면 출력물에 한글이 깨져 보일 수 있습니다.)
+
+데이터 의존성:
+  - 학기: AcademicTerm (TermDialog 로 등록)
+  - 반별 출력: SchoolClass + TimetableEntry (GenerateWorker 로 생성)
+  - 교사별 출력: Teacher + TimetableEntry
+  - 다이얼로그를 열 때마다 DB 에서 최신 데이터를 조회하므로
+    페이지 refresh 와 무관하게 항상 최신 상태로 출력됩니다.
 
 출력 범위:
-  - 전체 학반: 반마다 1페이지
-  - 전체 교사: 교사마다 1페이지
-  - 학반 + 교사 모두: 위 두 가지 합산
+  - 전체 학반: 반마다 1페이지 (해당 반의 TimetableEntry 가 있을 때만)
+  - 전체 교사: 교사마다 1페이지 (해당 교사의 TimetableEntry 가 있을 때만)
+  - 학반 + 교사 모두: 위 두 가지 합산 (많은 페이지가 생성될 수 있음)
 
 각 페이지 구조:
-  타이틀 텍스트 → 시간표 그리드 (교시 행 × 요일 열) → PageBreak
+  Spacer → 타이틀(Paragraph) → Spacer → Table(교시 행 × 요일 열) → PageBreak
+  Table 은 repeatRows=1 로 설정되어 페이지가 넘어가도 헤더가 반복됩니다.
+
+폰트 탐색 우선순위:
+  macOS: Apple SD Gothic Neo > Apple Gothic > Nanum Gothic
+  Windows: 맑은 고딕 > 굴림
+  Linux: Nanum Gothic > Noto Sans CJK
 """
 import os
 import platform

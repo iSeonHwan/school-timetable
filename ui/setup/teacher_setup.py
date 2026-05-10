@@ -5,8 +5,18 @@
   1. 교사 추가/편집: 이름·교원번호·일 최대 수업 수·담임 여부·담임 학반을 입력합니다.
   2. 교사 불가 시간 설정: 교사를 선택한 뒤 요일×교시 그리드에서 불가 슬롯을 체크합니다.
 
-불가 시간은 TeacherConstraint 테이블에 constraint_type="unavailable" 로 저장됩니다.
-시간표 자동 생성 시 이 슬롯에는 해당 교사를 배치하지 않습니다.
+데이터 의존성:
+  이 페이지는 ClassSetupWidget(편제 설정)에서 등록된 SchoolClass 데이터를
+  '담임 학반' 콤보박스(cb_homeroom_class)에 표시합니다.
+  페이지 전환 시 refresh() 가 호출되어 최신 학반 목록을 DB 에서 다시 읽어옵니다.
+
+  또한 TeacherConstraint 테이블에 constraint_type="unavailable" 로 저장된
+  불가 시간은 시간표 자동 생성 시 hard constraint(절대 위반 불가)로 작용합니다.
+
+불가 시간 저장 전략:
+  _save_constraints() 는 '전체 삭제 후 재삽입' 방식을 사용합니다.
+  이는 업데이트 로직을 단순화하지만, constraint 레코드의 id 가 매번 변경됩니다.
+  (히스토리 추적이 필요하다면 soft delete + upsert 방식으로 전환을 고려하세요.)
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
