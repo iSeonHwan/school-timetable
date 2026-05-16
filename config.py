@@ -60,7 +60,11 @@ def get_db_url(cfg: dict | None = None) -> str:
     if cfg is None:
         cfg = load_config()
 
-    if cfg["db_type"] == "postgresql":
+    db_type = cfg["db_type"]
+    if db_type not in ("sqlite", "postgresql"):
+        raise ValueError(f"지원하지 않는 db_type입니다: '{db_type}' (sqlite 또는 postgresql만 허용)")
+
+    if db_type == "postgresql":
         # 비밀번호에 @, :, # 등 특수문자가 포함된 경우 URL이 깨지는 것을 방지합니다.
         pw = quote_plus(cfg["pg_password"])
         return (
