@@ -97,10 +97,11 @@ def generate_timetable(
             from core.change_logger import log_entry_create, log_entry_delete
 
             # 기존 시간표 항목 삭제 (이력 로그도 기록)
+            # 이미 ORM 객체를 순회하므로 session.delete()를 사용해 세션 상태를 일관되게 유지합니다.
             old_entries = session.query(TimetableEntry).filter_by(term_id=term_id).all()
             for old_entry in old_entries:
                 log_entry_delete(session, old_entry)
-            session.query(TimetableEntry).filter_by(term_id=term_id).delete()
+                session.delete(old_entry)
 
             # 새 시간표 항목 삽입
             new_entries = []
