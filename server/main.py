@@ -39,21 +39,40 @@ async def lifespan(app: FastAPI):
 def _ensure_admin():
     """
     최초 실행 시 관리자 계정이 없으면 자동으로 생성합니다.
-    ADMIN_USERNAME / ADMIN_PASSWORD 환경 변수로 자격 증명을 설정할 수 있습니다.
+
+    두 종류의 관리자 계정을 생성합니다:
+      - 일과계 선생님 (admin): 전체 관리 권한
+        환경 변수 ADMIN_USERNAME / ADMIN_PASSWORD 로 설정 (기본값 admin / admin1234)
+      - 교감 선생님 (vice_principal): 변경 신청 최종 승인만 가능
+        환경 변수 VP_USERNAME / VP_PASSWORD 로 설정 (기본값 vice_principal / vp1234)
     """
-    username = os.getenv("ADMIN_USERNAME", "admin")
-    password = os.getenv("ADMIN_PASSWORD", "admin1234")
     db = get_session()
     try:
+        # ── 일과계 선생님 계정 (admin) ──────────────────────────────────────
+        admin_username = os.getenv("ADMIN_USERNAME", "admin")
+        admin_password = os.getenv("ADMIN_PASSWORD", "admin1234")
         if not db.query(User).filter_by(role="admin").first():
             admin = User(
-                username=username,
-                password_hash=hash_password(password),
+                username=admin_username,
+                password_hash=hash_password(admin_password),
                 role="admin",
             )
             db.add(admin)
             db.commit()
-            print(f"[서버] 최초 관리자 계정 생성: {username} (비밀번호를 즉시 변경하세요!)")
+            print(f"[서버] 최초 일과계 선생님 계정 생성: {admin_username} (비밀번호를 즉시 변경하세요!)")
+
+        # ── 교감 선생님 계정 (vice_principal) ───────────────────────────────
+        vp_username = os.getenv("VP_USERNAME", "vice_principal")
+        vp_password = os.getenv("VP_PASSWORD", "vp1234")
+        if not db.query(User).filter_by(role="vice_principal").first():
+            vp = User(
+                username=vp_username,
+                password_hash=hash_password(vp_password),
+                role="vice_principal",
+            )
+            db.add(vp)
+            db.commit()
+            print(f"[서버] 최초 교감 선생님 계정 생성: {vp_username} (비밀번호를 즉시 변경하세요!)")
     finally:
         db.close()
 

@@ -25,7 +25,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    role: str        # "admin" | "teacher"
+    role: str        # "admin" | "vice_principal" | "teacher"
     user_id: int
     teacher_id: Optional[int] = None
 
@@ -250,8 +250,12 @@ class ChangeRequestOut(BaseModel):
     reason: str
     requested_by: str
     requested_at: datetime
-    approved_by: str
-    approved_at: Optional[datetime]
+    # 1차 승인: 일과계 선생님의 승인 정보
+    scheduler_approved_by: str = ""
+    scheduler_approved_at: Optional[datetime] = None
+    # 최종 승인: 교감 선생님의 승인 정보
+    approved_by: str = ""
+    approved_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

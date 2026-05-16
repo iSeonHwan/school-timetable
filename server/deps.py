@@ -47,8 +47,40 @@ def get_current_user(user: User = Depends(_get_current_user)) -> User:
     return user
 
 
-def require_admin(user: User = Depends(_get_current_user)) -> User:
-    """admin role 이 아니면 403 을 반환합니다."""
+def require_scheduler(user: User = Depends(_get_current_user)) -> User:
+    """
+    일과계 선생님(admin role) 전용 가드.
+    편제·교사·교과·교실 CRUD, 계정 관리, 시간표 생성·수정, 1차 승인에 사용합니다.
+    """
     if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="관리자 권한이 필요합니다.")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="일과계 선생님 권한이 필요합니다.",
+        )
+    return user
+
+
+def require_vice_principal(user: User = Depends(_get_current_user)) -> User:
+    """
+    교감 선생님(vice_principal role) 전용 가드.
+    변경 신청 최종 승인(2차)에 사용합니다.
+    """
+    if user.role != "vice_principal":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="교감 선생님 권한이 필요합니다.",
+        )
+    return user
+
+
+def require_admin_or_vice_principal(user: User = Depends(_get_current_user)) -> User:
+    """
+    일과계(admin) 또는 교감(vice_principal) 접근 허용 가드.
+    데이터 조회(GET) 엔드포인트에 사용합니다. 교사(teacher)는 차단됩니다.
+    """
+    if user.role not in ("admin", "vice_principal"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="관리자 권한이 필요합니다.",
+        )
     return user

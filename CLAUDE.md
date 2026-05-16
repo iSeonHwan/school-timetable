@@ -58,14 +58,17 @@ Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 - `main.py` — FastAPI app entry point, lifespan (DB init + first admin creation)
 - `auth_utils.py` — JWT creation/validation, bcrypt password hashing
 - `deps.py` — FastAPI dependencies: DB session injection, auth/role guards
-- `api/auth.py` — Login, user management (admin only)
-- `api/setup.py` — Grade/class/subject/room/teacher CRUD (admin only)
-- `api/timetable.py` — Timetable query/generation, change requests/logs
-- `api/chat.py` — REST + WebSocket real-time group chat
+- `api/auth.py` — Login, user management (일과계 only)
+- `api/setup.py` — Grade/class/subject/room/teacher CRUD (쓰기: 일과계 only, 읽기: 일과계·교감)
+- `api/timetable.py` — Timetable query/generation, 2-step change request approval (일과계 1차 → 교감 최종)
+- `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감)
 
 ### Admin App (`admin_app/`)
 - Reuses existing `ui/` widgets (setup pages, timetable views, history)
 - Adds login screen (`LoginWindow`) and chat panel (`ChatPanel`)
+- Role-based sidebar:
+  - **일과계(admin)**: 8 pages (전체 관리 기능)
+  - **교감(vice_principal)**: 3 pages (시간표 읽기 전용 + 변경 신청 최종 승인)
 - Connects directly to PostgreSQL DB (same machine or LAN)
 
 ### Teacher App (`teacher_app/`)
@@ -90,17 +93,17 @@ Reads/writes `db_config.json`. Supports SQLite (default) and PostgreSQL.
 |---|---|---|---|
 | POST | `/auth/login` | — | Login, get JWT |
 | GET | `/auth/me` | any | Current user info |
-| GET/POST | `/auth/users` | admin | User management |
-| GET/POST/DELETE | `/setup/grades` | admin | Grade CRUD |
-| GET/POST/DELETE | `/setup/classes` | admin | Class CRUD |
-| GET/POST/DELETE | `/setup/teachers` | admin | Teacher CRUD |
-| GET/POST/DELETE | `/setup/subjects` | admin | Subject CRUD |
-| GET/POST/DELETE | `/setup/rooms` | admin | Room CRUD |
-| GET/POST | `/timetable/terms` | any/admin | Academic terms |
+| GET/POST | `/auth/users` | scheduler | User management (일과계 only) |
+| GET/POST/DELETE | `/setup/grades` | scheduler (write) / admin+vp (read) | Grade CRUD |
+| GET/POST/DELETE | `/setup/classes` | scheduler (write) / admin+vp (read) | Class CRUD |
+| GET/POST/DELETE | `/setup/teachers` | scheduler (write) / admin+vp (read) | Teacher CRUD |
+| GET/POST/DELETE | `/setup/subjects` | scheduler (write) / admin+vp (read) | Subject CRUD |
+| GET/POST/DELETE | `/setup/rooms` | scheduler (write) / admin+vp (read) | Room CRUD |
+| GET/POST | `/timetable/terms` | any/일과계 | Academic terms |
 | GET | `/timetable/entries` | any | Timetable entries |
-| POST | `/timetable/generate` | admin | Auto-generate |
-| GET | `/timetable/logs` | admin | Change history |
+| POST | `/timetable/generate` | scheduler | Auto-generate (일과계 only) |
+| GET | `/timetable/logs` | admin+vp | Change history |
 | GET/POST | `/timetable/requests` | any | Change requests |
-| PATCH | `/timetable/requests/{id}` | admin | Approve/reject |
+| PATCH | `/timetable/requests/{id}` | admin+vp | 2-step approve/reject (일과계 1차 → 교감 최종) |
 | GET | `/chat/messages` | any | Chat history |
 | WS | `/chat/ws?token=` | any | Real-time chat |

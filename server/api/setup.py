@@ -24,7 +24,7 @@ from shared.schemas import (
     TeacherConstraintOut, TeacherConstraintCreate,
     AssignmentOut, AssignmentCreate,
 )
-from server.deps import get_db, require_admin
+from server.deps import get_db, require_scheduler, require_admin_or_vice_principal
 
 router = APIRouter(prefix="/setup", tags=["편제·교과·교사 관리"])
 
@@ -32,12 +32,12 @@ router = APIRouter(prefix="/setup", tags=["편제·교과·교사 관리"])
 # ── 학년 ───────────────────────────────────────────────────────────────────
 
 @router.get("/grades", response_model=list[GradeOut])
-def list_grades(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_grades(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(Grade).order_by(Grade.grade_number).all()
 
 
 @router.post("/grades", response_model=GradeOut, status_code=201)
-def create_grade(body: GradeCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_grade(body: GradeCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     grade = Grade(grade_number=body.grade_number, name=body.name)
     db.add(grade)
     db.commit()
@@ -46,7 +46,7 @@ def create_grade(body: GradeCreate, db: Session = Depends(get_db), _: User = Dep
 
 
 @router.delete("/grades/{grade_id}")
-def delete_grade(grade_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_grade(grade_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     grade = db.get(Grade, grade_id)
     if grade is None:
         raise HTTPException(404, "학년을 찾을 수 없습니다.")
@@ -58,12 +58,12 @@ def delete_grade(grade_id: int, db: Session = Depends(get_db), _: User = Depends
 # ── 반 ─────────────────────────────────────────────────────────────────────
 
 @router.get("/classes", response_model=list[SchoolClassOut])
-def list_classes(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_classes(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(SchoolClass).order_by(SchoolClass.grade_id, SchoolClass.class_number).all()
 
 
 @router.post("/classes", response_model=SchoolClassOut, status_code=201)
-def create_class(body: SchoolClassCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_class(body: SchoolClassCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     sc = SchoolClass(
         grade_id=body.grade_id,
         class_number=body.class_number,
@@ -77,7 +77,7 @@ def create_class(body: SchoolClassCreate, db: Session = Depends(get_db), _: User
 
 
 @router.delete("/classes/{class_id}")
-def delete_class(class_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_class(class_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     sc = db.get(SchoolClass, class_id)
     if sc is None:
         raise HTTPException(404, "반을 찾을 수 없습니다.")
@@ -89,12 +89,12 @@ def delete_class(class_id: int, db: Session = Depends(get_db), _: User = Depends
 # ── 교과목 ─────────────────────────────────────────────────────────────────
 
 @router.get("/subjects", response_model=list[SubjectOut])
-def list_subjects(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_subjects(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(Subject).order_by(Subject.name).all()
 
 
 @router.post("/subjects", response_model=SubjectOut, status_code=201)
-def create_subject(body: SubjectCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_subject(body: SubjectCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     subj = Subject(
         name=body.name,
         short_name=body.short_name,
@@ -108,7 +108,7 @@ def create_subject(body: SubjectCreate, db: Session = Depends(get_db), _: User =
 
 
 @router.delete("/subjects/{subject_id}")
-def delete_subject(subject_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_subject(subject_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     subj = db.get(Subject, subject_id)
     if subj is None:
         raise HTTPException(404, "교과목을 찾을 수 없습니다.")
@@ -120,12 +120,12 @@ def delete_subject(subject_id: int, db: Session = Depends(get_db), _: User = Dep
 # ── 교실 ───────────────────────────────────────────────────────────────────
 
 @router.get("/rooms", response_model=list[RoomOut])
-def list_rooms(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_rooms(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(Room).order_by(Room.name).all()
 
 
 @router.post("/rooms", response_model=RoomOut, status_code=201)
-def create_room(body: RoomCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_room(body: RoomCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     room = Room(
         name=body.name, room_type=body.room_type,
         capacity=body.capacity, floor=body.floor, notes=body.notes,
@@ -137,7 +137,7 @@ def create_room(body: RoomCreate, db: Session = Depends(get_db), _: User = Depen
 
 
 @router.delete("/rooms/{room_id}")
-def delete_room(room_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_room(room_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     room = db.get(Room, room_id)
     if room is None:
         raise HTTPException(404, "교실을 찾을 수 없습니다.")
@@ -149,12 +149,12 @@ def delete_room(room_id: int, db: Session = Depends(get_db), _: User = Depends(r
 # ── 교사 ───────────────────────────────────────────────────────────────────
 
 @router.get("/teachers", response_model=list[TeacherOut])
-def list_teachers(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_teachers(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(Teacher).order_by(Teacher.name).all()
 
 
 @router.post("/teachers", response_model=TeacherOut, status_code=201)
-def create_teacher(body: TeacherCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_teacher(body: TeacherCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     teacher = Teacher(
         name=body.name,
         employee_number=body.employee_number,
@@ -171,7 +171,7 @@ def create_teacher(body: TeacherCreate, db: Session = Depends(get_db), _: User =
 @router.patch("/teachers/{teacher_id}", response_model=TeacherOut)
 def update_teacher(
     teacher_id: int, body: TeacherUpdate,
-    db: Session = Depends(get_db), _: User = Depends(require_admin),
+    db: Session = Depends(get_db), _: User = Depends(require_scheduler),
 ):
     teacher = db.get(Teacher, teacher_id)
     if teacher is None:
@@ -184,7 +184,7 @@ def update_teacher(
 
 
 @router.delete("/teachers/{teacher_id}")
-def delete_teacher(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_teacher(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     teacher = db.get(Teacher, teacher_id)
     if teacher is None:
         raise HTTPException(404, "교사를 찾을 수 없습니다.")
@@ -196,14 +196,14 @@ def delete_teacher(teacher_id: int, db: Session = Depends(get_db), _: User = Dep
 # ── 교사 불가시간 제약 ──────────────────────────────────────────────────────
 
 @router.get("/teachers/{teacher_id}/constraints", response_model=list[TeacherConstraintOut])
-def list_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(TeacherConstraint).filter_by(teacher_id=teacher_id).all()
 
 
 @router.post("/teachers/{teacher_id}/constraints", response_model=TeacherConstraintOut, status_code=201)
 def add_constraint(
     teacher_id: int, body: TeacherConstraintCreate,
-    db: Session = Depends(get_db), _: User = Depends(require_admin),
+    db: Session = Depends(get_db), _: User = Depends(require_scheduler),
 ):
     c = TeacherConstraint(
         teacher_id=teacher_id,
@@ -218,7 +218,7 @@ def add_constraint(
 
 
 @router.delete("/teachers/{teacher_id}/constraints")
-def clear_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def clear_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     """해당 교사의 모든 제약을 삭제합니다. (저장 전 전체 교체 방식)"""
     db.query(TeacherConstraint).filter_by(teacher_id=teacher_id).delete()
     db.commit()
@@ -228,7 +228,7 @@ def clear_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = 
 # ── 시수 배정 ──────────────────────────────────────────────────────────────
 
 @router.get("/assignments", response_model=list[AssignmentOut])
-def list_assignments(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_assignments(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
     return db.query(SubjectClassAssignment).all()
 
 
@@ -236,7 +236,7 @@ def list_assignments(db: Session = Depends(get_db), _: User = Depends(require_ad
 def create_or_update_assignment(
     body: AssignmentCreate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_scheduler),
 ):
     """같은 (반, 교과, 교사) 조합이 있으면 시수만 업데이트합니다."""
     existing = db.query(SubjectClassAssignment).filter_by(
@@ -264,7 +264,7 @@ def create_or_update_assignment(
 
 
 @router.delete("/assignments/{assignment_id}")
-def delete_assignment(assignment_id: int, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_assignment(assignment_id: int, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     a = db.get(SubjectClassAssignment, assignment_id)
     if a is None:
         raise HTTPException(404, "배정 정보를 찾을 수 없습니다.")

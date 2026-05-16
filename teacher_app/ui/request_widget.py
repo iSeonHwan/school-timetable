@@ -167,11 +167,17 @@ class RequestWidget(QWidget):
     def _populate_requests(self, requests: list):
         self.table.setRowCount(len(requests))
         status_colors = {
-            "pending":  "#FFF9C4",
-            "approved": "#E8F5E9",
-            "rejected": "#FFEBEE",
+            "pending":            "#FFF9C4",
+            "scheduler_approved": "#BBDEFB",  # 1차 승인: 연한 파랑
+            "approved":           "#E8F5E9",
+            "rejected":           "#FFEBEE",
         }
-        status_labels = {"pending": "대기 중", "approved": "승인됨", "rejected": "거절됨"}
+        status_labels = {
+            "pending": "대기 중",
+            "scheduler_approved": "1차 승인 (최종 대기)",
+            "approved": "최종 승인됨",
+            "rejected": "거절됨",
+        }
         for row, req in enumerate(requests):
             at = str(req.get("requested_at", ""))[:16]
             status = req.get("status", "")

@@ -263,7 +263,17 @@ class TimetableChangeLog(Base):
 # ── 변경 신청 ──────────────────────────────────────────────────────────────
 
 class TimetableChangeRequest(Base):
-    """당일 시간표 변경 신청. status: pending → approved / rejected"""
+    """
+    당일 시간표 변경 신청.
+
+    status 흐름 (2단계 승인):
+      교사 제출 → pending → 일과계 1차 승인 → scheduler_approved
+                           → 교감 최종 승인  → approved (TimetableEntry 에 반영)
+      어느 단계든 거절 가능 → rejected
+
+    approved_by / approved_at: 교감의 최종 승인 정보를 기록합니다.
+    scheduler_approved_by / scheduler_approved_at: 일과계의 1차 승인 정보를 기록합니다.
+    """
     __tablename__ = "timetable_change_requests"
 
     id                 = Column(Integer, primary_key=True)
@@ -275,6 +285,10 @@ class TimetableChangeRequest(Base):
     reason             = Column(Text, default="")
     requested_by       = Column(String(30), default="")
     requested_at       = Column(DateTime, default=datetime.now)
+    # 일과계 선생님의 1차 승인 정보
+    scheduler_approved_by = Column(String(30), default="")
+    scheduler_approved_at = Column(DateTime, nullable=True)
+    # 교감 선생님의 최종 승인 정보
     approved_by        = Column(String(30), default="")
     approved_at        = Column(DateTime, nullable=True)
 
@@ -291,8 +305,12 @@ class User(Base):
     앱 로그인 계정.
 
     role:
-      - "admin"   : 관리 프로그램 접근 가능 (교감·일과계)
-      - "teacher" : 교사 프로그램 접근 가능
+      - "admin"            : 일과계 선생님 (scheduler) — 전체 관리 권한
+                             편제·교사·교과·교실 CRUD, 계정 관리, 시간표 생성·수정,
+                             변경 신청 1차 승인
+      - "vice_principal"   : 교감 선생님 — 읽기 전용 + 변경 신청 최종 승인만 가능
+                             시간표·편제 수정 불가, 계정 관리 불가
+      - "teacher"          : 교사 — 시간표 조회, 변경 신청 제출
 
     teacher_id 가 설정된 경우 Teacher 레코드와 연결됩니다.
     관리자 계정은 teacher_id 가 없을 수 있습니다 (None).

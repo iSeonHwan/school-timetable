@@ -3,6 +3,10 @@
 
 아이디·비밀번호를 입력하고 FastAPI 서버에 인증합니다.
 로그인 성공 시 AdminMainWindow 를 열고 이 창을 닫습니다.
+
+허용 역할:
+  - admin (일과계 선생님): 전체 관리 기능
+  - vice_principal (교감 선생님): 변경 신청 최종 승인 + 시간표 열람
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -27,9 +31,10 @@ class _LoginWorker(QThread):
     def run(self):
         try:
             data = self._client.login(self._username, self._password)
-            if data.get("role") != "admin":
+            # 일과계(admin) 또는 교감(vice_principal)만 관리자 앱에 접근 가능
+            if data.get("role") not in ("admin", "vice_principal"):
                 self._client.logout()
-                self.failure.emit("관리자 계정으로만 로그인할 수 있습니다.")
+                self.failure.emit("관리자 계정(일과계·교감)으로만 로그인할 수 있습니다.")
             else:
                 self.success.emit(data)
         except ApiError as e:

@@ -110,8 +110,8 @@ def post_message(
     current_user: User = Depends(get_current_user),
 ):
     """REST 방식으로 메시지를 전송합니다 (WebSocket fallback)."""
-    if body.is_announcement and current_user.role != "admin":
-        raise HTTPException(403, "공지 메시지는 관리자만 전송할 수 있습니다.")
+    if body.is_announcement and current_user.role not in ("admin", "vice_principal"):
+        raise HTTPException(403, "공지 메시지는 관리자(일과계·교감)만 전송할 수 있습니다.")
     msg = _save_message(db, current_user, body.content, body.is_announcement)
     return _to_out(msg, db)
 
@@ -176,8 +176,8 @@ async def websocket_chat(ws: WebSocket, token: str = Query(...)):
                 if not content:
                     await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "빈 메시지"}}))
                     continue
-                if is_ann and user.role != "admin":
-                    await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "공지는 관리자만 가능합니다."}}))
+                if is_ann and user.role not in ("admin", "vice_principal"):
+                    await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "공지는 관리자(일과계·교감)만 가능합니다."}}))
                     continue
 
                 msg = _save_message(db, user, content, is_ann)

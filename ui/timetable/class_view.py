@@ -47,8 +47,10 @@ DAYS_KR = ["월", "화", "수", "목", "금"]
 class ClassTimetableView(QWidget):
     """반별 시간표 조회 및 편집 위젯."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, read_only: bool = False):
         super().__init__(parent)
+        # read_only=True 이면 더블클릭 편집이 비활성화됩니다 (교감 전용).
+        self._read_only = read_only
         # (day, period) → TimetableEntry 매핑. 더블클릭 시 빠른 조회에 사용합니다.
         self._entries_by_slot: dict = {}
         self._init_ui()
@@ -225,7 +227,12 @@ class ClassTimetableView(QWidget):
         """
         Mode A 셀 더블클릭 시 처리합니다.
         EditDialog 에서 직접 수정 또는 변경 신청 중 하나를 선택합니다.
+        read_only=True (교감 전용) 이면 편집을 허용하지 않습니다.
         """
+        # 읽기 전용 모드(교감)에서는 편집 불가
+        if self._read_only:
+            return
+
         entry = self._entries_by_slot.get((day, period))
         if entry is None:
             return  # 빈 슬롯은 편집하지 않습니다.

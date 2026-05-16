@@ -95,7 +95,8 @@ class TeacherMainWindow(QMainWindow):
         root.addWidget(self.stack, stretch=1)
 
         # ── 채팅 패널 ────────────────────────────────────────────────────
-        is_admin = self._client.role == "admin"
+        # 일과계(admin) 또는 교감(vice_principal)은 공지 전송 가능
+        is_admin = self._client.role in ("admin", "vice_principal")
         self._chat = ChatPanel(client=self._client, is_admin=is_admin)
         self._chat.setFixedWidth(CHAT_W)
         root.addWidget(self._chat)

@@ -15,7 +15,7 @@ from shared.schemas import (
     LoginRequest, TokenResponse, UserOut, UserCreate, UserUpdate,
 )
 from server.auth_utils import verify_password, hash_password, create_token
-from server.deps import get_db, get_current_user, require_admin
+from server.deps import get_db, get_current_user, require_scheduler
 
 router = APIRouter(prefix="/auth", tags=["인증"])
 
@@ -50,13 +50,13 @@ def me(current_user: User = Depends(get_current_user)):
 
 
 @router.get("/users", response_model=list[UserOut])
-def list_users(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def list_users(db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     """전체 사용자 목록을 반환합니다. 관리자 전용."""
     return db.query(User).order_by(User.id).all()
 
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_user(body: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_user(body: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
     """새 사용자 계정을 생성합니다. 관리자 전용."""
     if db.query(User).filter_by(username=body.username).first():
         raise HTTPException(status_code=400, detail="이미 사용 중인 아이디입니다.")
@@ -77,7 +77,7 @@ def update_user(
     user_id: int,
     body: UserUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_scheduler),
 ):
     """사용자 정보를 수정합니다. 관리자 전용."""
     user = db.get(User, user_id)
