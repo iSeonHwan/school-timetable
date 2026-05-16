@@ -227,7 +227,7 @@ class TimetableEntry(Base):
     day_of_week     = Column(Integer, nullable=False)   # 1(월) ~ 5(금)
     period          = Column(Integer, nullable=False)   # 1 ~ max_periods
     is_fixed        = Column(Boolean, default=False)    # 고정 슬롯 여부
-    # default 에 함수 객체(datetime.now)를 전달하면 SQLAlchemy 가 삽입 시점에 호출합니다.
+    # 함수 객체를 전달하면 SQLAlchemy 가 삽입(default) 및 수정(onupdate) 시점에 각각 호출합니다.
     created_at      = Column(DateTime, default=datetime.now)
     updated_at      = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
