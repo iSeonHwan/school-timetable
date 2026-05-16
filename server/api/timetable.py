@@ -106,7 +106,17 @@ def generate(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    """시간표를 자동 생성합니다. 관리자 전용."""
+    """
+    지정 학기의 시간표를 자동 생성합니다. 관리자 전용.
+
+    Body:
+        term_id    : 대상 학기 ID (필수)
+        max_periods: 하루 최대 교시 수 (기본 7)
+        max_retries: Greedy 재시도 횟수 (기본 30)
+
+    성공 시 기존 시간표를 삭제하고 새 배정으로 교체합니다.
+    30회 내 완전 배치 실패 시 422 를 반환합니다.
+    """
     ok, msg = generate_timetable(db, body.term_id, body.max_periods, body.max_retries)
     if not ok:
         raise HTTPException(status_code=422, detail=msg)
@@ -205,6 +215,10 @@ def review_request(
                 entry.teacher_id = req.new_teacher_id
             if req.new_room_id:
                 entry.room_id = req.new_room_id
+            # 승인 시점에 중복 배정 재검증을 하지 않는 이유:
+            # 신청 제출 당시에는 충돌이 없었더라도, 승인 전에 다른 슬롯이 변경됐을 수
+            # 있습니다. 그러나 충돌 감지를 여기서 하면 승인 거부 로직이 복잡해집니다.
+            # 대신 관리자가 시간표를 직접 확인하고 충돌 여부를 판단하도록 위임합니다.
             log_entry_update(session=db, entry=entry, before=before)
 
     db.commit()

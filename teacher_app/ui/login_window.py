@@ -1,7 +1,9 @@
 """
 교사 로그인 창
 
-teacher role 계정으로만 로그인할 수 있습니다.
+role 에 상관없이 모든 계정으로 로그인할 수 있습니다.
+admin 계정도 이 창으로 교사 프로그램에 접속할 수 있으나, 시간표 조회·교체 신청·
+채팅 기능만 제공됩니다 (편제 관리·시간표 생성·결재는 관리자 프로그램 전용).
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox,

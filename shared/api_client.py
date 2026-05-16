@@ -29,9 +29,14 @@ class ApiClient:
     """
     FastAPI 서버와 통신하는 동기 HTTP 클라이언트.
 
+    ※ 블로킹 주의: get/post/patch/delete 메서드는 모두 네트워크 응답을
+    기다리는 동기 호출입니다. PyQt6 UI 스레드에서 직접 호출하면 앱이
+    응답 없음(freezing) 상태가 됩니다. 반드시 QThread 서브클래스의
+    run() 메서드 안에서 호출하세요. (예: _SubmitWorker, _LoadWorker)
+
     Args:
         base_url: 서버 주소 (예: "http://192.168.1.10:8000")
-        timeout : 요청 타임아웃 (초)
+        timeout : 요청 타임아웃 (초). 기본 10초.
     """
 
     def __init__(self, base_url: str, timeout: float = 10.0):

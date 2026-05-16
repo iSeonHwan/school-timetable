@@ -15,6 +15,19 @@ WebSocket 프로토콜:
     {"type": "chat",     "payload": ChatMessageOut}          # 새 메시지 브로드캐스트
     {"type": "pong"}
     {"type": "error",    "payload": {"detail": "..."}}
+
+ConnectionManager 설계:
+  - `manager` 는 모듈 레벨 싱글턴입니다. FastAPI 앱이 시작될 때 단 한 번 생성되어
+    서버 프로세스가 종료될 때까지 유지됩니다.
+  - 내부 `_connections` 리스트에는 (user_id, WebSocket) 쌍을 저장합니다.
+    한 사용자가 여러 창에서 접속하면 동일한 user_id가 여러 번 들어갈 수 있습니다.
+  - `broadcast()`는 연결이 끊긴 소켓에 send_text()가 실패하면 해당 소켓을
+    자동으로 목록에서 제거합니다.
+  - FastAPI는 각 WebSocket 연결을 별도의 asyncio 태스크로 처리하므로,
+    같은 이벤트 루프 안에서 `_connections` 리스트에 동시 접근이 일어납니다.
+    CPython의 GIL과 asyncio 단일 스레드 특성 덕분에 별도의 락 없이 안전합니다.
+    단, 멀티프로세스(uvicorn workers > 1) 환경에서는 프로세스 간 연결 목록이
+    공유되지 않으므로 Redis Pub/Sub 같은 별도 브로드캐스트 버스가 필요합니다.
 """
 from __future__ import annotations
 import json

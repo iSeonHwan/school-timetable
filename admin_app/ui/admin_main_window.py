@@ -2,11 +2,11 @@
 관리자 메인 창
 
 기존 MainWindow 의 레이아웃(사이드바 + QStackedWidget)을 유지하면서
-오른쪽 하단에 채팅 패널이 추가됩니다.
-DB 접근은 서버 API(ApiClient)를 통하지 않고, 기존처럼 직접 SQLAlchemy 세션을
-사용합니다 (관리 프로그램은 서버 DB 에 직접 접근 가능한 환경에서 실행하기 때문).
+우측에 채팅 패널(너비 280px)이 추가된 구조입니다.
 
-관리자 프로그램의 핵심 UI 는 기존 ui/ 폴더의 위젯을 재활용합니다.
+편제·시간표 관련 위젯은 ui/ 폴더의 기존 PyQt6 위젯을 그대로 재활용하며,
+SQLAlchemy 세션으로 DB에 직접 접근합니다.
+채팅 패널만 ApiClient 를 통해 서버의 WebSocket 엔드포인트에 연결합니다.
 """
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
