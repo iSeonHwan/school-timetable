@@ -397,7 +397,7 @@ TimetableEntry (시간표 배정 1행 = 1수업 슬롯)
 | `Grade` | grade_number |
 | `SchoolClass` | grade_id, class_number, homeroom_teacher_id |
 | `Subject` | name, short_name, color |
-| `Teacher` | name, max_daily_lessons |
+| `Teacher` | name, max_daily_classes |
 | `SubjectClassAssignment` | school_class_id, subject_id, teacher_id, weekly_hours |
 | `TimetableEntry` | term_id, school_class_id, subject_id, teacher_id, room_id, day_of_week, period |
 | `TeacherConstraint` | teacher_id, day_of_week, period, constraint_type (unavailable/preferred/avoid) |
