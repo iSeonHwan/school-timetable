@@ -138,7 +138,7 @@ def _try_generate(
     unavailable: dict[int, set],
     teacher_max: dict[int, int],
     max_periods: int,
-) -> Optional[list]:
+) -> Optional[list[dict]]:
     """
     한 번의 그리디 시도를 실행합니다.
 
