@@ -19,7 +19,7 @@
   교사 관리에서 교사를 추가한 뒤 오면 새 교사가 cb_teacher 에 나타납니다.
 
 색상 관리:
-  PRESET_COLORS: 12색 파스텔 팔레트. _next_color() 로 순환하며 자동 할당.
+  PRESET_COLORS: 12색 파스텔 팔레트. SubjectSetupWidget._next_color() 로 순환하며 자동 할당.
   사용자가 색상 버튼을 클릭하면 QColorDialog 로 직접 선택 가능.
 
 시수 배정 중복 처리:
@@ -45,23 +45,21 @@ PRESET_COLORS = [
     "#FFF9C4", "#FFEBEE", "#E0F7FA", "#FCE4EC",
     "#F1F8E9", "#FBE9E7", "#EDE7F6", "#E0F2F1",
 ]
-_color_idx = 0   # 모듈 수준 전역 인덱스 (앱 실행 중 계속 증가)
-
-
-def _next_color() -> str:
-    """PRESET_COLORS 를 순환하며 다음 색상을 반환합니다."""
-    global _color_idx
-    c = PRESET_COLORS[_color_idx % len(PRESET_COLORS)]
-    _color_idx += 1
-    return c
-
-
 class SubjectSetupWidget(QWidget):
     """교과목 CRUD 및 시수 배정 위젯."""
 
+    _color_idx = 0  # 클래스 변수 — 인스턴스 간 공유되어 색상이 순환 할당됩니다.
+
+    @classmethod
+    def _next_color(cls) -> str:
+        """PRESET_COLORS 를 순환하며 다음 색상을 반환합니다."""
+        c = PRESET_COLORS[cls._color_idx % len(PRESET_COLORS)]
+        cls._color_idx += 1
+        return c
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._selected_color = _next_color()   # 현재 선택된 색상 (#RRGGBB)
+        self._selected_color = self._next_color()  # 현재 선택된 색상 (#RRGGBB)
         self._init_ui()
         self._load_data()
 
@@ -303,7 +301,7 @@ class SubjectSetupWidget(QWidget):
             self.edit_name.clear()
             self.edit_short.clear()
             # 다음 교과목 추가를 위해 색상을 자동으로 변경합니다.
-            self._selected_color = _next_color()
+            self._selected_color = self._next_color()
             self._refresh_color_btn()
             self._load_data()
         finally:
