@@ -12,7 +12,7 @@ FastAPI 서버 진입점
   ADMIN_PASSWORD     : 최초 일과계 비밀번호 (기본 "admin1234")
   VP_USERNAME        : 최초 교감 아이디 (기본 "vice_principal")
   VP_PASSWORD        : 최초 교감 비밀번호 (기본 "vp1234")
-  CHAT_RETENTION_DAYS: 채팅 메시지 보관 기간(일) (기본 30, 0=무기한)
+  CHAT_RETENTION_DAYS: 채팅 메시지 보관 기간(일) (기본 60, 0=무기한)
 """
 import os
 from contextlib import asynccontextmanager

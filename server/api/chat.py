@@ -34,7 +34,7 @@ ConnectionManager 설계:
     공유되지 않으므로 Redis Pub/Sub 같은 별도 브로드캐스트 버스가 필요합니다.
 
 채팅 메시지 자동 정리:
-  - 서버 시작 시점부터 `CHAT_RETENTION_DAYS`(기본값 30일)보다 오래된 메시지는
+  - 서버 시작 시점부터 `CHAT_RETENTION_DAYS`(기본값 60일)보다 오래된 메시지는
     자동 삭제됩니다. lifespan 에서 백그라운드 asyncio 태스크로 주기적으로 실행되며,
     삭제된 메시지 ID 는 WebSocket 으로 브로드캐스트되어 모든 클라이언트의 UI 에서
     해당 메시지가 제거됩니다.
@@ -185,14 +185,14 @@ def cleanup_old_messages(
     """
     보관 기간이 지난 오래된 채팅 메시지를 일괄 삭제합니다. (일과계 전용)
 
-    CHAT_RETENTION_DAYS 환경 변수(기본값 30일)를 기준으로,
+    CHAT_RETENTION_DAYS 환경 변수(기본값 60일)를 기준으로,
     created_at 이 그 기간보다 이전인 모든 메시지를 삭제합니다.
     CHAT_RETENTION_DAYS=0 으로 설정된 경우 보관 기간 제한 없이 모든 메시지가 유지됩니다.
 
     Returns:
         {"deleted_count": <삭제된 메시지 수>}
     """
-    retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "30"))
+    retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "60"))
     if retention_days <= 0:
         return {"deleted_count": 0, "message": "자동 정리가 비활성화되어 있습니다 (CHAT_RETENTION_DAYS=0)."}
 
@@ -361,9 +361,9 @@ async def _auto_cleanup_loop():
 
     동작 방식:
       1. 서버 시작 후 최초 5분 대기 (초기 연결이 안정화될 때까지)
-      2. CHAT_RETENTION_DAYS 환경 변수(기본값 30일) 기준으로 오래된 메시지 삭제
+      2. CHAT_RETENTION_DAYS 환경 변수(기본값 60일) 기준으로 오래된 메시지 삭제
       3. 삭제된 메시지 ID 들을 WebSocket 으로 브로드캐스트하여 모든 클라이언트 UI 갱신
-      4. 1시간 간격으로 반복 실행
+      4. 12시간 간격으로 반복 실행
 
     CHAT_RETENTION_DAYS=0 으로 설정 시 자동 정리가 비활성화됩니다.
     이 태스크는 FastAPI lifespan 을 통해 시작되며, 서버 종료 시 함께 종료됩니다.
@@ -376,7 +376,7 @@ async def _auto_cleanup_loop():
 
     while True:
         try:
-            retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "30"))
+            retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "60"))
             if retention_days > 0:
                 db = get_session()
                 try:
@@ -406,9 +406,9 @@ async def _auto_cleanup_loop():
         except Exception as e:
             print(f"[채팅 정리] 오류 발생: {e}")
 
-        # 1시간 대기 후 다음 정리 주기 실행
+        # 12시간 대기 후 다음 정리 주기 실행
         try:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(43200)  # 12시간 = 12 * 60 * 60
         except asyncio.CancelledError:
             return
 

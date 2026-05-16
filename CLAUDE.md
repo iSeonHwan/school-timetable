@@ -26,7 +26,7 @@ export DB_URL="postgresql+psycopg2://user:pw@host/db"  # default: SQLite
 export JWT_SECRET_KEY="your-secret"                     # change in production!
 export ADMIN_USERNAME="admin"                           # first-run admin account
 export ADMIN_PASSWORD="admin1234"                       # change immediately!
-export CHAT_RETENTION_DAYS="30"                       # chat message retention (days, 0=forever)
+export CHAT_RETENTION_DAYS="60"                       # chat message retention (days, 0=forever)
 ```
 
 ## Running the Apps
