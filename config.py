@@ -10,6 +10,7 @@ DB 연결 설정 관리 모듈
 """
 import json
 import os
+from urllib.parse import quote_plus
 
 # db_config.json 의 절대 경로 — 이 파일과 같은 디렉터리(프로젝트 루트)에 위치합니다.
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "db_config.json")
@@ -60,8 +61,10 @@ def get_db_url(cfg: dict | None = None) -> str:
         cfg = load_config()
 
     if cfg["db_type"] == "postgresql":
+        # 비밀번호에 @, :, # 등 특수문자가 포함된 경우 URL이 깨지는 것을 방지합니다.
+        pw = quote_plus(cfg["pg_password"])
         return (
-            f"postgresql+psycopg2://{cfg['pg_user']}:{cfg['pg_password']}"
+            f"postgresql+psycopg2://{cfg['pg_user']}:{pw}"
             f"@{cfg['pg_host']}:{cfg['pg_port']}/{cfg['pg_dbname']}"
         )
 
