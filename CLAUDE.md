@@ -2,17 +2,40 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Running the App
+## Program Structure (3 Programs)
 
-```bash
-python3 main.py
-```
+This project has been split into three separate programs:
 
-Install dependencies first (use the project venv):
+| Program | Entry Point | Role |
+|---|---|---|
+| **Server** | `uvicorn server.main:app` | FastAPI API server + WebSocket chat hub |
+| **Admin App** | `python -m admin_app.main` | Full management (vice-principal / scheduler) |
+| **Teacher App** | `python -m teacher_app.main` | Timetable view + change requests + chat |
+
+## Running the Server
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+
+# Start API server (default port 8000)
+.venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8000
+
+# Environment variables (optional)
+export DB_URL="postgresql+psycopg2://user:pw@host/db"  # default: SQLite
+export JWT_SECRET_KEY="your-secret"                     # change in production!
+export ADMIN_USERNAME="admin"                           # first-run admin account
+export ADMIN_PASSWORD="admin1234"                       # change immediately!
+```
+
+## Running the Apps
+
+```bash
+# Admin program
+SERVER_URL=http://localhost:8000 .venv/bin/python -m admin_app.main
+
+# Teacher program
+SERVER_URL=http://localhost:8000 .venv/bin/python -m teacher_app.main
 ```
 
 ## Running Tests
@@ -21,40 +44,63 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests/ -v
 ```
 
-Tests use `pytest-qt` and require a display (or a headless environment via `QT_QPA_PLATFORM=offscreen`).
+Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 
 ## Architecture
 
-This is a Korean school timetable management desktop app built with **PyQt6** + **SQLAlchemy**.
+### Shared Layer (`shared/`)
+- `models.py` — All SQLAlchemy ORM models (canonical source). `database/models.py` re-exports from here for backward compatibility.
+  - New models: `User` (login accounts), `ChatMessage` (group chat)
+- `schemas.py` — Pydantic v2 request/response schemas for all API endpoints
+- `api_client.py` — Sync HTTP + WebSocket client used by both desktop apps
 
-### Entry Point
+### Server (`server/`)
+- `main.py` — FastAPI app entry point, lifespan (DB init + first admin creation)
+- `auth_utils.py` — JWT creation/validation, bcrypt password hashing
+- `deps.py` — FastAPI dependencies: DB session injection, auth/role guards
+- `api/auth.py` — Login, user management (admin only)
+- `api/setup.py` — Grade/class/subject/room/teacher CRUD (admin only)
+- `api/timetable.py` — Timetable query/generation, change requests/logs
+- `api/chat.py` — REST + WebSocket real-time group chat
 
-`main.py` initializes the DB via `database/connection.py`, then launches `ui/main_window.MainWindow`. If the configured DB fails, it falls back to a local SQLite file (`timetable.db`).
+### Admin App (`admin_app/`)
+- Reuses existing `ui/` widgets (setup pages, timetable views, history)
+- Adds login screen (`LoginWindow`) and chat panel (`ChatPanel`)
+- Connects directly to PostgreSQL DB (same machine or LAN)
+
+### Teacher App (`teacher_app/`)
+- Communicates with server exclusively via `ApiClient` (REST + WebSocket)
+- Pages: My Timetable, Class Timetable, Change Requests
+- Chat panel shared with admin app
 
 ### Database Layer (`database/`)
-
-- `connection.py` — module-level singleton engine/session factory. Call `init_db(url)` once at startup, then `get_session()` anywhere to get a new `Session`. Sessions must be closed manually (no context manager is used globally).
-- `models.py` — SQLAlchemy ORM models: `Grade` → `SchoolClass`, `Teacher`, `Subject`, `SubjectClassAssignment` (links class + subject + teacher + weekly hours), `TimetableEntry` (one row per scheduled lesson slot), `TeacherConstraint` (unavailable/preferred/avoid slots), `Room`, `AcademicTerm`.
+- `connection.py` — Singleton engine/session factory. `init_db(url)` once, then `get_session()`.
+- `models.py` — Re-exports from `shared/models.py` for backward compatibility.
 
 ### Timetable Generator (`core/generator.py`)
-
-`generate_timetable(session, term_id)` uses **Greedy + Random Restart** (up to 30 attempts). Each attempt shuffles lessons and slots, then places lessons one-by-one enforcing hard constraints (no double-booking of class, teacher, or room; teacher unavailable slots) and soft constraints (teacher daily max). Returns `(bool, message)`. Runs in a `QThread` (`GenerateWorker`) to keep the UI responsive.
-
-### UI Layer (`ui/`)
-
-`main_window.py` — sidebar navigation (`QStackedWidget` with 6 pages) + dialogs for term management, auto-generation, and DB config.
-
-Setup pages (`ui/setup/`):
-- `class_setup.py` — grade/class CRUD
-- `teacher_setup.py` — teacher CRUD + unavailable-time grid
-- `subject_setup.py` — subject CRUD + per-class weekly-hours assignment
-- `room_setup.py` — room CRUD
-
-Timetable view pages (`ui/timetable/`):
-- `class_view.py` — per-class grid (days × periods); calls `refresh()` on page switch
-- `teacher_view.py` — per-teacher grid; calls `refresh()` on page switch
-- `neis_grid.py` — shared grid widget used by both views
+Greedy + Random Restart (up to 30 attempts). Returns `(bool, message)`.
 
 ### Config (`config.py`)
+Reads/writes `db_config.json`. Supports SQLite (default) and PostgreSQL.
+`get_db_url(cfg)` builds a SQLAlchemy URL. PostgreSQL passwords are URL-encoded.
 
-Reads/writes `db_config.json` in the project root. Supports SQLite (default) and PostgreSQL. `get_db_url(cfg)` builds a SQLAlchemy URL from the config dict.
+## API Overview
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/auth/login` | — | Login, get JWT |
+| GET | `/auth/me` | any | Current user info |
+| GET/POST | `/auth/users` | admin | User management |
+| GET/POST/DELETE | `/setup/grades` | admin | Grade CRUD |
+| GET/POST/DELETE | `/setup/classes` | admin | Class CRUD |
+| GET/POST/DELETE | `/setup/teachers` | admin | Teacher CRUD |
+| GET/POST/DELETE | `/setup/subjects` | admin | Subject CRUD |
+| GET/POST/DELETE | `/setup/rooms` | admin | Room CRUD |
+| GET/POST | `/timetable/terms` | any/admin | Academic terms |
+| GET | `/timetable/entries` | any | Timetable entries |
+| POST | `/timetable/generate` | admin | Auto-generate |
+| GET | `/timetable/logs` | admin | Change history |
+| GET/POST | `/timetable/requests` | any | Change requests |
+| PATCH | `/timetable/requests/{id}` | admin | Approve/reject |
+| GET | `/chat/messages` | any | Chat history |
+| WS | `/chat/ws?token=` | any | Real-time chat |
