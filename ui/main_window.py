@@ -361,6 +361,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("학교 시간표 관리 시스템")
         self.resize(1280, 800)
         self.setMinimumSize(960, 640)
+        self._worker = None  # GenerateWorker 참조 — 생성 전 접근 방지용
         self._init_ui()
 
     def _init_ui(self):
