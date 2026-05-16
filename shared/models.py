@@ -338,8 +338,12 @@ class User(Base):
 class ChatMessage(Base):
     """
     전체 공개 채팅 메시지.
+
     관리자(admin)가 올린 메시지는 is_announcement=True 로 표시해 강조합니다.
-    메시지는 삭제되지 않고 서버에 영구 보관됩니다.
+    일과계(admin)는 메시지를 삭제하거나 오래된 메시지를 일괄 정리할 수 있습니다.
+
+    서버는 CHAT_RETENTION_DAYS(기본 30일)보다 오래된 메시지를 주기적으로
+    자동 삭제합니다. 0 으로 설정하면 무기한 보관합니다.
     """
     __tablename__ = "chat_messages"
 

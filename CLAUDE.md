@@ -26,6 +26,7 @@ export DB_URL="postgresql+psycopg2://user:pw@host/db"  # default: SQLite
 export JWT_SECRET_KEY="your-secret"                     # change in production!
 export ADMIN_USERNAME="admin"                           # first-run admin account
 export ADMIN_PASSWORD="admin1234"                       # change immediately!
+export CHAT_RETENTION_DAYS="30"                       # chat message retention (days, 0=forever)
 ```
 
 ## Running the Apps
@@ -61,7 +62,7 @@ Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 - `api/auth.py` — Login, user management (일과계 only)
 - `api/setup.py` — Grade/class/subject/room/teacher CRUD (쓰기: 일과계 only, 읽기: 일과계·교감)
 - `api/timetable.py` — Timetable query/generation, 2-step change request approval (일과계 1차 → 교감 최종)
-- `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감)
+- `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감, 삭제: 일과계 only, 자동 정리: CHAT_RETENTION_DAYS 기준)
 
 ### Admin App (`admin_app/`)
 - Reuses existing `ui/` widgets (setup pages, timetable views, history)
@@ -106,4 +107,6 @@ Reads/writes `db_config.json`. Supports SQLite (default) and PostgreSQL.
 | GET/POST | `/timetable/requests` | any | Change requests |
 | PATCH | `/timetable/requests/{id}` | admin+vp | 2-step approve/reject (일과계 1차 → 교감 최종) |
 | GET | `/chat/messages` | any | Chat history |
-| WS | `/chat/ws?token=` | any | Real-time chat |
+| DELETE | `/chat/messages/{id}` | admin+vp | Delete single message |
+| DELETE | `/chat/messages` | scheduler | Cleanup old messages (일과계 only) |
+| WS | `/chat/ws?token=` | any | Real-time chat (chat, delete, cleanup events) |

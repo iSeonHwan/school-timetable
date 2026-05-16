@@ -5,11 +5,14 @@ FastAPI 서버 진입점
   uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 환경 변수:
-  DB_URL           : SQLAlchemy DB URL (미설정 시 config.py 의 get_db_url() 사용)
-  JWT_SECRET_KEY   : JWT 서명 키 (운영 환경에서 반드시 설정)
-  JWT_EXPIRE_HOURS : 토큰 유효 시간 (기본 24)
-  ADMIN_USERNAME   : 최초 관리자 아이디 (기본 "admin")
-  ADMIN_PASSWORD   : 최초 관리자 비밀번호 (기본 "admin1234" — 첫 실행 후 반드시 변경)
+  DB_URL             : SQLAlchemy DB URL (미설정 시 config.py 의 get_db_url() 사용)
+  JWT_SECRET_KEY     : JWT 서명 키 (운영 환경에서 반드시 설정)
+  JWT_EXPIRE_HOURS   : 토큰 유효 시간 (기본 24)
+  ADMIN_USERNAME     : 최초 일과계 아이디 (기본 "admin")
+  ADMIN_PASSWORD     : 최초 일과계 비밀번호 (기본 "admin1234")
+  VP_USERNAME        : 최초 교감 아이디 (기본 "vice_principal")
+  VP_PASSWORD        : 최초 교감 비밀번호 (기본 "vp1234")
+  CHAT_RETENTION_DAYS: 채팅 메시지 보관 기간(일) (기본 30, 0=무기한)
 """
 import os
 from contextlib import asynccontextmanager
@@ -23,17 +26,30 @@ from server.auth_utils import hash_password
 from server.api.auth import router as auth_router
 from server.api.setup import router as setup_router
 from server.api.timetable import router as timetable_router
-from server.api.chat import router as chat_router
+from server.api.chat import router as chat_router, start_cleanup_task
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """서버 시작 시 DB 초기화 및 최초 관리자 계정 생성."""
+    """
+    서버 시작 시 DB 초기화, 최초 관리자 계정 생성, 채팅 정리 태스크 시작.
+    서버 종료 시 채팅 정리 태스크를 안전하게 종료합니다.
+    """
     db_url = os.getenv("DB_URL")
     init_db(db_url)
     _ensure_admin()
+
+    # 채팅 메시지 자동 정리 백그라운드 태스크 시작
+    _cleanup_task = start_cleanup_task()
+
     yield
-    # 종료 시 정리 작업 (현재는 없음)
+
+    # 종료 시 정리: 백그라운드 태스크 취소
+    _cleanup_task.cancel()
+    try:
+        await _cleanup_task
+    except Exception:
+        pass  # CancelledError 는 무시
 
 
 def _ensure_admin():

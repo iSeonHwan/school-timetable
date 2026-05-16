@@ -1,18 +1,22 @@
 """
 채팅 API — REST + WebSocket
 
-GET  /chat/messages        — 최근 메시지 목록 (REST, 접속 시 이력 로드용)
-POST /chat/messages        — 메시지 전송 (REST fallback)
-WS   /chat/ws?token=...    — 실시간 WebSocket 채팅
+GET    /chat/messages              — 최근 메시지 목록 (REST, 접속 시 이력 로드용)
+POST   /chat/messages              — 메시지 전송 (REST fallback)
+DELETE /chat/messages/{message_id} — 단일 메시지 삭제 (일과계·교감만 가능)
+DELETE /chat/messages/cleanup      — 보관 기간 지난 메시지 일괄 삭제 (일과계만 가능)
+WS     /chat/ws?token=...          — 실시간 WebSocket 채팅
 
 WebSocket 프로토콜:
   클라이언트 → 서버:
     {"type": "chat", "payload": {"content": "...", "is_announcement": false}}
+    {"type": "delete", "payload": {"message_id": 123}}
     {"type": "ping"}
 
   서버 → 클라이언트:
     {"type": "history",  "payload": [ChatMessageOut, ...]}   # 접속 직후 최근 100개
     {"type": "chat",     "payload": ChatMessageOut}          # 새 메시지 브로드캐스트
+    {"type": "delete",   "payload": {"message_id": 123}}     # 메시지 삭제 브로드캐스트
     {"type": "pong"}
     {"type": "error",    "payload": {"detail": "..."}}
 
@@ -28,18 +32,27 @@ ConnectionManager 설계:
     CPython의 GIL과 asyncio 단일 스레드 특성 덕분에 별도의 락 없이 안전합니다.
     단, 멀티프로세스(uvicorn workers > 1) 환경에서는 프로세스 간 연결 목록이
     공유되지 않으므로 Redis Pub/Sub 같은 별도 브로드캐스트 버스가 필요합니다.
+
+채팅 메시지 자동 정리:
+  - 서버 시작 시점부터 `CHAT_RETENTION_DAYS`(기본값 30일)보다 오래된 메시지는
+    자동 삭제됩니다. lifespan 에서 백그라운드 asyncio 태스크로 주기적으로 실행되며,
+    삭제된 메시지 ID 는 WebSocket 으로 브로드캐스트되어 모든 클라이언트의 UI 에서
+    해당 메시지가 제거됩니다.
+  - 환경 변수 CHAT_RETENTION_DAYS=0 이면 자동 정리를 비활성화합니다.
 """
 from __future__ import annotations
+import asyncio
 import json
+import os
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query, HTTPException
 from sqlalchemy.orm import Session
 
 from shared.models import ChatMessage, User
 from shared.schemas import ChatMessageOut, ChatMessageCreate
-from server.deps import get_db, get_current_user
+from server.deps import get_db, get_current_user, require_scheduler, require_admin_or_vice_principal
 from server.auth_utils import decode_token
 from database.connection import get_session
 
@@ -116,6 +129,99 @@ def post_message(
     return _to_out(msg, db)
 
 
+# ── 메시지 삭제 엔드포인트 ─────────────────────────────────────────────────────
+
+@router.delete("/messages/{message_id}", status_code=200)
+def delete_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_vice_principal),
+):
+    """
+    단일 채팅 메시지를 삭제합니다. (일과계·교감 모두 가능)
+
+    삭제된 메시지의 ID 를 WebSocket 으로 브로드캐스트하여
+    모든 접속 클라이언트의 UI 에서 해당 메시지가 즉시 제거되도록 합니다.
+
+    Args:
+        message_id: 삭제할 메시지의 ID
+
+    Returns:
+        {"deleted": True, "message_id": <id>}
+
+    Raises:
+        404: 해당 ID 의 메시지가 존재하지 않음
+    """
+    msg = db.get(ChatMessage, message_id)
+    if msg is None:
+        raise HTTPException(404, "해당 메시지를 찾을 수 없습니다.")
+
+    db.delete(msg)
+    db.commit()
+
+    # WebSocket 으로 삭제 이벤트를 브로드캐스트하여 모든 클라이언트가 UI 에서 제거하도록 함
+    # asyncio.create_task 로 비동기 브로드캐스트 — 동기 핸들러 안에서 안전하게 실행
+    async def _broadcast_delete():
+        await manager.broadcast({
+            "type": "delete",
+            "payload": {"message_id": message_id},
+        })
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_broadcast_delete())
+    except RuntimeError:
+        pass  # 이벤트 루프가 없는 환경 (테스트 등)에서는 브로드캐스트 생략
+
+    return {"deleted": True, "message_id": message_id}
+
+
+@router.delete("/messages", status_code=200)
+def cleanup_old_messages(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_scheduler),
+):
+    """
+    보관 기간이 지난 오래된 채팅 메시지를 일괄 삭제합니다. (일과계 전용)
+
+    CHAT_RETENTION_DAYS 환경 변수(기본값 30일)를 기준으로,
+    created_at 이 그 기간보다 이전인 모든 메시지를 삭제합니다.
+    CHAT_RETENTION_DAYS=0 으로 설정된 경우 보관 기간 제한 없이 모든 메시지가 유지됩니다.
+
+    Returns:
+        {"deleted_count": <삭제된 메시지 수>}
+    """
+    retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "30"))
+    if retention_days <= 0:
+        return {"deleted_count": 0, "message": "자동 정리가 비활성화되어 있습니다 (CHAT_RETENTION_DAYS=0)."}
+
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    old_messages = db.query(ChatMessage).filter(ChatMessage.created_at < cutoff).all()
+    deleted_ids = [msg.id for msg in old_messages]
+    count = len(deleted_ids)
+
+    for msg in old_messages:
+        db.delete(msg)
+    db.commit()
+
+    # 삭제된 모든 메시지 ID 를 WebSocket 으로 브로드캐스트
+    async def _broadcast_cleanup():
+        await manager.broadcast({
+            "type": "cleanup",
+            "payload": {"message_ids": deleted_ids},
+        })
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_broadcast_cleanup())
+    except RuntimeError:
+        pass
+
+    return {"deleted_count": count}
+
+
 # ── WebSocket 엔드포인트 ───────────────────────────────────────────────────
 
 @router.websocket("/ws")
@@ -168,6 +274,36 @@ async def websocket_chat(ws: WebSocket, token: str = Query(...)):
             if etype == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
 
+            elif etype == "delete":
+                # ── 메시지 삭제 요청 (WebSocket 경로, 일과계·교감만 가능) ──
+                if user.role not in ("admin", "vice_principal"):
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "payload": {"detail": "메시지 삭제는 관리자(일과계·교감)만 가능합니다."},
+                    }))
+                    continue
+                p = event.get("payload", {})
+                msg_id = p.get("message_id")
+                if msg_id is None:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "payload": {"detail": "message_id 가 필요합니다."},
+                    }))
+                    continue
+                target = db.get(ChatMessage, msg_id)
+                if target is None:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "payload": {"detail": "해당 메시지를 찾을 수 없습니다."},
+                    }))
+                    continue
+                db.delete(target)
+                db.commit()
+                await manager.broadcast({
+                    "type": "delete",
+                    "payload": {"message_id": msg_id},
+                })
+
             elif etype == "chat":
                 p = event.get("payload", {})
                 content = str(p.get("content", "")).strip()
@@ -215,3 +351,74 @@ def _to_out(msg: ChatMessage, db: Session) -> ChatMessageOut:
         is_announcement=msg.is_announcement,
         created_at=msg.created_at,
     )
+
+
+# ── 백그라운드 자동 정리 태스크 ────────────────────────────────────────────────
+
+async def _auto_cleanup_loop():
+    """
+    주기적으로 오래된 채팅 메시지를 자동 삭제하는 백그라운드 태스크입니다.
+
+    동작 방식:
+      1. 서버 시작 후 최초 5분 대기 (초기 연결이 안정화될 때까지)
+      2. CHAT_RETENTION_DAYS 환경 변수(기본값 30일) 기준으로 오래된 메시지 삭제
+      3. 삭제된 메시지 ID 들을 WebSocket 으로 브로드캐스트하여 모든 클라이언트 UI 갱신
+      4. 1시간 간격으로 반복 실행
+
+    CHAT_RETENTION_DAYS=0 으로 설정 시 자동 정리가 비활성화됩니다.
+    이 태스크는 FastAPI lifespan 을 통해 시작되며, 서버 종료 시 함께 종료됩니다.
+    """
+    try:
+        # 서버 시작 직후에는 연결이 안정화될 때까지 잠시 대기
+        await asyncio.sleep(300)  # 5분 대기
+    except asyncio.CancelledError:
+        return
+
+    while True:
+        try:
+            retention_days = int(os.getenv("CHAT_RETENTION_DAYS", "30"))
+            if retention_days > 0:
+                db = get_session()
+                try:
+                    cutoff = datetime.now() - timedelta(days=retention_days)
+                    old_messages = (
+                        db.query(ChatMessage)
+                        .filter(ChatMessage.created_at < cutoff)
+                        .all()
+                    )
+                    if old_messages:
+                        deleted_ids = [msg.id for msg in old_messages]
+                        for msg in old_messages:
+                            db.delete(msg)
+                        db.commit()
+
+                        # 삭제된 메시지 ID 브로드캐스트
+                        await manager.broadcast({
+                            "type": "cleanup",
+                            "payload": {"message_ids": deleted_ids},
+                        })
+                        print(f"[채팅 정리] {len(deleted_ids)}개의 오래된 메시지 삭제 완료 "
+                              f"(보관 기간: {retention_days}일)")
+                finally:
+                    db.close()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[채팅 정리] 오류 발생: {e}")
+
+        # 1시간 대기 후 다음 정리 주기 실행
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            return
+
+
+def start_cleanup_task():
+    """
+    FastAPI lifespan 에서 호출하여 백그라운드 자동 정리 태스크를 시작합니다.
+
+    Returns:
+        asyncio.Task — 서버 종료 시 cancel() 할 수 있는 태스크 핸들
+    """
+    loop = asyncio.get_event_loop()
+    return loop.create_task(_auto_cleanup_loop())
