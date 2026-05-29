@@ -47,7 +47,7 @@ import os
 from typing import Optional
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException
 from sqlalchemy.orm import Session
 
 from shared.models import ChatMessage, User
@@ -65,15 +65,28 @@ class ConnectionManager:
     """
     활성 WebSocket 연결 목록을 관리하고 브로드캐스트를 담당합니다.
     FastAPI 앱 수명 동안 단일 인스턴스로 동작합니다.
+
+    보안:
+      - 사용자당 최대 _MAX_CONNECTIONS_PER_USER 개의 동시 연결만 허용하여
+        단일 사용자의 연결 고갈 공격을 방지합니다.
+      - 초과 연결은 code=4002 로 즉시 종료됩니다.
     """
+
+    _MAX_CONNECTIONS_PER_USER = 5  # 사용자당 최대 동시 연결 수 (DoS 방지)
 
     def __init__(self):
         # {user_id: WebSocket} — 동일 사용자가 여러 창을 열 수 있으므로 리스트 사용
         self._connections: list[tuple[int, WebSocket]] = []
 
     async def connect(self, user_id: int, ws: WebSocket):
+        # 사용자당 연결 수 제한 확인
+        user_count = sum(1 for uid, _ in self._connections if uid == user_id)
+        if user_count >= self._MAX_CONNECTIONS_PER_USER:
+            await ws.close(code=4002, reason="동시 연결 한도를 초과했습니다.")
+            return False
         await ws.accept()
         self._connections.append((user_id, ws))
+        return True
 
     def disconnect(self, ws: WebSocket):
         self._connections = [(uid, w) for uid, w in self._connections if w is not ws]
@@ -222,14 +235,53 @@ def cleanup_old_messages(
     return {"deleted_count": count}
 
 
+# WebSocket 접속을 허용할 Origin 목록 (환경 변수 WS_ALLOWED_ORIGINS 로 설정, 쉼표 구분)
+# Cross-Site WebSocket Hijacking (CSWSH) 공격을 방지합니다.
+# 빈 문자열로 설정하면 Origin 검증을 건너뜁니다 (개발 환경용).
+_ALLOWED_WS_ORIGINS = os.getenv(
+    "WS_ALLOWED_ORIGINS",
+    "http://localhost:8000,http://127.0.0.1:8000",
+).split(",")
+_ALLOWED_WS_ORIGINS = [o.strip() for o in _ALLOWED_WS_ORIGINS if o.strip()]
+
+
 # ── WebSocket 엔드포인트 ───────────────────────────────────────────────────
 
 @router.websocket("/ws")
-async def websocket_chat(ws: WebSocket, token: str = Query(...)):
+async def websocket_chat(ws: WebSocket):
     """
     WebSocket 채팅 엔드포인트.
-    URL 파라미터로 JWT 토큰을 전달합니다: /chat/ws?token=<JWT>
+
+    보안:
+      - Origin 헤더 검증: _ALLOWED_WS_ORIGINS 에 등록된 출처만 접속 허용 (CSWSH 방지)
+      - Authorization 헤더로 JWT 전달: Bearer 토큰을 URL 쿼리 파라미터 대신
+        HTTP 헤더로 전송하여 서버 로그·프록시 로그에 토큰이 기록되는 것을 방지
+      - 메시지 크기 제한: receive_text(max_size=4096) 으로 대용량 페이로드 공격 방지
+      - 연결 수 제한: ConnectionManager 에서 사용자당 최대 연결 수 제한
+
+    연결 종료 코드:
+      4001 — 인증 실패 (토큰 없음·만료·계정 비활성)
+      4002 — 동시 연결 한도 초과
+      4003 — Origin 미승인
     """
+    # Origin 검증 — Cross-Site WebSocket Hijacking (CSWSH) 방지.
+    # 웹 브라우저는 WebSocket 연결 시 Origin 헤더를 자동으로 전송하므로,
+    # 승인된 출처 목록과 비교하여 허용되지 않은 출처의 접속을 차단합니다.
+    # 데스크톱 앱(PyQt)은 Origin 헤더를 보내지 않으므로 origin 이 없으면 검증을 건너뜁니다.
+    origin = ws.headers.get("origin")
+    if origin:
+        allowed = any(origin.startswith(a) for a in _ALLOWED_WS_ORIGINS)
+        if not allowed:
+            await ws.close(code=4003)
+            return
+    # Authorization 헤더에서 토큰 추출
+    auth_header = ws.headers.get("authorization", "")
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    if not token:
+        await ws.close(code=4001)
+        return
     # 토큰 검증
     payload = decode_token(token)
     if payload is None:
@@ -244,7 +296,9 @@ async def websocket_chat(ws: WebSocket, token: str = Query(...)):
             await ws.close(code=4001)
             return
 
-        await manager.connect(user_id, ws)
+        if not await manager.connect(user_id, ws):
+            db.close()
+            return
 
         # 접속 직후 최근 100개 이력 전송
         rows = (
@@ -262,7 +316,7 @@ async def websocket_chat(ws: WebSocket, token: str = Query(...)):
 
         # 메시지 수신 루프
         while True:
-            raw = await ws.receive_text()
+            raw = await ws.receive_text(max_size=4096)
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:

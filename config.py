@@ -43,9 +43,21 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """설정 딕셔너리를 db_config.json 에 저장합니다."""
+    """설정 딕셔너리를 db_config.json 에 저장합니다.
+
+    보안:
+      - PostgreSQL 비밀번호가 평문으로 저장될 수 있으므로,
+        저장 후 파일 권한을 소유자 전용(0o600)으로 제한합니다.
+      - config 디렉토리가 없으면 자동 생성합니다.
+    """
+    # 설정 파일을 저장하기 전에 디렉토리 존재를 확인합니다.
+    config_dir = os.path.dirname(CONFIG_FILE)
+    if config_dir and not os.path.exists(config_dir):
+        os.makedirs(config_dir, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+    # 비밀번호가 포함될 수 있으므로 소유자만 읽고 쓸 수 있도록 권한 제한
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def get_db_url(cfg: dict | None = None) -> str:

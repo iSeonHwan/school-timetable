@@ -213,11 +213,17 @@ def review_request(
         raise HTTPException(400, "action 은 'approve' 또는 'reject' 여야 합니다.")
 
     now = datetime.now()
-    actor_name = body.approved_by or current_user.username
+    # actor_name 은 항상 서버에서 JWT 토큰으로 인증된 current_user.username 으로 결정합니다.
+    # 클라이언트가 요청 바디에 임의의 approved_by 값을 주입하더라도 무시됩니다.
+    # 이를 통해 승인자 사칭(actor impersonation) 공격을 방지하고 감사 로그의 무결성을 보장합니다.
+    actor_name = current_user.username
     user_role = current_user.role
 
-    # ── 거절 처리 (두 역할 모두 가능) ───────────────────────────────────────
+    # ── 거절 처리 (일과계·교감만 가능) ───────────────────────────────────────
     if body.action == "reject":
+        # 교사는 거절 권한이 없습니다.
+        if user_role not in ("admin", "vice_principal"):
+            raise HTTPException(403, "변경 신청 거절 권한이 없습니다. 관리자 계정으로 로그인하세요.")
         # 대기 중이거나 1차 승인된 상태만 거절 가능 (이미 최종 승인/거절된 건은 불가)
         if req.status in ("approved", "rejected"):
             raise HTTPException(400, "이미 최종 처리 완료된 신청입니다.")

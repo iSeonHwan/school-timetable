@@ -291,6 +291,9 @@ class TimetableChangeRequest(Base):
     # 교감 선생님의 최종 승인 정보
     approved_by        = Column(String(30), default="")
     approved_at        = Column(DateTime, nullable=True)
+    # 교감 선생님의 승인/거절 기록 (timetable.py 에서 사용)
+    vice_principal_approved_by = Column(String(30), default="")
+    vice_principal_approved_at = Column(DateTime, nullable=True)
 
     timetable_entry = relationship("TimetableEntry")
     new_subject     = relationship("Subject", foreign_keys=[new_subject_id])

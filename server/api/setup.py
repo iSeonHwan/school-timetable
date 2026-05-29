@@ -176,8 +176,16 @@ def update_teacher(
     teacher = db.get(Teacher, teacher_id)
     if teacher is None:
         raise HTTPException(404, "교사를 찾을 수 없습니다.")
+    # Mass Assignment 방지: model_dump() 로 받은 모든 필드 중 명시적으로
+    # 허용된 필드만 setattr 로 업데이트합니다. Teacher 모델에 salary 같은
+    # 민감한 컬럼이 추가되더라도 이 allowlist 에 없으면 덮어쓸 수 없습니다.
+    _TEACHER_UPDATE_ALLOWED = {
+        "name", "employee_number", "is_homeroom",
+        "homeroom_class_id", "max_daily_classes",
+    }
     for field, val in body.model_dump(exclude_none=True).items():
-        setattr(teacher, field, val)
+        if field in _TEACHER_UPDATE_ALLOWED:
+            setattr(teacher, field, val)
     db.commit()
     db.refresh(teacher)
     return teacher

@@ -39,8 +39,10 @@ class _LoginWorker(QThread):
                 self.success.emit(data)
         except ApiError as e:
             self.failure.emit(e.detail)
-        except Exception as e:
-            self.failure.emit(f"서버에 연결할 수 없습니다.\n({e})")
+        except Exception:
+            import logging
+            logging.exception("관리자 로그인 중 연결 오류 발생")
+            self.failure.emit("서버에 연결할 수 없습니다. 네트워크 상태를 확인해 주세요.")
 
 
 class LoginWindow(QWidget):

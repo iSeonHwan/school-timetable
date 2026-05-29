@@ -120,6 +120,9 @@ class ApiClient:
         채팅용 WebSocket 연결을 생성하고 반환합니다.
         실제 연결(run_forever)은 호출자가 별도 스레드에서 실행해야 합니다.
 
+        JWT 토큰은 URL 쿼리 파라미터 대신 Authorization HTTP 헤더로 전송합니다.
+        이 방식은 서버 액세스 로그·프록시 로그에 토큰이 기록되는 것을 방지합니다.
+
         Args:
             on_message: 메시지 수신 콜백 (ws, message_str)
             on_error  : 오류 콜백 (ws, error)
@@ -129,9 +132,10 @@ class ApiClient:
             websocket.WebSocketApp 인스턴스
         """
         ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_url}/chat/ws?token={self._token}"
+        ws_url = f"{ws_url}/chat/ws"
         return websocket.WebSocketApp(
             ws_url,
+            header={"Authorization": f"Bearer {self._token}"},
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,

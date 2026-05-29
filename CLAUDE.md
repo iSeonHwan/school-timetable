@@ -23,10 +23,14 @@ python3 -m venv .venv
 
 # Environment variables (optional)
 export DB_URL="postgresql+psycopg2://user:pw@host/db"  # default: SQLite
-export JWT_SECRET_KEY="your-secret"                     # change in production!
+export JWT_SECRET_KEY="your-secret"                     # 운영 환경에서 반드시 설정 (미설정 시 임시키 생성)
 export ADMIN_USERNAME="admin"                           # first-run admin account
-export ADMIN_PASSWORD="admin1234"                       # change immediately!
-export CHAT_RETENTION_DAYS="60"                       # chat message retention (days, 0=forever)
+export ADMIN_PASSWORD=""                                # 미설정 시 랜덤 생성 (로그에 출력됨)
+export VP_USERNAME="vice_principal"                     # first-run vice-principal account
+export VP_PASSWORD=""                                   # 미설정 시 랜덤 생성 (로그에 출력됨)
+export CHAT_RETENTION_DAYS="60"                         # chat message retention (days, 0=forever)
+export CORS_ORIGINS="http://your-server-ip:8000"        # 운영 환경에서 서버 IP/도메인으로 제한
+export WS_ALLOWED_ORIGINS="http://your-server-ip:8000"  # WebSocket Origin 검증용
 ```
 
 ## Running the Apps

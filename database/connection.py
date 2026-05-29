@@ -11,7 +11,8 @@ SQLAlchemy 데이터베이스 연결 관리 모듈
 
 주의: 전역 세션을 공유하지 않습니다. 각 요청/작업마다 새 세션을 열고 닫습니다.
 """
-from sqlalchemy import create_engine
+import os
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 from .models import Base
 from config import get_db_url
@@ -39,8 +40,28 @@ def init_db(db_url: str | None = None) -> None:
 
     _engine = create_engine(url, connect_args=connect_args, echo=False)
 
+    # SQLite 최적화 및 보안 설정:
+    #   WAL 모드 — 읽기·쓰기 동시성 향상 (기본 rollback journal 대비)
+    #   synchronous=NORMAL — 안전성 유지하면서 WAL 쓰기 속도 향상
+    #   (FULL 모드보다 2~3배 빠르며, OS 크래시에도 corruption 발생 안 함)
+    if url.startswith("sqlite"):
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.close()
+
     # ORM 모델에 선언된 테이블을 DB에 CREATE TABLE IF NOT EXISTS 로 생성합니다.
     Base.metadata.create_all(_engine)
+
+    # SQLite DB 파일 권한을 소유자 전용(0o600)으로 제한.
+    # DB 파일에는 bcrypt 해시와 모든 데이터가 포함되므로
+    # 시스템의 다른 사용자가 읽을 수 없도록 합니다.
+    if url.startswith("sqlite"):
+        db_path = url.replace("sqlite:///", "")
+        if os.path.exists(db_path):
+            os.chmod(db_path, 0o600)
 
     # autocommit=False: 명시적으로 session.commit() 을 호출해야 변경이 반영됩니다.
     # autoflush=False : 쿼리 전 자동 flush 를 하지 않아 의도치 않은 INSERT/UPDATE 를 방지합니다.

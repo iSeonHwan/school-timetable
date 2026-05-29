@@ -327,6 +327,10 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 # PostgreSQL 사용 시 (운영 환경 권장)
 export DB_URL="postgresql+psycopg2://사용자:비밀번호@호스트/DB명"
 export JWT_SECRET_KEY="반드시-운영환경에서-변경할-비밀키"
+export ADMIN_PASSWORD="안전한-초기-비밀번호"
+export VP_PASSWORD="안전한-초기-비밀번호"
+export CORS_ORIGINS="http://실제서버IP:8000,http://실제도메인:8000"
+export WS_ALLOWED_ORIGINS="http://실제서버IP:8000,http://실제도메인:8000"
 uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -334,23 +338,30 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 | 계정 유형 | 기본 아이디 | 기본 비밀번호 | 역할 |
 |---|---|---|---|
-| **일과계 선생님** | `admin` | `admin1234` | 전체 관리 (편제·계정·시간표 생성·1차 승인) |
-| **교감 선생님** | `vice_principal` | `vp1234` | 시간표 열람 + 변경 신청 최종 승인만 |
+| **일과계 선생님** | `admin` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 전체 관리 (편제·계정·시간표 생성·1차 승인) |
+| **교감 선생님** | `vice_principal` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 시간표 열람 + 변경 신청 최종 승인만 |
 
-**모든 계정은 첫 로그인 후 즉시 비밀번호를 변경하세요.**
+> **중요**: 서버 최초 실행 시 `ADMIN_PASSWORD` / `VP_PASSWORD` 환경 변수를 설정하지 않으면
+> 비밀번호가 `secrets.token_urlsafe(12)` 로 무작위 생성됩니다. 생성된 비밀번호는 서버 콘솔에
+> 한 번만 출력되므로 반드시 기록해 두세요. 환경 변수로 미리 설정하면 이 절차를 건너뛸 수 있습니다.
+>
+> **모든 계정은 첫 로그인 후 즉시 비밀번호를 변경하세요.**
 
 환경 변수를 통해 기본값을 바꿀 수 있습니다.
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
 | `DB_URL` | SQLite (timetable.db) | SQLAlchemy DB 연결 URL |
-| `JWT_SECRET_KEY` | `CHANGE_THIS_SECRET_IN_PRODUCTION_ENV` | JWT 서명 키 (운영 시 필수 변경) |
+| `JWT_SECRET_KEY` | `uuid4().hex` (서버 시작 시 자동 생성) | JWT 서명 키. **운영 환경에서는 반드시 고정된 값을 설정하세요.** 미설정 시 서버 재시작마다 새로운 키가 생성되어 기존 토큰이 모두 무효화됩니다. |
 | `JWT_EXPIRE_HOURS` | `24` | 토큰 유효 시간 (시간 단위) |
 | `ADMIN_USERNAME` | `admin` | 일과계 선생님 기본 아이디 |
-| `ADMIN_PASSWORD` | `admin1234` | 일과계 선생님 기본 비밀번호 |
+| `ADMIN_PASSWORD` | `secrets.token_urlsafe(12)` (랜덤 생성) | 일과계 선생님 초기 비밀번호. 미설정 시 서버 콘솔에 1회 출력됩니다. |
 | `VP_USERNAME` | `vice_principal` | 교감 선생님 기본 아이디 |
-| `VP_PASSWORD` | `vp1234` | 교감 선생님 기본 비밀번호 |
+| `VP_PASSWORD` | `secrets.token_urlsafe(12)` (랜덤 생성) | 교감 선생님 초기 비밀번호. 미설정 시 서버 콘솔에 1회 출력됩니다. |
 | `CHAT_RETENTION_DAYS` | `60` | 채팅 메시지 보관 기간(일). 0=무기한 보관, 자동 정리 비활성화 |
+| `CORS_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | CORS 허용 출처 (쉼표 구분, 운영 환경에서는 실제 서버 IP/도메인으로 설정) |
+| `WS_ALLOWED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | WebSocket 허용 출처 (CSWSH 방지, 쉼표 구분). "" (빈 문자열)로 설정 시 Origin 검증 비활성화 (개발 환경용) |
+| `SSL_CERT_FILE` | (미설정) | TLS 인증서 경로. 설정 시 TLS 경고가 표시되지 않습니다. 운영 환경에서는 nginx 리버스 프록시 또는 uvicorn --ssl 옵션으로 TLS 활성화를 권장합니다. |
 
 ### 3단계: 관리자 프로그램 실행 (일과계·교감 PC에서)
 

@@ -50,7 +50,17 @@ def get_current_user(user: User = Depends(_get_current_user)) -> User:
 def require_scheduler(user: User = Depends(_get_current_user)) -> User:
     """
     일과계 선생님(admin role) 전용 가드.
+
     편제·교사·교과·교실 CRUD, 계정 관리, 시간표 생성·수정, 1차 승인에 사용합니다.
+    교감(vice_principal)이나 교사(teacher) role 은 이 가드를 통과할 수 없습니다.
+
+    require_admin_or_vice_principal 과의 차이:
+      - require_scheduler: admin 만 통과 (쓰기·삭제 작업)
+      - require_admin_or_vice_principal: admin + vice_principal 통과 (읽기 전용 작업)
+
+    이렇게 분리한 이유는 최소 권한 원칙(Principle of Least Privilege)을
+    적용하기 위해서입니다. 교감은 데이터 조회만 가능하고, 편제·계정 수정이나
+    시간표 생성 같은 쓰기 작업은 일과계만 수행할 수 있습니다.
     """
     if user.role != "admin":
         raise HTTPException(
