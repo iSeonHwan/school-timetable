@@ -9,7 +9,7 @@ SQLAlchemy 세션으로 DB에 직접 접근합니다.
 채팅 패널만 ApiClient 를 통해 서버의 WebSocket 엔드포인트에 연결합니다.
 
 역할별 사이드바 구성:
-  - admin (일과계 선생님): 8개 페이지 전체 접근
+  - admin (일과계 선생님): 9개 페이지 전체 접근
     학년·반 관리, 교사 관리, 교과목·시수, 교실 관리,
     학반별 시간표, 교사별 시간표, 변경 이력, 변경 신청/결재
   - vice_principal (교감 선생님): 3개 페이지 (읽기 전용 + 승인)
@@ -33,6 +33,7 @@ from ui.timetable.class_view import ClassTimetableView
 from ui.timetable.teacher_view import TeacherTimetableView
 from ui.history.history_view import HistoryViewWidget
 from ui.timetable.request_list import ChangeRequestWidget
+from ui.setup.workflow_setup import WorkflowSetupWidget
 
 SIDEBAR_W = 180
 CHAT_W = 280  # 채팅 패널 고정 너비
@@ -43,6 +44,7 @@ NAV_SCHEDULER = [
     ("학년·반 관리", 0), ("교사 관리", 1), ("교과목·시수", 2),
     ("교실 관리", 3), ("학반별 시간표", 4),
     ("교사별 시간표", 5), ("변경 이력", 6), ("변경 신청/결재", 7),
+    ("결재 라인 설정", 8),
 ]
 
 NAV_VICE_PRINCIPAL = [
@@ -148,6 +150,8 @@ class AdminMainWindow(QMainWindow):
         self.page_history       = HistoryViewWidget()         # index 6
         # 변경 신청/결재 위젯 — 역할 정보를 전달하여 승인 로직이 분기되도록 함
         self.page_request_mgmt  = ChangeRequestWidget(role=self._role)   # index 7
+        # 결재 라인 설정 위젯 — 일과계 전용
+        self.page_workflow      = WorkflowSetupWidget()                  # index 8
 
         # 모든 페이지를 스택에 등록 (순서 중요: 인덱스 = 스택 내 위치)
         for page in [
@@ -159,6 +163,7 @@ class AdminMainWindow(QMainWindow):
             self.page_teacher_view,
             self.page_history,
             self.page_request_mgmt,
+            self.page_workflow,
         ]:
             self.stack.addWidget(page)
 

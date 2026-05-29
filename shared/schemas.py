@@ -33,7 +33,7 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    role: str        # "admin" | "vice_principal" | "teacher"
+    role: str        # "admin" | "vice_principal" | "department_head" | "teacher"
     user_id: int
     teacher_id: Optional[int] = None
 
@@ -287,6 +287,14 @@ class TimetableEntryOut(BaseModel):
 # ── 변경 신청 ──────────────────────────────────────────────────────────────
 
 class ChangeRequestOut(BaseModel):
+    """
+    변경 신청 응답.
+
+    동적 결재 워크플로우 지원:
+      - current_step: 현재 진행 중인 단계 (1-based)
+      - total_steps: 활성 워크플로우의 총 단계 수 (DB 컬럼 아님, API 응답 시 주입)
+      - approval_history: JSON 배열로 모든 단계별 승인/거절 기록
+    """
     id: int
     timetable_entry_id: int
     new_subject_id: Optional[int]
@@ -296,10 +304,13 @@ class ChangeRequestOut(BaseModel):
     reason: str
     requested_by: str
     requested_at: datetime
-    # 1차 승인: 일과계 선생님의 승인 정보
+    # 동적 결재 정보
+    current_step: int = 1
+    total_steps: int = 0           # API 응답 시 서버가 주입
+    approval_history: str = "[]"   # JSON 배열
+    # [DEPRECATED] 하드코딩된 2단계 결재 필드 — 하위 호환용 유지
     scheduler_approved_by: str = ""
     scheduler_approved_at: Optional[datetime] = None
-    # 최종 승인: 교감 선생님의 승인 정보
     approved_by: str = ""
     approved_at: Optional[datetime] = None
 
@@ -410,6 +421,67 @@ class ChatMessageCreate(BaseModel):
         if len(stripped) > 10000:
             raise ValueError("메시지가 너무 깁니다. 10000자 이하로 입력하세요.")
         return stripped
+
+
+# ── 결재 워크플로우 ─────────────────────────────────────────────────────────
+
+class ApprovalStepCreate(BaseModel):
+    """결재 단계 생성 요청."""
+    step_order: int = Field(..., ge=1)
+    role_required: str = Field(..., min_length=1, max_length=20)
+    step_name: str = Field(..., min_length=1, max_length=50)
+
+
+class ApprovalStepOut(BaseModel):
+    id: int
+    workflow_id: int
+    step_order: int
+    role_required: str
+    step_name: str
+
+    model_config = {"from_attributes": True}
+
+
+class ApprovalWorkflowCreate(BaseModel):
+    """
+    결재 워크플로우 생성 요청.
+
+    steps 의 step_order 는 1부터 시작하여 연속되어야 합니다.
+    예) [1, 2, 3] — 정상, [1, 3] — 오류 (2가 누락됨)
+
+    is_active=True 로 생성 시 기존 활성 워크플로우는 서버에서 자동 비활성화됩니다.
+    한 번에 하나의 워크플로우만 활성 상태일 수 있습니다.
+
+    보안:
+      - role_required 는 자유 텍스트이지만, 서버의 role 검증 로직에서
+        User.role 과 정확히 일치해야 승인 권한이 부여됩니다.
+        알 수 없는 role 값은 사실상 승인 불가능한 단계가 되므로 주의하세요.
+      - min_length=1 제약으로 빈 steps 배열 생성 방지 (최소 1단계 이상)
+      - field_validator 로 step_order 연속성 검증
+    """
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = ""
+    steps: list[ApprovalStepCreate] = Field(..., min_length=1)
+    is_active: bool = False
+
+    @field_validator("steps")
+    @classmethod
+    def steps_must_be_sequential(cls, v: list) -> list:
+        orders = [s.step_order for s in v]
+        if orders != list(range(1, len(orders) + 1)):
+            raise ValueError("단계 순서는 1부터 시작하여 빠짐없이 연속되어야 합니다.")
+        return v
+
+
+class ApprovalWorkflowOut(BaseModel):
+    id: int
+    name: str
+    description: str
+    is_active: bool
+    steps: list[ApprovalStepOut]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 # ── WebSocket 이벤트 (채팅 실시간 전송용) ──────────────────────────────────

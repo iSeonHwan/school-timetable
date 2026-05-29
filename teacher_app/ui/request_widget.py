@@ -7,7 +7,14 @@
   교사가 날짜·교시·대체 교사/교과/교실 선택 → 신청 제출
   → 관리자(교감·일과계)가 관리 프로그램에서 승인/거절
   → 이 화면에서 결과 확인
+
+동적 결재 워크플로우 지원:
+  - 서버에서 current_step, total_steps, approval_history 를 제공
+  - 상태 표시에 단계 진행 상황 포함
+  - 결재 이력 컬럼으로 각 단계별 처리 내역 확인 가능
 """
+import json
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QLineEdit, QPushButton, QTableWidget,
@@ -16,6 +23,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from shared.api_client import ApiClient, ApiError
+
+ROLE_DISPLAY = {
+    "admin": "일과계",
+    "vice_principal": "교감",
+    "department_head": "교무부장",
+}
 
 
 class _SubmitWorker(QThread):
@@ -119,7 +132,7 @@ class RequestWidget(QWidget):
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["신청일시", "대상", "사유", "상태", "처리자"])
+        self.table.setHorizontalHeaderLabels(["신청일시", "대상", "사유", "상태", "결재 이력"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
 
@@ -167,26 +180,33 @@ class RequestWidget(QWidget):
     def _populate_requests(self, requests: list):
         self.table.setRowCount(len(requests))
         status_colors = {
-            "pending":            "#FFF9C4",
-            "scheduler_approved": "#BBDEFB",  # 1차 승인: 연한 파랑
-            "approved":           "#E8F5E9",
-            "rejected":           "#FFEBEE",
-        }
-        status_labels = {
-            "pending": "대기 중",
-            "scheduler_approved": "1차 승인 (최종 대기)",
-            "approved": "최종 승인됨",
-            "rejected": "거절됨",
+            "pending":  "#FFF9C4",
+            "approved": "#E8F5E9",
+            "rejected": "#FFEBEE",
         }
         for row, req in enumerate(requests):
             at = str(req.get("requested_at", ""))[:16]
             status = req.get("status", "")
+            current_step = req.get("current_step", 1)
+            total_steps = req.get("total_steps", 0)
+
+            # 상태 텍스트 — pending 시 진행 단계 포함
+            if status == "pending":
+                total = total_steps or 1
+                status_text = f"대기 중 ({current_step}/{total}단계)"
+            elif status == "approved":
+                status_text = "승인 완료"
+            elif status == "rejected":
+                status_text = "거절"
+            else:
+                status_text = status
+
             cells = [
                 at,
                 f"시간표#{req.get('timetable_entry_id', '')}",
                 req.get("reason", ""),
-                status_labels.get(status, status),
-                req.get("approved_by", ""),
+                status_text,
+                self._format_approval_history(req.get("approval_history", "[]")),
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -194,6 +214,47 @@ class RequestWidget(QWidget):
                 if col == 3:
                     item.setBackground(QColor(status_colors.get(status, "#FFFFFF")))
                 self.table.setItem(row, col, item)
+
+    @staticmethod
+    def _format_approval_history(history_str: str) -> str:
+        """
+        서버에서 받은 approval_history JSON 문자열을 읽기 쉬운 여러 줄 텍스트로 변환합니다.
+
+        서버는 ChangeRequestOut 에 total_steps 를 동적으로 주입하여 응답하므로,
+        교사 앱은 별도의 워크플로우 조회 없이 API 응답만으로 진행 상황을 표시할 수 있습니다.
+
+        JSON 구조 (서버에서 current_user.username 으로 by 필드를 채워 응답):
+          [{"step": 1, "role": "admin", "action": "approve", "by": "admin", "at": "2024-03-15T14:30:00"}]
+
+        출력 예:
+          1단계 승인 (일과계, 03/15 14:30)
+          2단계 거절 (교감, 03/15 15:00)
+        """
+        try:
+            history = json.loads(history_str or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return ""
+
+        if not history:
+            return ""
+
+        lines = []
+        for h in history:
+            step = h.get("step", "?")
+            role = h.get("role", "")
+            role_label = ROLE_DISPLAY.get(role, role)
+            action = h.get("action", "")
+            action_text = "승인" if action == "approve" else "거절"
+            at_str = ""
+            if h.get("at"):
+                try:
+                    dt = datetime.fromisoformat(h["at"])
+                    at_str = dt.strftime("%m/%d %H:%M")
+                except (ValueError, TypeError):
+                    pass
+            lines.append(f"{step}단계 {action_text} ({role_label}{', ' + at_str if at_str else ''})")
+
+        return "\n".join(lines)
 
     def _submit(self):
         entry_id = self.cb_entry.currentData()

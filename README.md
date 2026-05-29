@@ -41,8 +41,8 @@
 | 프로그램 | 실행 위치 | 주요 역할 |
 |---|---|---|
 | **① FastAPI 서버** | 서버 컴퓨터 (24시간 상시 가동) | DB 관리, API 제공, 실시간 채팅 허브 |
-| **② 관리자 프로그램** | 일과계·교감 PC | **일과계(admin)**: 편제·교사·교과·교실 관리, 시간표 생성·직접 수정, 변경 신청 1차 승인 |
-| | | **교감(vice_principal)**: 시간표 열람(읽기 전용), 변경 신청 최종 승인/거절 |
+| **② 관리자 프로그램** | 일과계·교감 PC | **일과계(admin)**: 편제·교사·교과·교실 관리, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별) |
+| | | **교감(vice_principal)**: 시간표 열람(읽기 전용), 변경 신청 승인/거절 (워크플로우 설정에 따름) |
 | **③ 교사 프로그램** | 교사 PC | 시간표 조회, 교체 신청 제출·결과 확인 |
 
 서버 컴퓨터를 분리하는 이유는 업무용 PC를 24시간 켜놓기 어렵고, 다른 작업 중에 시간표 데이터가 의도치 않게 영향을 받을 수 있기 때문입니다. 모든 데이터는 서버의 PostgreSQL에서 중앙 관리됩니다.
@@ -53,15 +53,16 @@
 
 | 역할 | 코드상 role 값 | 권한 요약 |
 |---|---|---|
-| **일과계 선생님** | `admin` | **전체 관리**: 편제(학년·반·교실)·교사·교과목 CRUD, 계정 관리, 시간표 생성·직접 수정, 변경 신청 1차 승인 |
-| **교감 선생님** | `vice_principal` | **읽기 전용 + 최종 승인**: 시간표 열람(편집 불가), 변경 신청 최종 승인/거절만 가능. 편제·계정·일정 수정 불가 |
+| **일과계 선생님** | `admin` | **전체 관리**: 편제(학년·반·교실)·교사·교과목 CRUD, 계정 관리, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별) |
+| **교감 선생님** | `vice_principal` | **읽기 전용 + 승인 권한**: 시간표 열람(편집 불가), 변경 신청 승인/거절 (워크플로우 설정에 따름). 편제·계정·일정 수정 불가 |
+| **교무부장** | `department_head` | **읽기 전용 + 승인 권한**: 시간표 열람(편집 불가), 변경 신청 승인/거절 (워크플로우 설정에 따름). 3단계 이상 결재 라인에서 중간 승인자로 참여 가능 |
 | **교사** | `teacher` | 시간표 조회, 변경 신청 제출. 편집·승인 권한 없음 |
 
 서버 컴퓨터를 분리하는 이유는 업무용 PC를 24시간 켜놓기 어렵고, 다른 작업 중에 시간표 데이터가 의도치 않게 영향을 받을 수 있기 때문입니다. 모든 데이터는 서버의 PostgreSQL에서 중앙 관리됩니다.
 
 ### 핵심 설계 원칙
 
-핵심 설계 원칙은 세 가지입니다. 첫째, **역할 기반 접근 제어**입니다. JWT 토큰 인증으로 일과계(admin)·교감(vice_principal)·교사(teacher) 세 가지 계정을 구분하며, 시간표 생성·편집은 일과계만, 변경 신청 최종 승인은 교감만 가능합니다. 둘째, **데이터 일관성**입니다. 모든 수업 배정은 SQLAlchemy ORM을 통해 관계형 DB에 저장되므로, 교사 중복·교실 중복 같은 충돌은 자동 생성 단계에서 원천 차단합니다. 셋째, **감사 추적성**입니다. 모든 생성·수정·삭제 이벤트는 TimetableChangeLog 테이블에 변경 전후 상태를 JSON으로 기록합니다.
+핵심 설계 원칙은 세 가지입니다. 첫째, **역할 기반 접근 제어**입니다. JWT 토큰 인증으로 일과계(admin)·교감(vice_principal)·교무부장(department_head)·교사(teacher) 네 가지 계정을 구분하며, 시간표 생성·편집은 일과계만, 변경 신청 승인은 워크플로우 설정에 따라 역할별로 단계적 처리됩니다. 둘째, **데이터 일관성**입니다. 모든 수업 배정은 SQLAlchemy ORM을 통해 관계형 DB에 저장되므로, 교사 중복·교실 중복 같은 충돌은 자동 생성 단계에서 원천 차단합니다. 셋째, **감사 추적성**입니다. 모든 생성·수정·삭제 이벤트는 TimetableChangeLog 테이블에 변경 전후 상태를 JSON으로 기록하며, 변경 신청의 결재 이력도 approval_history JSON 배열로 완전히 추적됩니다.
 
 서버는 SQLite(개발/단독 운용)와 PostgreSQL(운영 환경) 두 가지 데이터베이스를 지원합니다. `DB_URL` 환경 변수로 전환합니다.
 
@@ -103,32 +104,43 @@
 
 **변경 신청**을 선택하면 변경 사유를 입력한 후 신청 레코드(TimetableChangeRequest)가 생성됩니다. 변경 신청은 즉시 시간표에 반영되지 않으며, 아래의 **2단계 승인 절차**를 거쳐 최종 확정됩니다.
 
-### 변경 신청 2단계 승인 절차
+### 변경 신청 동적 결재 승인 절차
 
-변경 신청은 단순히 승인/거절이 아니라, 실제 학교 운영 방식을 반영한 2단계 결재 흐름으로 처리됩니다.
+변경 신청은 실제 학교 운영 방식을 반영하여 관리자가 **자유롭게 설정할 수 있는 결재 워크플로우**로 처리됩니다. 학교 사정에 따라 1단계(일과계 단독 승인), 2단계(일과계 검토 → 교감 결재), 3단계 이상(일과계 → 교무부장 → 교감) 등으로 구성할 수 있습니다.
+
+**결재 라인 설정** (일과계 전용):
+- 사이드바 "결재 라인 설정" 페이지에서 워크플로우를 생성·수정·활성화
+- 각 단계마다 승인 역할(admin / vice_principal / department_head)과 단계 이름을 지정
+- 한 번에 하나의 워크플로우만 활성화되어 실제 결재에 사용됨
+- 단계 순서는 1부터 연속되어야 하며, 최소 1단계 이상 필요
 
 ```
 교사가 변경 신청 제출
-  → 상태: pending (대기 중)
+  → 상태: pending (대기 중), current_step = 1
   → "변경 신청/결재" 페이지에 표시
 
-1단계 — 일과계 선생님(admin)이 검토
-  → 1차 승인 시: pending → scheduler_approved (1차 승인)
-  → 거절 시: pending → rejected
-  → 1차 승인 단계에서는 실제 시간표가 변경되지 않음
+[동적 결재 워크플로우에 따른 단계별 승인]
 
-2단계 — 교감 선생님(vice_principal)이 최종 승인
-  → 최종 승인 시: scheduler_approved → approved
-  → 실제 TimetableEntry 에 변경 내용 적용 + 변경 이력 자동 기록
-  → 거절 시: scheduler_approved → rejected
+각 단계:
+  → 해당 단계의 role_required 와 일치하는 사용자만 승인·거절 가능
+  → 승인 시: approval_history JSON 배열에 기록 추가
+     - 마지막 단계가 아니면 current_step += 1 (다음 단계로 진행)
+     - 마지막 단계면 status = "approved", 실제 TimetableEntry 에 변경 적용 + 이력 기록
+  → 거절 시: status = "rejected", TimetableEntry 는 변경되지 않음
+
+예시: 3단계 결재 (일과계 → 교무부장 → 교감)
+  1단계 — 일과계(admin) 승인 → approval_history: [1단계 승인 기록]
+  2단계 — 교무부장(department_head) 승인 → approval_history: [1단계, 2단계]
+  3단계 — 교감(vice_principal) 최종 승인 → status = "approved", 시간표 반영
 ```
 
 **핵심 특징**:
-- **일과계**는 실무 검토자로서, 변경의 타당성과 충돌 여부를 1차적으로 확인합니다
-- **교감**은 최종 결재권자로서, 1차 승인된 건만 최종 승인할 수 있습니다
-- 교감은 시간표를 열람할 수 있지만 직접 수정하거나 편제·계정·일정을 변경할 수 없습니다
-- 각 단계마다 누가 언제 승인/거절했는지 기록되어 감사 추적이 가능합니다
-- 교사는 교사 프로그램의 "교체 신청" 페이지에서 자신의 신청 상태(pending → 1차 승인 → 최종 승인/거절)를 실시간으로 확인할 수 있습니다
+- **설정 가능한 결재 라인**: 학교마다 다른 결재 구조를 자유롭게 구성할 수 있습니다
+- **역할 기반 승인**: 각 단계는 개별 사용자가 아닌 역할(role) 단위로 승인자를 지정합니다
+- **단계별 진행 추적**: `current_step` / `total_steps` 로 현재 승인 진행 상황을 실시간 확인 가능
+- **완전한 감사 추적**: `approval_history` JSON 배열에 모든 단계의 승인·거절 기록(누가, 언제, 어떤 역할로, 어떤 결정을)이 저장됩니다
+- **권한 검증**: 각 단계에서 지정된 role과 일치하지 않는 사용자는 승인·거절을 시도해도 서버에서 403 Forbidden으로 차단됩니다
+- 교사는 교사 프로그램의 "교체 신청" 페이지에서 자신의 신청 상태(대기 중 (1/3단계) → 대기 중 (2/3단계) → 승인 완료/거절)를 실시간으로 확인할 수 있습니다
 
 ### 2.5 학사일정 관리
 
@@ -329,6 +341,7 @@ export DB_URL="postgresql+psycopg2://사용자:비밀번호@호스트/DB명"
 export JWT_SECRET_KEY="반드시-운영환경에서-변경할-비밀키"
 export ADMIN_PASSWORD="안전한-초기-비밀번호"
 export VP_PASSWORD="안전한-초기-비밀번호"
+export DH_PASSWORD="안전한-초기-비밀번호"
 export CORS_ORIGINS="http://실제서버IP:8000,http://실제도메인:8000"
 export WS_ALLOWED_ORIGINS="http://실제서버IP:8000,http://실제도메인:8000"
 uvicorn server.main:app --host 0.0.0.0 --port 8000
@@ -338,10 +351,11 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 | 계정 유형 | 기본 아이디 | 기본 비밀번호 | 역할 |
 |---|---|---|---|
-| **일과계 선생님** | `admin` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 전체 관리 (편제·계정·시간표 생성·1차 승인) |
-| **교감 선생님** | `vice_principal` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 시간표 열람 + 변경 신청 최종 승인만 |
+| **일과계 선생님** | `admin` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 전체 관리 (편제·계정·시간표 생성·승인) |
+| **교감 선생님** | `vice_principal` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 시간표 열람 + 변경 신청 승인 (워크플로우 설정에 따름) |
+| **교무부장** | `department_head` | 랜덤 생성 (서버 시작 시 콘솔에 1회 출력) | 시간표 열람 + 변경 신청 승인 (워크플로우 설정에 따름) |
 
-> **중요**: 서버 최초 실행 시 `ADMIN_PASSWORD` / `VP_PASSWORD` 환경 변수를 설정하지 않으면
+> **중요**: 서버 최초 실행 시 `ADMIN_PASSWORD` / `VP_PASSWORD` / `DH_PASSWORD` 환경 변수를 설정하지 않으면
 > 비밀번호가 `secrets.token_urlsafe(12)` 로 무작위 생성됩니다. 생성된 비밀번호는 서버 콘솔에
 > 한 번만 출력되므로 반드시 기록해 두세요. 환경 변수로 미리 설정하면 이 절차를 건너뛸 수 있습니다.
 >
@@ -358,6 +372,8 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 | `ADMIN_PASSWORD` | `secrets.token_urlsafe(12)` (랜덤 생성) | 일과계 선생님 초기 비밀번호. 미설정 시 서버 콘솔에 1회 출력됩니다. |
 | `VP_USERNAME` | `vice_principal` | 교감 선생님 기본 아이디 |
 | `VP_PASSWORD` | `secrets.token_urlsafe(12)` (랜덤 생성) | 교감 선생님 초기 비밀번호. 미설정 시 서버 콘솔에 1회 출력됩니다. |
+| `DH_USERNAME` | `department_head` | 교무부장 기본 아이디 |
+| `DH_PASSWORD` | `secrets.token_urlsafe(12)` (랜덤 생성) | 교무부장 초기 비밀번호. 미설정 시 서버 콘솔에 1회 출력됩니다. |
 | `CHAT_RETENTION_DAYS` | `60` | 채팅 메시지 보관 기간(일). 0=무기한 보관, 자동 정리 비활성화 |
 | `CORS_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | CORS 허용 출처 (쉼표 구분, 운영 환경에서는 실제 서버 IP/도메인으로 설정) |
 | `WS_ALLOWED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | WebSocket 허용 출처 (CSWSH 방지, 쉼표 구분). "" (빈 문자열)로 설정 시 Origin 검증 비활성화 (개발 환경용) |
@@ -370,8 +386,8 @@ export SERVER_URL="http://서버IP:8000"   # 서버 주소 지정
 python -m admin_app.main
 ```
 
-- **일과계 선생님**은 `admin` 계정으로 로그인합니다. 편제·교사·교과 등록 → 시간표 자동 생성 → 변경 신청 1차 승인 등 관리 기능 전체를 사용할 수 있습니다.
-- **교감 선생님**은 `vice_principal` 계정으로 로그인합니다. 사이드바에는 시간표 열람(읽기 전용)과 변경 신청 최종 승인 페이지만 표시됩니다. 편제나 계정 관리 기능은 접근할 수 없습니다.
+- **일과계 선생님**은 `admin` 계정으로 로그인합니다. 편제·교사·교과 등록 → 시간표 자동 생성 → 결재 라인 설정 → 변경 신청 승인 등 관리 기능 전체를 사용할 수 있습니다. 사이드바에는 9개 페이지가 표시됩니다.
+- **교감 선생님**은 `vice_principal` 계정으로 로그인합니다. 사이드바에는 시간표 열람(읽기 전용)과 변경 신청 승인 페이지만 표시됩니다(3개 페이지). 편제나 계정 관리 기능은 접근할 수 없습니다.
 
 ### 4단계: 교사 프로그램 실행 (교사 PC에서)
 
@@ -424,7 +440,11 @@ python -m teacher_app.main
 
 ### 5.7 변경 신청 결재
 
-사이드바에서 **"변경 신청/결재"**를 선택하면 대기 중인 변경 신청 목록이 표시됩니다. 목록에서 신청 항목을 클릭하면 하단에 신청 내용(대상 슬롯, 변경 내용, 사유)이 표시됩니다. "승인" 또는 "거절" 버튼을 클릭하여 처리합니다. 승인된 항목은 즉시 시간표에 반영됩니다.
+사이드바에서 **"변경 신청/결재"**를 선택하면 대기 중인 변경 신청 목록이 표시됩니다. 상태 컬럼에는 "대기 중 (1/3단계)"와 같이 현재 결재 진행 상황이 표시되며, 결재 이력 컬럼에서 각 단계별 승인·거절 기록을 확인할 수 있습니다.
+
+승인자는 자신의 역할(role)에 해당하는 단계의 신청만 처리할 수 있습니다. 예를 들어, 2단계 결재(일과계 → 교감)인 경우 일과계는 1단계 신청만 승인할 수 있고, 교감은 1단계를 통과한 2단계 신청만 최종 승인할 수 있습니다. 목록에서 신청 항목을 선택한 후 "승인" 또는 "거절" 버튼을 클릭하여 처리합니다. 마지막 단계에서 승인되면 변경 내용이 즉시 시간표에 반영되고 변경 이력에 자동 기록됩니다.
+
+**결재 라인 설정** 페이지에서는 학교의 결재 구조에 맞게 워크플로우를 설정할 수 있습니다. 새 워크플로우 생성 다이얼로그에서 단계 수와 각 단계의 승인 역할·이름을 지정하고, 목록에서 원하는 워크플로우를 선택하여 "활성화" 버튼을 누르면 해당 워크플로우가 변경 신청 결재에 적용됩니다. 활성화된 워크플로우는 삭제할 수 없으므로, 먼저 다른 워크플로우를 활성화한 후 삭제해야 합니다.
 
 ---
 
@@ -437,8 +457,9 @@ school_timetable/
 ├── build_installer.py            # PyInstaller 기반 설치 프로그램 빌드 스크립트
 │
 ├── shared/                       # 서버·관리자 앱·교사 앱이 함께 사용하는 공통 모듈
-│   ├── models.py                 # SQLAlchemy ORM 모델 14개 (정식 정의 위치)
+│   ├── models.py                 # SQLAlchemy ORM 모델 16개 (정식 정의 위치)
 │   │                             #   기존 12개 + User(로그인 계정) + ChatMessage(채팅 메시지)
+│   │                             #   + ApprovalWorkflow(결재 워크플로우) + ApprovalStep(결재 단계)
 │   ├── schemas.py                # Pydantic v2 요청/응답 스키마 (API 계약 정의)
 │   └── api_client.py             # 동기 HTTP + WebSocket 클라이언트 (ApiClient 클래스)
 │                                 #   ※ 블로킹 호출 — PyQt6에서는 반드시 QThread 안에서 사용
@@ -451,14 +472,16 @@ school_timetable/
 │       ├── auth.py               # /auth/* 엔드포인트: 로그인, 현재 사용자 조회, 계정 CRUD (admin 전용)
 │       ├── setup.py              # /setup/* 엔드포인트: 학년·반·교사·교과목·교실 CRUD (admin 전용)
 │       ├── timetable.py          # /timetable/* 엔드포인트: 학기·시간표 조회·생성, 변경 신청·승인·이력
-│       └── chat.py               # /chat/* 엔드포인트: REST 메시지 조회 + WebSocket 실시간 채팅
-│                                 #   ConnectionManager 싱글턴이 접속 목록을 관리하며 브로드캐스트 처리
+│       ├── chat.py               # /chat/* 엔드포인트: REST 메시지 조회 + WebSocket 실시간 채팅
+│       │                         #   ConnectionManager 싱글턴이 접속 목록을 관리하며 브로드캐스트 처리
+│       └── workflow.py           # /workflows/* 엔드포인트: 결재 워크플로우 CRUD + 활성화 (일과계 전용)
+│                                 #   ApprovalWorkflow + ApprovalStep 테이블 관리
 │
 ├── admin_app/                    # 관리자(교감·일과계) 전용 데스크톱 앱
 │   ├── main.py                   # 앱 진입점: Qt 초기화 → 로그인 창
 │   └── ui/
 │       ├── login_window.py       # 로그인 창 (role=admin 계정만 허용)
-│       ├── admin_main_window.py  # 메인 창: 기존 ui/ 위젯(편제·시간표) + 우측 채팅 패널(280px)
+│       ├── admin_main_window.py  # 메인 창: 역할별 사이드바 (일과계 9페이지 / 교감 3페이지) + 우측 채팅 패널(280px)
 │       └── chat_panel.py         # 채팅 패널. _WsThread(QThread)로 WebSocket 수신, 공지 체크박스 포함
 │
 ├── teacher_app/                  # 일반 교사 전용 데스크톱 앱
@@ -484,7 +507,8 @@ school_timetable/
 │   │   ├── class_setup.py        # 학년/반 CRUD 화면
 │   │   ├── teacher_setup.py      # 교사 CRUD + 불가 시간 체크박스 그리드
 │   │   ├── subject_setup.py      # 교과목 CRUD + 반별 시수/교사 배정 테이블
-│   │   └── room_setup.py         # 교실 CRUD (일반교실·특별실)
+│   │   ├── room_setup.py         # 교실 CRUD (일반교실·특별실)
+│   │   └── workflow_setup.py     # 결재 라인 설정 (워크플로우 CRUD + 활성화, 일과계 전용)
 │   ├── timetable/
 │   │   ├── class_view.py         # 반별 시간표 조회 (Mode A: 주간 / Mode B: 1일 전체)
 │   │   ├── teacher_view.py       # 교사별 시간표 조회
@@ -515,7 +539,7 @@ school_timetable/
 
 ## 7. 데이터베이스 구조 (ERD)
 
-이 프로그램은 14개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
+이 프로그램은 16개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
 
 ```
 AcademicTerm (학기)
@@ -548,6 +572,10 @@ TimetableEntry (시간표 배정 1행 = 1수업 슬롯)
   └── room_id          → Room (nullable)
        └──< TimetableChangeRequest (변경 신청/결재)
        └──< TimetableChangeLog    (변경 이력, 감사 로그)
+
+ApprovalWorkflow (결재 워크플로우 정의)
+  └──< ApprovalStep (cascade delete-orphan, step_order 기준 정렬)
+         └── role_required → role 값 참조 (User.role 과 매칭, FK 아님)
 ```
 
 **모델별 핵심 컬럼 요약**
@@ -568,6 +596,8 @@ TimetableEntry (시간표 배정 1행 = 1수업 슬롯)
 | `Room` | name, room_type |
 | `User` | username, password_hash, role (admin/teacher), teacher_id, is_active |
 | `ChatMessage` | user_id, content, is_announcement, created_at |
+| `ApprovalWorkflow` | name, description, is_active, created_at |
+| `ApprovalStep` | workflow_id, step_order, role_required, step_name |
 
 ### FK 의존성 계층 (Tier)
 
@@ -589,6 +619,8 @@ TimetableEntry (시간표 배정 1행 = 1수업 슬롯)
 | 3 | ↓ | `chat_messages` | users |
 | 4 | 최하위 | `timetable_change_logs` | timetable_entries, school_classes |
 | 4 | 최하위 | `timetable_change_requests` | timetable_entries, subjects, teachers, rooms |
+| 5 | 독립 | `approval_workflows` | 없음 |
+| 5 | 하위 | `approval_steps` | approval_workflows |
 
 - **INSERT(Import)**: Tier 0 → 4 순서로 처리 (상위 데이터가 먼저 존재해야 FK 생성 가능)
 - **DELETE(초기화)**: Tier 4 → 0 순서로 처리 (하위 데이터를 먼저 삭제해야 FK 위반 방지)

@@ -85,10 +85,15 @@ def require_vice_principal(user: User = Depends(_get_current_user)) -> User:
 
 def require_admin_or_vice_principal(user: User = Depends(_get_current_user)) -> User:
     """
-    일과계(admin) 또는 교감(vice_principal) 접근 허용 가드.
-    데이터 조회(GET) 엔드포인트에 사용합니다. 교사(teacher)는 차단됩니다.
+    일과계(admin), 교감(vice_principal), 교무부장(department_head) 접근 허용 가드.
+
+    데이터 조회(GET) 엔드포인트와 워크플로우 결재에 사용합니다.
+    교사(teacher)는 차단됩니다.
+
+    department_head 는 결재 워크플로우의 중간 승인자로 참여할 수 있도록
+    읽기 권한을 부여받습니다.
     """
-    if user.role not in ("admin", "vice_principal"):
+    if user.role not in ("admin", "vice_principal", "department_head"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="관리자 권한이 필요합니다.",

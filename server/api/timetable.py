@@ -10,12 +10,14 @@ GET  /timetable/requests         — 변경 신청 목록
 POST /timetable/requests         — 변경 신청 제출 (교사)
 PATCH /timetable/requests/{id}   — 신청 승인/거절 (관리자)
 """
+import json
 from typing import Optional
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 from shared.models import (
     AcademicTerm, TimetableEntry, TimetableChangeLog,
     TimetableChangeRequest, Subject, Teacher, Room, User,
+    ApprovalWorkflow, ApprovalStep,
 )
 from shared.schemas import (
     AcademicTermOut, AcademicTermCreate,
@@ -143,16 +145,27 @@ def list_logs(
 
 # ── 변경 신청 ──────────────────────────────────────────────────────────────
 
-@router.get("/requests", response_model=list[ChangeRequestOut])
+@router.get("/requests")
 def list_requests(
     status: Optional[str] = None,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
+    """
+    변경 신청 목록을 반환합니다.
+
+    각 응답에 활성 워크플로우의 total_steps 를 주입하여
+    클라이언트가 진행 상황(현재 단계/총 단계)을 표시할 수 있게 합니다.
+    """
     q = db.query(TimetableChangeRequest)
     if status:
         q = q.filter(TimetableChangeRequest.status == status)
-    return q.order_by(TimetableChangeRequest.requested_at.desc()).all()
+    requests = q.order_by(TimetableChangeRequest.requested_at.desc()).all()
+
+    wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
+    total_steps = len(wf.steps) if wf else 0
+
+    return [_enrich_response(req, total_steps) for req in requests]
 
 
 @router.post("/requests", response_model=ChangeRequestOut, status_code=201)
@@ -179,7 +192,7 @@ def submit_request(
     return req
 
 
-@router.patch("/requests/{request_id}", response_model=ChangeRequestOut)
+@router.patch("/requests/{request_id}")
 def review_request(
     request_id: int,
     body: ChangeRequestReview,
@@ -187,17 +200,22 @@ def review_request(
     current_user: User = Depends(get_current_user),
 ):
     """
-    변경 신청을 승인하거나 거절합니다. (2단계 승인)
+    변경 신청을 승인하거나 거절합니다. (동적 결재 워크플로우)
 
-    승인 흐름 (사용자의 role 에 따라 자동 분기):
-      1단계 — 일과계 선생님(admin)이 승인:
-               pending → scheduler_approved
-               (TimetableEntry 는 아직 변경되지 않음)
-      2단계 — 교감 선생님(vice_principal)이 최종 승인:
-               scheduler_approved → approved
-               (TimetableEntry 에 변경 내용을 실제 적용 + 변경 이력 기록)
+    활성 ApprovalWorkflow 를 기준으로 현재 단계(current_step)와
+    사용자의 role 을 검증하여 승인/거절을 처리합니다.
 
-    거절은 두 역할 모두 가능하며, 어느 단계든 거절 시 rejected 로 처리됩니다.
+    승인 흐름:
+      1. 활성 워크플로우 로드 → 총 단계 수(total_steps) 파악
+      2. 현재 current_step 에 해당하는 ApprovalStep 조회
+      3. current_user.role 이 step.role_required 와 일치하는지 검증
+      4. 승인 시:
+         - approval_history JSON 배열에 기록 추가
+         - 마지막 단계가 아니면 current_step += 1 (다음 단계로 진행)
+         - 마지막 단계면 status = "approved", TimetableEntry 에 변경 적용
+
+    거절: 현재 단계의 role 을 가진 사용자만 거절 가능.
+          승인된/이미 거절된 건은 거절 불가.
 
     Body:
         action: "approve" | "reject"
@@ -212,72 +230,66 @@ def review_request(
     if body.action not in ("approve", "reject"):
         raise HTTPException(400, "action 은 'approve' 또는 'reject' 여야 합니다.")
 
+    # ── 활성 워크플로우 로드 ──────────────────────────────────────────────
+    wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
+    if wf is None:
+        raise HTTPException(500, "활성화된 결재 워크플로우가 없습니다. 관리자에게 문의하세요.")
+
+    total_steps = len(wf.steps)
+    cur = req.current_step
     now = datetime.now()
-    # actor_name 은 항상 서버에서 JWT 토큰으로 인증된 current_user.username 으로 결정합니다.
-    # 클라이언트가 요청 바디에 임의의 approved_by 값을 주입하더라도 무시됩니다.
-    # 이를 통해 승인자 사칭(actor impersonation) 공격을 방지하고 감사 로그의 무결성을 보장합니다.
-    actor_name = current_user.username
+    actor_name = current_user.username  # 항상 서버에서 결정 (위조 방지)
     user_role = current_user.role
 
-    # ── 거절 처리 (일과계·교감만 가능) ───────────────────────────────────────
+    # ── 거절 처리 ──────────────────────────────────────────────────────────
     if body.action == "reject":
         # 교사는 거절 권한이 없습니다.
-        if user_role not in ("admin", "vice_principal"):
-            raise HTTPException(403, "변경 신청 거절 권한이 없습니다. 관리자 계정으로 로그인하세요.")
-        # 대기 중이거나 1차 승인된 상태만 거절 가능 (이미 최종 승인/거절된 건은 불가)
+        if user_role == "teacher":
+            raise HTTPException(403, "변경 신청 거절 권한이 없습니다.")
+
         if req.status in ("approved", "rejected"):
             raise HTTPException(400, "이미 최종 처리 완료된 신청입니다.")
+
+        # 현재 단계의 역할 검증
+        step_def = _get_step_at(wf, cur)
+        if step_def is not None and user_role != step_def.role_required:
+            raise HTTPException(400, f"현재 결재 단계는 '{step_def.role_required}' 역할만 처리할 수 있습니다.")
 
         req.status = "rejected"
         req.approved_by = actor_name
         req.approved_at = now
-
-        # 누가 거절했는지 기록: 일과계인지 교감인지에 따라 적절한 필드에 저장
-        if user_role == "admin":
-            req.scheduler_approved_by = actor_name
-            req.scheduler_approved_at = now
-        elif user_role == "vice_principal":
-            req.vice_principal_approved_by = actor_name
-            req.vice_principal_approved_at = now
-        # teacher 는 이 엔드포인트 자체에 접근할 수 없으므로(별도 가드 없으나
-        # deps.py 의 require_admin_or_vice_principal 을 여기서는 사용하지 않음 —
-        # review_request 는 get_current_user 로 인증만 확인하고,
-        # 역할 검증은 아래 approve 분기에서 진행)
-
+        _append_history(req, cur, user_role, "reject", actor_name, now)
         db.commit()
         db.refresh(req)
-        return req
+        return _enrich_response(req, total_steps)
 
-    # ── 승인 처리 (role 에 따라 1차/2차 분기) ───────────────────────────────
+    # ── 승인 처리 ──────────────────────────────────────────────────────────
     # body.action == "approve"
+    if req.status not in ("pending", "scheduler_approved"):
+        raise HTTPException(400, f"'대기 중' 상태인 신청만 승인할 수 있습니다. 현재 상태: {req.status}")
 
-    if user_role == "admin":
-        # ── 1차 승인: 일과계 선생님 ──────────────────────────────────────
-        if req.status != "pending":
-            raise HTTPException(
-                400,
-                f"1차 승인은 '대기 중(pending)' 상태인 신청만 처리할 수 있습니다. "
-                f"현재 상태: {req.status}",
-            )
-        req.status = "scheduler_approved"
-        req.scheduler_approved_by = actor_name
-        req.scheduler_approved_at = now
-        # approved_by 는 교감 최종 승인 시에만 채워집니다.
-        # 여기서는 명시적으로 비워둡니다 (혹시 이전에 거절됐다가 재신청된 경우 대비).
-        req.approved_by = ""
-        req.approved_at = None
+    # 현재 단계 확인
+    step_def = _get_step_at(wf, cur)
+    if step_def is None:
+        raise HTTPException(500, f"워크플로우에 {cur}단계가 정의되어 있지 않습니다.")
 
-    elif user_role == "vice_principal":
-        # ── 2차(최종) 승인: 교감 선생님 ─────────────────────────────────
-        if req.status != "scheduler_approved":
-            raise HTTPException(
-                400,
-                f"최종 승인은 '1차 승인(scheduler_approved)' 상태인 신청만 처리할 수 있습니다. "
-                f"현재 상태: {req.status}",
-            )
+    # 역할 검증: 현재 단계의 required role 과 사용자 role 이 일치해야 함
+    if user_role != step_def.role_required:
+        raise HTTPException(
+            403,
+            f"현재 결재 단계({cur}단계)는 '{step_def.role_required}' 역할만 승인할 수 있습니다. "
+            f"당신의 역할: {user_role}",
+        )
+
+    # 승인 기록 추가
+    _append_history(req, cur, user_role, "approve", actor_name, now)
+
+    if cur < total_steps:
+        # 다음 단계로 진행 (아직 최종 승인 아님)
+        req.current_step = cur + 1
+    else:
+        # 마지막 단계: 최종 승인
         req.status = "approved"
-        req.vice_principal_approved_by = actor_name
-        req.vice_principal_approved_at = now
         req.approved_by = actor_name
         req.approved_at = now
 
@@ -285,30 +297,83 @@ def review_request(
         entry = db.get(TimetableEntry, req.timetable_entry_id)
         if entry:
             from core.change_logger import log_entry_update
-            # 변경 전 상태를 스냅샷으로 기록합니다.
             before = {
                 "subject_id": entry.subject_id,
                 "teacher_id": entry.teacher_id,
                 "room_id": entry.room_id,
             }
-            # 신청된 변경사항만 선택적으로 적용 (None 이 아닌 필드만 덮어씀)
             if req.new_subject_id is not None:
                 entry.subject_id = req.new_subject_id
             if req.new_teacher_id is not None:
                 entry.teacher_id = req.new_teacher_id
             if req.new_room_id is not None:
                 entry.room_id = req.new_room_id
-
-            # 승인 시점에 중복 배정 재검증을 하지 않는 이유:
-            # 신청 제출 당시에는 충돌이 없었더라도, 승인 전에 다른 슬롯이 변경됐을 수
-            # 있습니다. 그러나 충돌 감지를 여기서 하면 승인 거부 로직이 복잡해집니다.
-            # 대신 교감이 시간표를 직접 확인하고 충돌 여부를 판단하도록 위임합니다.
             log_entry_update(session=db, entry=entry, before=before)
-
-    else:
-        # teacher role — 승인 권한 없음
-        raise HTTPException(403, "변경 신청 승인 권한이 없습니다. 관리자 계정으로 로그인하세요.")
 
     db.commit()
     db.refresh(req)
-    return req
+    return _enrich_response(req, total_steps)
+
+
+# ── 워크플로우 헬퍼 함수 ─────────────────────────────────────────────────────
+# 이 함수들은 review_request 와 list_requests 에서 공통으로 사용하는
+# 결재 워크플로우 처리 로직입니다. DB 직접 접근하는 admin_app UI 와
+# 동일한 비즈니스 로직을 공유하므로, 변경 시 양쪽을 동기화해야 합니다.
+
+
+def _get_step_at(workflow: ApprovalWorkflow, step_order: int) -> Optional[ApprovalStep]:
+    """
+    워크플로우에서 지정된 step_order 에 해당하는 ApprovalStep 을 반환합니다.
+
+    workflow.steps 는 order_by="ApprovalStep.step_order" 로 정렬되어 있습니다.
+    step_order 는 1-based: 1=첫 단계, 2=두 번째 단계, ...
+    일치하는 단계가 없으면 None 을 반환합니다 (워크플로우 정의 불일치).
+    """
+    for step in workflow.steps:
+        if step.step_order == step_order:
+            return step
+    return None
+
+
+def _append_history(req: TimetableChangeRequest, step: int, role: str,
+                    action: str, by: str, at: datetime):
+    """
+    approval_history JSON 배열에 승인/거절 항목을 추가합니다.
+
+    각 항목의 필드:
+      - step: 결재 단계 번호 (1-based)
+      - role: 승인/거절자의 role 값 (서버가 current_user.role 로 결정 — 위조 불가)
+      - action: "approve" 또는 "reject"
+      - by: 승인/거절자 username (서버가 current_user.username 으로 결정 — 위조 불가)
+      - at: ISO 8601 형식의 처리 시각
+
+    보안: by 와 role 필드는 서버에서 JWT 토큰으로 인증된 current_user 정보를
+    사용하므로, 클라이언트가 다른 사용자로 위장하여 승인 기록을 조작할 수 없습니다.
+    """
+    history = json.loads(req.approval_history or "[]")
+    history.append({
+        "step": step,
+        "role": role,
+        "action": action,
+        "by": by,
+        "at": at.isoformat(),
+    })
+    req.approval_history = json.dumps(history, ensure_ascii=False)
+
+
+def _enrich_response(req: TimetableChangeRequest, total_steps: int) -> ChangeRequestOut:
+    """
+    ChangeRequestOut 응답에 total_steps 를 동적으로 주입하여 반환합니다.
+
+    total_steps 는 DB 컬럼이 아니라 활성 ApprovalWorkflow 의 steps 개수로
+    매 응답마다 계산됩니다. 워크플로우가 변경되면 total_steps 도 자동으로
+    새로운 값이 반영됩니다.
+
+    object.__setattr__ 를 사용하는 이유:
+      ChangeRequestOut 은 Pydantic v2 모델로, model_validate() 이후에는
+      일반적인 속성 할당이 제한됩니다. __setattr__ 로 우회하여
+      DB 컬럼이 아닌 동적 필드를 주입합니다.
+    """
+    result = ChangeRequestOut.model_validate(req)
+    object.__setattr__(result, "total_steps", total_steps)
+    return result

@@ -28,6 +28,7 @@ from server.api.auth import router as auth_router
 from server.api.setup import router as setup_router
 from server.api.timetable import router as timetable_router
 from server.api.chat import router as chat_router, start_cleanup_task
+from server.api.workflow import router as workflow_router
 
 
 @asynccontextmanager
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
     db_url = os.getenv("DB_URL")
     init_db(db_url)
     _ensure_admin()
+    _ensure_default_workflow()
 
     # 채팅 메시지 자동 정리 백그라운드 태스크 시작
     _cleanup_task = start_cleanup_task()
@@ -57,17 +59,19 @@ def _ensure_admin():
     """
     최초 실행 시 관리자 계정이 없으면 자동으로 생성합니다.
 
-    두 종류의 관리자 계정을 생성합니다:
-      - 일과계 선생님 (admin): 전체 관리 권한
+    세 종류의 관리자 계정을 생성합니다 (각 role 별 1개씩, 기존 계정이 없을 때만):
+      - 일과계 선생님 (admin): 전체 관리 권한 — 편제·계정·시간표 생성·결재 라인 설정
         환경 변수 ADMIN_USERNAME / ADMIN_PASSWORD 로 제어.
-        ADMIN_PASSWORD 미설정 시 secrets.token_urlsafe(12)로 랜덤 생성 후
-        콘솔에 1회 출력합니다. 생성된 비밀번호는 서버 로그에만 남으므로
-        반드시 기록해 두세요.
-      - 교감 선생님 (vice_principal): 변경 신청 최종 승인만 가능
+      - 교감 선생님 (vice_principal): 시간표 열람 + 변경 신청 승인
         환경 변수 VP_USERNAME / VP_PASSWORD 로 제어.
-        VP_PASSWORD 미설정 시 마찬가지로 랜덤 생성됩니다.
+      - 교무부장 (department_head): 시간표 열람 + 변경 신청 승인 (중간 결재자)
+        환경 변수 DH_USERNAME / DH_PASSWORD 로 제어.
 
-    이미 해당 role 의 계정이 존재하면 아무 작업도 하지 않습니다.
+    비밀번호 미설정 시 secrets.token_urlsafe(12)로 랜덤 생성 후
+    콘솔에 1회 출력합니다. 생성된 비밀번호는 서버 로그에만 남으므로
+    반드시 기록해 두세요.
+
+    이미 해당 role 의 계정이 존재하면 아무 작업도 하지 않습니다 (멱등성 보장).
     """
     db = get_session()
     try:
@@ -106,6 +110,95 @@ def _ensure_admin():
                 print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
             else:
                 print(f"[서버] 최초 교감 선생님 계정 생성: {vp_username} (비밀번호를 즉시 변경하세요!)")
+
+        # ── 교무부장 계정 (department_head) ──────────────────────────────
+        dh_username = os.getenv("DH_USERNAME", "department_head")
+        dh_password = os.getenv("DH_PASSWORD") or secrets.token_urlsafe(12)
+        if not db.query(User).filter_by(role="department_head").first():
+            dh = User(
+                username=dh_username,
+                password_hash=hash_password(dh_password),
+                role="department_head",
+            )
+            db.add(dh)
+            db.commit()
+            if not os.getenv("DH_PASSWORD"):
+                print(f"[서버] 최초 교무부장 계정 생성: {dh_username}")
+                print(f"  초기 비밀번호: {dh_password}")
+                print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
+            else:
+                print(f"[서버] 최초 교무부장 계정 생성: {dh_username} (비밀번호를 즉시 변경하세요!)")
+    finally:
+        db.close()
+
+
+def _ensure_default_workflow():
+    """
+    최초 실행 시 기본 2단계 결재 워크플로우를 생성하고 기존 데이터를 마이그레이션합니다.
+
+    이 함수는 서버 시작 시마다 호출되지만, 이미 워크플로우가 존재하면
+    아무 작업도 수행하지 않습니다 (멱등성 보장).
+
+    1. 기본 워크플로우 생성 (approval_workflows 테이블이 비어있을 때만):
+       - "기본 2단계 결재": 일과계 1차 승인 → 교감 최종 승인
+       - is_active=True 로 생성되어 즉시 사용 가능
+
+    2. 기존 timetable_change_requests 데이터 백필 (마이그레이션):
+       기존의 하드코딩된 2단계 결재(status 기반)에서
+       동적 워크플로우(current_step 기반)로 전환 시 기존 데이터를 보정합니다.
+
+       이전 상태              → 새 필드 값
+       ──────────────────────────────────────────────
+       pending                 → current_step=1, approval_history=[]
+       scheduler_approved      → current_step=2 (1단계 승인 완료, 2단계 대기)
+       approved                → current_step=3 (모든 단계 완료, total_steps+1)
+       rejected                → 변경 없음 (current_step 은 유지)
+
+       IDEMPOTENT: (current_step IS NULL OR current_step=0) 조건으로
+       이미 마이그레이션된 행을 건너뛰므로 반복 실행해도 안전합니다.
+    """
+    from shared.models import ApprovalWorkflow, ApprovalStep
+    from sqlalchemy import text
+
+    db = get_session()
+    try:
+        # 1. 기본 워크플로우 생성
+        if db.query(ApprovalWorkflow).count() == 0:
+            wf = ApprovalWorkflow(
+                name="기본 2단계 결재",
+                description="일과계 1차 승인 → 교감 최종 승인",
+                is_active=True,
+            )
+            db.add(wf)
+            db.flush()
+            db.add(ApprovalStep(
+                workflow_id=wf.id, step_order=1,
+                role_required="admin", step_name="1차 승인 (일과계)",
+            ))
+            db.add(ApprovalStep(
+                workflow_id=wf.id, step_order=2,
+                role_required="vice_principal", step_name="최종 승인 (교감)",
+            ))
+            db.commit()
+            print("[서버] 기본 2단계 결재 워크플로우가 생성되었습니다.")
+
+        # 2. 기존 change request 데이터 마이그레이션
+        # pending → current_step=1, approval_history=[]
+        db.execute(text(
+            "UPDATE timetable_change_requests SET current_step=1, approval_history='[]' "
+            "WHERE status='pending' AND (current_step IS NULL OR current_step=0)"
+        ))
+        # scheduler_approved → current_step=2 (1단계 통과, 2단계 대기)
+        db.execute(text(
+            "UPDATE timetable_change_requests SET current_step=2 "
+            "WHERE status='scheduler_approved' AND (current_step IS NULL OR current_step=0)"
+        ))
+        # approved → current_step=3 (모든 단계 완료)
+        db.execute(text(
+            "UPDATE timetable_change_requests SET current_step=3 "
+            "WHERE status='approved' AND (current_step IS NULL OR current_step=0)"
+        ))
+        db.commit()
     finally:
         db.close()
 
@@ -142,6 +235,7 @@ app.include_router(auth_router)
 app.include_router(setup_router)
 app.include_router(timetable_router)
 app.include_router(chat_router)
+app.include_router(workflow_router)
 
 
 @app.get("/", tags=["상태"])

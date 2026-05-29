@@ -89,7 +89,21 @@ def list_users(db: Session = Depends(get_db), _: User = Depends(require_schedule
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def create_user(body: UserCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
-    """새 사용자 계정을 생성합니다. 관리자 전용."""
+    """
+    새 사용자 계정을 생성합니다. 관리자(일과계) 전용.
+
+    보안:
+      - role 값 화이트리스트 검증으로 알 수 없는 role 주입 방지.
+        허용된 role: admin(일과계), vice_principal(교감), department_head(교무부장), teacher(교사).
+        예를 들어 body.role="superadmin" 같은 임의 값은 400 에러로 차단됩니다.
+      - 아이디 중복 검사로 동일 username 생성 방지 (DB unique 제약조건과 이중 방어).
+      - 비밀번호는 hash_password() 로 bcrypt 해싱 후 저장 (평문 저장 금지).
+        비밀번호는 UserCreate.password 필드로 평문 전송되므로,
+        반드시 HTTPS(TLS) 환경에서만 이 엔드포인트를 사용해야 합니다.
+    """
+    _ALLOWED_ROLES = {"admin", "vice_principal", "department_head", "teacher"}
+    if body.role not in _ALLOWED_ROLES:
+        raise HTTPException(status_code=400, detail=f"허용되지 않은 역할입니다: {body.role}")
     if db.query(User).filter_by(username=body.username).first():
         raise HTTPException(status_code=400, detail="이미 사용 중인 아이디입니다.")
     user = User(
