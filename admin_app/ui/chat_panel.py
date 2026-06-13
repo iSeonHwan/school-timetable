@@ -43,6 +43,7 @@ class _WsThread(QThread):
       - disconnected     : WebSocket 연결 종료
     """
     message_received = pyqtSignal(str)
+    notification_received = pyqtSignal(dict)
     connected = pyqtSignal()
     disconnected = pyqtSignal()
 
@@ -191,7 +192,14 @@ class ChatPanel(QWidget):
       - teacher              : 메시지 열람·전송만 가능
       - vice_principal (교감): 메시지 열람·전송 + 공지 발송 가능
       - admin (일과계)      : 메시지 열람·전송 + 공지 발송 + 메시지 삭제 + 일괄 정리 가능
+
+    Signals:
+        notification_received(dict): 서버에서 "notification" WebSocket 이벤트 수신 시 발송.
+                                     ChatPanel 은 자신이 아닌 상위 위젯(TeacherMainWindow)에서
+                                     알림 UI 를 갱신할 수 있도록 중계합니다.
     """
+
+    notification_received = pyqtSignal(dict)
 
     def __init__(self, client: ApiClient, is_admin: bool = False):
         """
@@ -319,6 +327,7 @@ class ChatPanel(QWidget):
     def _start_ws(self):
         self._ws_thread = _WsThread(self._client)
         self._ws_thread.message_received.connect(self._on_ws_message)
+        self._ws_thread.notification_received.connect(self.notification_received)
         self._ws_thread.connected.connect(self._on_connected)
         self._ws_thread.disconnected.connect(self._on_disconnected)
         self._ws_thread.start()
@@ -363,6 +372,10 @@ class ChatPanel(QWidget):
             msg_ids = event.get("payload", {}).get("message_ids", [])
             for mid in msg_ids:
                 self._remove_bubble(mid)
+
+        elif etype == "notification":
+            # 서버에서 실시간 알림 전송 → 상위 위젯에 전달
+            self.notification_received.emit(event.get("payload", {}))
 
     # ── 버블 추가/제거 ───────────────────────────────────────────────────────
 

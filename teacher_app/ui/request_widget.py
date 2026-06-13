@@ -131,8 +131,8 @@ class RequestWidget(QWidget):
 
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["신청일시", "대상", "사유", "상태", "결재 이력"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["신청일시", "대상", "사유", "상태", "동의", "결재 이력"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
 
@@ -184,11 +184,24 @@ class RequestWidget(QWidget):
             "approved": "#E8F5E9",
             "rejected": "#FFEBEE",
         }
+        consent_colors = {
+            "not_required": "#FFFFFF",
+            "pending":      "#FFF9C4",
+            "approved":     "#E8F5E9",
+            "rejected":     "#FFEBEE",
+        }
+        consent_labels = {
+            "not_required": "불필요",
+            "pending":      "대기 중",
+            "approved":     "동의 완료",
+            "rejected":     "동의 거절",
+        }
         for row, req in enumerate(requests):
             at = str(req.get("requested_at", ""))[:16]
             status = req.get("status", "")
             current_step = req.get("current_step", 1)
             total_steps = req.get("total_steps", 0)
+            consent_status = req.get("consent_status", "not_required")
 
             # 상태 텍스트 — pending 시 진행 단계 포함
             if status == "pending":
@@ -206,6 +219,7 @@ class RequestWidget(QWidget):
                 f"시간표#{req.get('timetable_entry_id', '')}",
                 req.get("reason", ""),
                 status_text,
+                consent_labels.get(consent_status, consent_status),
                 self._format_approval_history(req.get("approval_history", "[]")),
             ]
             for col, text in enumerate(cells):
@@ -213,6 +227,8 @@ class RequestWidget(QWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if col == 3:
                     item.setBackground(QColor(status_colors.get(status, "#FFFFFF")))
+                elif col == 4:
+                    item.setBackground(QColor(consent_colors.get(consent_status, "#FFFFFF")))
                 self.table.setItem(row, col, item)
 
     @staticmethod

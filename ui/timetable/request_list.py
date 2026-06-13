@@ -128,6 +128,7 @@ class ChangeRequestWidget(QWidget):
                 font-weight: bold; padding: 4px;
             }
         """)
+        self.table.itemSelectionChanged.connect(self._update_button_state)
         layout.addWidget(self.table)
 
         # ── 승인/거절 버튼 ────────────────────────────────────────────
@@ -247,15 +248,23 @@ class ChangeRequestWidget(QWidget):
         """
         상태 문자열을 생성합니다.
 
-        pending 상태일 때는 현재 결재 진행 상황을 표시합니다:
-          예) "대기 중 (1/3단계)" — 3단계 중 1단계 대기 중
-          예) "대기 중 (3/3단계)" — 마지막 단계 승인만 남음
+        pending 상태일 때는 현재 결재 진행 상황과 피교사 동의 상태를 표시합니다:
+          예) "대기 중 (1/3단계) — 동의 완료"
+          예) "대기 중 (1/3단계) — 동의 대기"
 
         approved/rejected 는 최종 상태이므로 단계 정보 없이 표시합니다.
         """
+        consent_labels = {
+            "not_required": "동의 불필요",
+            "pending":      "동의 대기",
+            "approved":     "동의 완료",
+            "rejected":     "동의 거절",
+        }
+        consent_text = consent_labels.get(req.consent_status, req.consent_status)
+
         if req.status == "pending":
             total = self._total_steps or 1
-            return f"대기 중 ({req.current_step}/{total}단계)"
+            return f"대기 중 ({req.current_step}/{total}단계) — {consent_text}"
         if req.status == "approved":
             return "승인 완료"
         if req.status == "rejected":
@@ -312,6 +321,34 @@ class ChangeRequestWidget(QWidget):
             QMessageBox.warning(self, "선택 오류", "처리할 신청을 선택해 주세요.")
             return None
         return int(self.table.item(row, 0).text())
+
+    def _update_button_state(self):
+        """
+        테이블 선택 변경 시 승인/거절 버튼의 활성화 상태를 조정합니다.
+
+        피교사 동의가 필요한 신청(consent_status=pending)은 아직 승인할 수 없으며,
+        버튼에 툴팁으로 안내 메시지를 표시합니다.
+        """
+        row = self.table.currentRow()
+        if row < 0:
+            self.btn_approve.setEnabled(True)
+            self.btn_approve.setToolTip("")
+            return
+
+        req_id = int(self.table.item(row, 0).text())
+        session = get_session()
+        try:
+            req = session.get(TimetableChangeRequest, req_id)
+            if req and req.consent_status == "pending":
+                self.btn_approve.setEnabled(False)
+                self.btn_approve.setToolTip(
+                    "피교사의 동의가 완료된 후에 승인할 수 있습니다."
+                )
+            else:
+                self.btn_approve.setEnabled(True)
+                self.btn_approve.setToolTip("")
+        finally:
+            session.close()
 
     def _get_step_at(self, step_number: int):
         """워크플로우에서 지정된 단계의 ApprovalStep 을 반환합니다."""
@@ -383,6 +420,14 @@ class ChangeRequestWidget(QWidget):
                 return
             if req.status == "rejected":
                 QMessageBox.warning(self, "오류", "이미 거절된 신청입니다.")
+                return
+
+            # 피교사 동의가 필요한 신청은 동의 완료 전까지 승인 불가
+            if req.consent_status == "pending":
+                QMessageBox.warning(
+                    self, "동의 대기 중",
+                    "피교사의 동의가 완료된 후에 승인할 수 있습니다."
+                )
                 return
 
             # 활성 워크플로우가 없으면 결재 진행 불가능

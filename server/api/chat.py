@@ -48,7 +48,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from shared.models import ChatMessage, User
 from shared.schemas import ChatMessageOut, ChatMessageCreate
@@ -102,6 +102,40 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect(ws)
 
+    async def send_to_user(self, user_id: int, message: dict):
+        """
+        특정 사용자에게만 메시지를 전송합니다.
+
+        같은 사용자가 여러 창/기기로 접속 중이면 모두에게 전송합니다.
+        끊긴 연결은 자동 제거합니다.
+        """
+        dead = []
+        sent = False
+        for uid, ws in self._connections:
+            if uid != user_id:
+                continue
+            try:
+                await ws.send_text(json.dumps(message, ensure_ascii=False, default=str))
+                sent = True
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+        return sent
+
+    async def send_to_users(self, user_ids: set[int], message: dict):
+        """여러 지정 사용자에게 동일한 메시지를 전송합니다."""
+        dead = []
+        for uid, ws in self._connections:
+            if uid not in user_ids:
+                continue
+            try:
+                await ws.send_text(json.dumps(message, ensure_ascii=False, default=str))
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
     @property
     def online_count(self) -> int:
         return len(self._connections)
@@ -118,9 +152,16 @@ def list_messages(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """최근 채팅 메시지를 반환합니다 (오래된 순 정렬)."""
+    """
+    최근 채팅 메시지를 반환합니다 (오래된 순 정렬).
+
+    2026-06-13 변경:
+      - joinedload(ChatMessage.user) 를 사용하여 N+1 쿼리를 제거합니다.
+        각 메시지마다 User 를 개별 조회하는 대신 한 번의 JOIN 으로 가져옵니다.
+    """
     rows = (
         db.query(ChatMessage)
+        .options(joinedload(ChatMessage.user))
         .order_by(ChatMessage.created_at.desc())
         .limit(limit)
         .all()
@@ -301,8 +342,10 @@ async def websocket_chat(ws: WebSocket):
             return
 
         # 접속 직후 최근 100개 이력 전송
+        # joinedload 로 발신자 정보를 한 번에 가져와 N+1 을 방지합니다.
         rows = (
             db.query(ChatMessage)
+            .options(joinedload(ChatMessage.user))
             .order_by(ChatMessage.created_at.desc())
             .limit(100)
             .all()
@@ -396,7 +439,15 @@ def _save_message(db: Session, user: User, content: str, is_announcement: bool) 
 
 
 def _to_out(msg: ChatMessage, db: Session) -> ChatMessageOut:
-    user = db.get(User, msg.user_id)
+    """
+    ChatMessage 를 ChatMessageOut 으로 변환합니다.
+
+    2026-06-13 변경:
+      - msg.user 를 직접 사용합니다. 호출자가 joinedload 로 미리 로드했다면
+        추가 쿼리가 발생하지 않습니다. lazy load 되지 않은 경우에만 fallback
+        으로 DB 에서 조회합니다.
+    """
+    user = msg.user if msg.user else db.get(User, msg.user_id)
     return ChatMessageOut(
         id=msg.id,
         user_id=msg.user_id,
@@ -405,6 +456,57 @@ def _to_out(msg: ChatMessage, db: Session) -> ChatMessageOut:
         is_announcement=msg.is_announcement,
         created_at=msg.created_at,
     )
+
+
+# ── 알림 헬퍼 ────────────────────────────────────────────────────────────────
+
+async def create_and_send_notification(
+    db: Session,
+    user_id: int,
+    notif_type: str,
+    change_request_id: Optional[int],
+    message: str,
+):
+    """
+    알림을 DB 에 저장하고, 접속 중인 사용자에게 WebSocket 으로 실시간 전송합니다.
+
+    2026-06-13 신규:
+      - 교사 동의 요청/결과, 변경 신청 상태 변화 등을 실시간으로 전달하기 위해
+        사용합니다.
+      - DB 저장과 WebSocket 발송은 모두 이 함수에서 처리하여 중앙 집중화합니다.
+
+    Args:
+        db: SQLAlchemy 세션
+        user_id: 수신자 User.id
+        notif_type: Notification.type 값
+        change_request_id: 연결된 TimetableChangeRequest.id (없으면 None)
+        message: 사용자에게 표시할 메시지 본문
+    """
+    from shared.models import Notification
+
+    notif = Notification(
+        user_id=user_id,
+        type=notif_type,
+        change_request_id=change_request_id,
+        message=message,
+        is_read=False,
+    )
+    db.add(notif)
+    db.commit()
+    db.refresh(notif)
+
+    payload = {
+        "type": "notification",
+        "payload": {
+            "id": notif.id,
+            "type": notif.type,
+            "change_request_id": notif.change_request_id,
+            "message": notif.message,
+            "is_read": notif.is_read,
+            "created_at": notif.created_at.isoformat(),
+        },
+    }
+    await manager.send_to_user(user_id, payload)
 
 
 # ── 백그라운드 자동 정리 태스크 ────────────────────────────────────────────────

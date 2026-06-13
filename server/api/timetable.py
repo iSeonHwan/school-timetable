@@ -9,25 +9,46 @@ GET  /timetable/logs             — 변경 이력 (관리자)
 GET  /timetable/requests         — 변경 신청 목록
 POST /timetable/requests         — 변경 신청 제출 (교사)
 PATCH /timetable/requests/{id}   — 신청 승인/거절 (관리자)
+GET  /timetable/suggestions      — 교체 가능한 대안 제안 (교사)
+PATCH /timetable/requests/{id}/consent — 피교사 동의/거절 (교사)
 """
 import json
 from typing import Optional
+from datetime import datetime
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 from shared.models import (
     AcademicTerm, TimetableEntry, TimetableChangeLog,
     TimetableChangeRequest, Subject, Teacher, Room, User,
-    ApprovalWorkflow, ApprovalStep,
+    ApprovalWorkflow, ApprovalStep, SubjectClassAssignment, SchoolClass,
 )
 from shared.schemas import (
     AcademicTermOut, AcademicTermCreate,
     TimetableEntryOut, GenerateRequest,
     ChangeLogOut, ChangeRequestOut, ChangeRequestCreate, ChangeRequestReview,
+    SuggestionResponse, SuggestionCurrent, SuggestionOption,
+    ConsentReview,
 )
 from server.deps import get_db, get_current_user, require_scheduler, require_admin_or_vice_principal
 from core.generator import generate_timetable
+from server.api.chat import create_and_send_notification
 
 router = APIRouter(prefix="/timetable", tags=["시간표"])
+
+
+async def _notify_user_async(user_id: int, notif_type: str, change_request_id: Optional[int], message: str):
+    """
+    백그라운드에서 알림을 생성·전송하는 헬퍼.
+
+    FastAPI BackgroundTasks 는 동기/비동기 함수 모두 실행할 수 있습니다.
+    DB 세션을 요청 핸들러와 분리하기 위해 별도 세션을 생성합니다.
+    """
+    from database.connection import get_session
+    db = get_session()
+    try:
+        await create_and_send_notification(db, user_id, notif_type, change_request_id, message)
+    finally:
+        db.close()
 
 
 # ── 학기 ───────────────────────────────────────────────────────────────────
@@ -171,13 +192,47 @@ def list_requests(
 @router.post("/requests", response_model=ChangeRequestOut, status_code=201)
 def submit_request(
     body: ChangeRequestCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """교사가 시간표 변경을 신청합니다."""
+    """
+    교사가 시간표 변경을 신청합니다.
+
+    2026-06-13 변경:
+      - 피교사 동의가 필요한 경우 consent_status=pending 으로 설정하고,
+        current_step=0 으로 두어 일과계가 먼저 승인하지 못하도록 합니다.
+      - 피교사에게 실시간 알림을 전송합니다.
+      - 교환(swap) 신청의 경우 상대 슬롯의 교사를 affected_teacher_id 로 설정.
+    """
     entry = db.get(TimetableEntry, body.timetable_entry_id)
     if entry is None:
         raise HTTPException(404, "시간표 항목을 찾을 수 없습니다.")
+
+    # 피교사 동의가 필요한지 판단
+    affected_teacher_id: Optional[int] = None
+    consent_status = "not_required"
+    current_step = 1
+
+    # 1) 교환(swap) 신청: 상대 슬롯의 현재 교사에게 동의 요청
+    if body.swap_partner_entry_id is not None:
+        partner = db.get(TimetableEntry, body.swap_partner_entry_id)
+        if partner is None:
+            raise HTTPException(404, "교환 상대 슬롯을 찾을 수 없습니다.")
+        if partner.term_id != entry.term_id:
+            raise HTTPException(400, "교환 상대 슬롯은 같은 학기여야 합니다.")
+        affected_teacher_id = partner.teacher_id
+        consent_status = "pending"
+        current_step = 0
+    # 2) 교사 변경: 새 교사에게 동의 요청
+    elif body.new_teacher_id is not None and body.new_teacher_id != entry.teacher_id:
+        new_teacher = db.get(Teacher, body.new_teacher_id)
+        if new_teacher is None:
+            raise HTTPException(404, "지정한 교사를 찾을 수 없습니다.")
+        affected_teacher_id = new_teacher.id
+        consent_status = "pending"
+        current_step = 0
+
     req = TimetableChangeRequest(
         timetable_entry_id=body.timetable_entry_id,
         new_subject_id=body.new_subject_id,
@@ -185,44 +240,57 @@ def submit_request(
         new_room_id=body.new_room_id,
         reason=body.reason,
         requested_by=current_user.username,
+        requested_at=datetime.now(),
+        current_step=current_step,
+        affected_teacher_id=affected_teacher_id,
+        consent_status=consent_status,
+        swap_partner_entry_id=body.swap_partner_entry_id,
     )
     db.add(req)
     db.commit()
     db.refresh(req)
-    return req
+
+    # 피교사 동의가 필요하면 알림 생성 및 실시간 전송
+    if consent_status == "pending" and affected_teacher_id is not None:
+        affected_user = db.query(User).filter_by(teacher_id=affected_teacher_id).first()
+        if affected_user is not None:
+            message = (
+                f"{current_user.username} 선생님이 수업 변경을 요청하셨습니다. "
+                f"사유: {body.reason or '미작성'}"
+            )
+            background_tasks.add_task(
+                _notify_user_async,
+                affected_user.id,
+                "consent_request",
+                req.id,
+                message,
+            )
+
+    wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
+    total_steps = len(wf.steps) if wf else 0
+    return _enrich_response(req, total_steps)
 
 
 @router.patch("/requests/{request_id}")
 def review_request(
     request_id: int,
     body: ChangeRequestReview,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    변경 신청을 승인하거나 거절합니다. (동적 결재 워크플로우)
+    변경 신청을 승인하거나 거절합니다. (동적 결재 워크플로우 + 교사 동의)
 
-    활성 ApprovalWorkflow 를 기준으로 현재 단계(current_step)와
-    사용자의 role 을 검증하여 승인/거절을 처리합니다.
-
-    승인 흐름:
-      1. 활성 워크플로우 로드 → 총 단계 수(total_steps) 파악
-      2. 현재 current_step 에 해당하는 ApprovalStep 조회
-      3. current_user.role 이 step.role_required 와 일치하는지 검증
-      4. 승인 시:
-         - approval_history JSON 배열에 기록 추가
-         - 마지막 단계가 아니면 current_step += 1 (다음 단계로 진행)
-         - 마지막 단계면 status = "approved", TimetableEntry 에 변경 적용
-
-    거절: 현재 단계의 role 을 가진 사용자만 거절 가능.
-          승인된/이미 거절된 건은 거절 불가.
+    2026-06-13 변경:
+      - 피교사 동의(consent) 완료 전에는 일과계/교감이 승인할 수 없습니다.
+      - 최종 승인 시 교환(swap)인 경우 상대 슬롯도 함께 변경합니다.
+      - 승인/거절 결과를 신청자에게 실시간 알림으로 전송합니다.
 
     Body:
         action: "approve" | "reject"
         approved_by: 승인자/거절자 이름 (미입력 시 current_user.username 사용)
     """
-    from datetime import datetime
-
     # ── 기본 검증 ──────────────────────────────────────────────────────────
     req = db.get(TimetableChangeRequest, request_id)
     if req is None:
@@ -241,9 +309,24 @@ def review_request(
     actor_name = current_user.username  # 항상 서버에서 결정 (위조 방지)
     user_role = current_user.role
 
+    # ── 피교사 동의 상태 검증 ──────────────────────────────────────────────
+    # 동의가 필요한 신청(consent_status=pending/rejected)은 관리자 결재 전에
+    # 피교사의 동의를 먼저 받아야 합니다.
+    if req.consent_status == "pending":
+        raise HTTPException(
+            400,
+            "피교사의 동의 대기 중입니다. 동의 완료 후 관리자 승인이 가능합니다."
+        )
+    if req.consent_status == "rejected":
+        raise HTTPException(
+            400,
+            "피교사가 동의를 거절하여 더 이상 승인할 수 없습니다."
+        )
+
     # ── 거절 처리 ──────────────────────────────────────────────────────────
     if body.action == "reject":
-        # 교사는 거절 권한이 없습니다.
+        # 교사는 관리자 결재 단계에서 거절 권한이 없습니다.
+        # (교사의 거절은 PATCH /requests/{id}/consent 로 처리)
         if user_role == "teacher":
             raise HTTPException(403, "변경 신청 거절 권한이 없습니다.")
 
@@ -261,6 +344,10 @@ def review_request(
         _append_history(req, cur, user_role, "reject", actor_name, now)
         db.commit()
         db.refresh(req)
+
+        # 신청자에게 거절 알림 전송
+        _notify_requester(background_tasks, db, req, "rejected", "변경 신청이 거절되었습니다.")
+
         return _enrich_response(req, total_steps)
 
     # ── 승인 처리 ──────────────────────────────────────────────────────────
@@ -287,32 +374,121 @@ def review_request(
     if cur < total_steps:
         # 다음 단계로 진행 (아직 최종 승인 아님)
         req.current_step = cur + 1
-    else:
-        # 마지막 단계: 최종 승인
-        req.status = "approved"
-        req.approved_by = actor_name
-        req.approved_at = now
+        db.commit()
+        db.refresh(req)
+        _notify_requester(background_tasks, db, req, "status_update",
+                         f"변경 신청이 {cur + 1}단계로 전달되었습니다.")
+        return _enrich_response(req, total_steps)
 
-        # 실제 시간표 항목에 변경 내용을 적용합니다.
-        entry = db.get(TimetableEntry, req.timetable_entry_id)
-        if entry:
-            from core.change_logger import log_entry_update
-            before = {
-                "subject_id": entry.subject_id,
-                "teacher_id": entry.teacher_id,
-                "room_id": entry.room_id,
-            }
-            if req.new_subject_id is not None:
-                entry.subject_id = req.new_subject_id
-            if req.new_teacher_id is not None:
-                entry.teacher_id = req.new_teacher_id
-            if req.new_room_id is not None:
-                entry.room_id = req.new_room_id
-            log_entry_update(session=db, entry=entry, before=before)
+    # 마지막 단계: 최종 승인
+    req.status = "approved"
+    req.approved_by = actor_name
+    req.approved_at = now
+
+    # 실제 시간표 항목에 변경 내용을 적용합니다.
+    _apply_request_changes(db, req)
 
     db.commit()
     db.refresh(req)
+
+    # 신청자에게 최종 승인 알림 전송
+    _notify_requester(background_tasks, db, req, "approved", "변경 신청이 최종 승인되어 시간표에 반영되었습니다.")
+
     return _enrich_response(req, total_steps)
+
+
+@router.patch("/requests/{request_id}/consent")
+def review_consent(
+    request_id: int,
+    body: ConsentReview,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    피교사가 변경 신청에 대한 동의(승인) 또는 거절을 처리합니다.
+
+    2026-06-13 신규:
+      - 피교사(로그인한 사용자의 teacher_id == affected_teacher_id)만 호출 가능.
+      - 승인 시: consent_status=approved, current_step=1 로 설정하여
+        일과계 결재 라인이 시작됩니다.
+      - 거절 시: consent_status=rejected, status=rejected 로 최종 처리.
+      - 결과는 신청자에게 실시간 알림으로 전송됩니다.
+
+    Body:
+        action: "approve" | "reject"
+    """
+    # ── 기본 검증 ──────────────────────────────────────────────────────────
+    req = db.get(TimetableChangeRequest, request_id)
+    if req is None:
+        raise HTTPException(404, "신청 내역을 찾을 수 없습니다.")
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(400, "action 은 'approve' 또는 'reject' 여야 합니다.")
+
+    # 피교사 권한 검증
+    if current_user.teacher_id is None or current_user.teacher_id != req.affected_teacher_id:
+        raise HTTPException(403, "해당 변경 신청에 대한 동의/거절 권한이 없습니다.")
+
+    if req.consent_status != "pending":
+        raise HTTPException(400, f"동의 대기 중인 신청만 처리할 수 있습니다. 현재 상태: {req.consent_status}")
+
+    if req.status in ("approved", "rejected"):
+        raise HTTPException(400, "이미 최종 처리 완료된 신청입니다.")
+
+    now = datetime.now()
+    req.consent_by_user_id = current_user.id
+    req.consent_at = now
+
+    wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
+    total_steps = len(wf.steps) if wf else 0
+
+    if body.action == "reject":
+        req.consent_status = "rejected"
+        req.status = "rejected"
+        db.commit()
+        db.refresh(req)
+        _notify_requester(background_tasks, db, req, "consent_rejected",
+                         f"{current_user.username} 선생님이 교체/변경 요청을 거절하셨습니다.")
+        return _enrich_response(req, total_steps)
+
+    # 승인
+    req.consent_status = "approved"
+    req.current_step = 1  # 일과계 결재 라인 시작
+    db.commit()
+    db.refresh(req)
+
+    _notify_requester(background_tasks, db, req, "consent_approved",
+                     f"{current_user.username} 선생님이 교체/변경 요청에 동의하셨습니다. 일과계 승인 대기 중입니다.")
+    return _enrich_response(req, total_steps)
+
+
+@router.get("/suggestions", response_model=SuggestionResponse)
+def get_suggestions(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    특정 시간표 슬롯에 대한 교체 가능한 대안을 제안합니다.
+
+    2026-06-13 신규:
+      - 현재 슬롯의 반·교시·교사·과목·교실 정보를 반환.
+      - 과목/교사/교실별 대체 제안과, 다른 슬롯과의 교환(swap) 제안을 반환.
+      - 모든 제안은 반 중복, 교사 중복, 교실 중복, 교사 불가 시간, 일일 최대 수업
+        등의 충돌 검증을 통과해야 합니다.
+
+    Query:
+        entry_id: 대상 TimetableEntry.id
+    """
+    entry = db.get(TimetableEntry, entry_id)
+    if entry is None:
+        raise HTTPException(404, "시간표 항목을 찾을 수 없습니다.")
+
+    # 요청자가 해당 슬롯의 교사이거나, 관리자/교감/교무부장이면 조회 허용
+    if current_user.role == "teacher" and current_user.teacher_id != entry.teacher_id:
+        raise HTTPException(403, "본인의 수업 슬롯에 대한 제안만 조회할 수 있습니다.")
+
+    return _build_suggestions(db, entry)
 
 
 # ── 워크플로우 헬퍼 함수 ─────────────────────────────────────────────────────
@@ -377,3 +553,362 @@ def _enrich_response(req: TimetableChangeRequest, total_steps: int) -> ChangeReq
     result = ChangeRequestOut.model_validate(req)
     object.__setattr__(result, "total_steps", total_steps)
     return result
+
+
+# ── 변경 적용 및 알림 헬퍼 ───────────────────────────────────────────────────
+
+def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
+    """
+    최종 승인된 변경 신청을 실제 TimetableEntry 에 반영합니다.
+
+    2026-06-13 변경:
+      - 단순 변경(과목/교사/교실)과 교환(swap)을 모두 처리합니다.
+      - 교환인 경우 swap_partner_entry_id 의 슬롯도 함께 수정합니다.
+      - 모든 변경은 TimetableChangeLog 에 before/after 로 기록됩니다.
+    """
+    from core.change_logger import log_entry_update
+
+    entry = db.get(TimetableEntry, req.timetable_entry_id)
+    if entry is None:
+        return
+
+    before = {"subject_id": entry.subject_id, "teacher_id": entry.teacher_id, "room_id": entry.room_id}
+    if req.new_subject_id is not None:
+        entry.subject_id = req.new_subject_id
+    if req.new_teacher_id is not None:
+        entry.teacher_id = req.new_teacher_id
+    if req.new_room_id is not None:
+        entry.room_id = req.new_room_id
+    log_entry_update(db, entry, before)
+
+    # 교환(swap)인 경우 상대 슬롯도 교환합니다.
+    if req.swap_partner_entry_id is not None:
+        partner = db.get(TimetableEntry, req.swap_partner_entry_id)
+        if partner is not None:
+            # swap 은 서로의 원래 값을 맞바꿉니다.
+            partner_before = {"subject_id": partner.subject_id, "teacher_id": partner.teacher_id, "room_id": partner.room_id}
+            # entry 의 원래 값(before)과 partner 의 원래 값을 교환
+            entry.subject_id, partner.subject_id = partner_before["subject_id"], before["subject_id"]
+            entry.teacher_id, partner.teacher_id = partner_before["teacher_id"], before["teacher_id"]
+            entry.room_id, partner.room_id = partner_before["room_id"], before["room_id"]
+            log_entry_update(db, partner, partner_before)
+
+
+def _notify_requester(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    req: TimetableChangeRequest,
+    notif_type: str,
+    message: str,
+) -> None:
+    """
+    변경 신청자(requested_by)에게 실시간 알림을 전송합니다.
+
+    2026-06-13 신규:
+      - requested_by username 으로 User 를 조회하여 알림을 생성.
+      - 요청자가 오프라인이어도 DB 에 남아 재접속 시 확인 가능.
+    """
+    requester = db.query(User).filter_by(username=req.requested_by).first()
+    if requester is None:
+        return
+    background_tasks.add_task(
+        _notify_user_async,
+        requester.id,
+        notif_type,
+        req.id,
+        message,
+    )
+
+
+# ── 제안 알고리즘 헬퍼 ─────────────────────────────────────────────────────
+
+def _day_name(day: int) -> str:
+    """요일 번호(1=월)를 한글 요일명으로 변환합니다."""
+    names = {1: "월", 2: "화", 3: "수", 4: "목", 5: "금"}
+    return names.get(day, "?")
+
+
+def _teacher_constraints_set(db: Session, teacher_ids: list[int]) -> set[tuple[int, int]]:
+    """
+    지정한 교사들의 '불가' 제약 슬롯을 {(day, period)} 집합으로 반환합니다.
+    """
+    from shared.models import TeacherConstraint
+    rows = (
+        db.query(TeacherConstraint)
+        .filter(
+            TeacherConstraint.teacher_id.in_(teacher_ids),
+            TeacherConstraint.constraint_type == "unavailable",
+        )
+        .all()
+    )
+    return {(r.day_of_week, r.period) for r in rows}
+
+
+def _entries_for_term(db: Session, term_id: int):
+    """해당 학기의 모든 TimetableEntry 를 반환합니다."""
+    return db.query(TimetableEntry).filter_by(term_id=term_id).all()
+
+
+def _build_conflict_maps(db: Session, term_id: int, exclude_entry_id: Optional[int]):
+    """
+    충돌 검증용 맵을 미리 계산합니다.
+
+    반환값:
+      class_slots: {class_id: {(day, period)}}
+      teacher_slots: {teacher_id: {(day, period)}}
+      room_slots: {room_id: {(day, period)}}
+      teacher_daily: {(teacher_id, day): count}
+    """
+    entries = _entries_for_term(db, term_id)
+    class_slots: dict[int, set] = {}
+    teacher_slots: dict[int, set] = {}
+    room_slots: dict[int, set] = {}
+    teacher_daily: dict[tuple[int, int], int] = {}
+
+    for e in entries:
+        if e.id == exclude_entry_id:
+            continue
+        slot = (e.day_of_week, e.period)
+        class_slots.setdefault(e.school_class_id, set()).add(slot)
+        teacher_slots.setdefault(e.teacher_id, set()).add(slot)
+        if e.room_id is not None:
+            room_slots.setdefault(e.room_id, set()).add(slot)
+        teacher_daily[(e.teacher_id, e.day_of_week)] = teacher_daily.get((e.teacher_id, e.day_of_week), 0) + 1
+
+    return class_slots, teacher_slots, room_slots, teacher_daily
+
+
+def _teacher_max_map(db: Session) -> dict[int, int]:
+    """교사별 일 최대 수업 수를 반환합니다. 1 미만은 1로 보정합니다."""
+    return {t.id: max(t.max_daily_classes, 1) for t in db.query(Teacher).all()}
+
+
+def _can_place_teacher(
+    teacher_id: int,
+    day: int,
+    period: int,
+    teacher_slots: dict[int, set],
+    teacher_daily: dict[tuple[int, int], int],
+    teacher_max: dict[int, int],
+    unavailable: set[tuple[int, int]],
+    exclude_entry_id: Optional[int] = None,
+) -> bool:
+    """
+    특정 교사를 (day, period)에 배치할 수 있는지 검증합니다.
+    """
+    slot = (day, period)
+    if slot in unavailable:
+        return False
+    if slot in teacher_slots.get(teacher_id, set()):
+        return False
+    if teacher_daily.get((teacher_id, day), 0) >= teacher_max.get(teacher_id, 1):
+        return False
+    return True
+
+
+def _can_place_class(
+    class_id: int,
+    day: int,
+    period: int,
+    class_slots: dict[int, set],
+) -> bool:
+    """특정 반을 (day, period)에 배치할 수 있는지 검증합니다."""
+    return (day, period) not in class_slots.get(class_id, set())
+
+
+def _can_place_room(
+    room_id: Optional[int],
+    day: int,
+    period: int,
+    room_slots: dict[int, set],
+) -> bool:
+    """특정 교실을 (day, period)에 배치할 수 있는지 검증합니다."""
+    if room_id is None:
+        return True
+    return (day, period) not in room_slots.get(room_id, set())
+
+
+def _build_suggestions(db: Session, entry: TimetableEntry) -> SuggestionResponse:
+    """
+    주어진 TimetableEntry 에 대한 교체/대체/교환 제안을 생성합니다.
+
+    2026-06-13 신규:
+      - 과목/교사/교실 대체 제안: 현재 슬롯의 반·교시에 배치 가능한 후보를 검색.
+      - 교환 제안: 다른 슬롯과 서로 교사/과목을 맞바꿀 수 있는 경우를 검색.
+      - 모든 제안은 반/교사/교실 중복, 불가 시간, 일일 최대 수업을 고려.
+    """
+    term_id = entry.term_id
+    day = entry.day_of_week
+    period = entry.period
+    class_id = entry.school_class_id
+    subject_id = entry.subject_id
+    teacher_id = entry.teacher_id
+    room_id = entry.room_id
+
+    # 현재 슬롯의 표시 정보 구성
+    subj = db.get(Subject, subject_id)
+    tchr = db.get(Teacher, teacher_id)
+    room = db.get(Room, room_id) if room_id else None
+    cls = db.get(SchoolClass, class_id)
+    current = SuggestionCurrent(
+        entry_id=entry.id,
+        day_of_week=day,
+        period=period,
+        school_class_id=class_id,
+        school_class_name=cls.display_name if cls else "",
+        subject_id=subject_id,
+        subject_name=subj.name if subj else "",
+        teacher_id=teacher_id,
+        teacher_name=tchr.name if tchr else "",
+        room_id=room_id,
+        room_name=room.name if room else None,
+    )
+
+    # 충돌 맵 구성 (현재 슬롯은 제외하여 비어있는 것처럼 취급)
+    class_slots, teacher_slots, room_slots, teacher_daily = _build_conflict_maps(db, term_id, entry.id)
+
+    # 교사 제약 및 최대 수업 맵
+    all_teachers = db.query(Teacher).all()
+    teacher_ids = [t.id for t in all_teachers]
+    unavailable = _teacher_constraints_set(db, teacher_ids)
+    teacher_max = _teacher_max_map(db)
+
+    subjects: list[SuggestionOption] = []
+    teachers: list[SuggestionOption] = []
+    rooms: list[SuggestionOption] = []
+
+    slot = (day, period)
+
+    # ── 과목 대체 제안 ────────────────────────────────────────────────────
+    # 같은 반·학기의 SubjectClassAssignment 중, 해당 교시에 갈 수 있는 조합
+    assignments = (
+        db.query(SubjectClassAssignment)
+        .filter_by(school_class_id=class_id, term_id=term_id)
+        .all()
+    )
+    seen_subject_teacher = set()
+    for a in assignments:
+        # 동일 (과목, 교사) 조합이면 스킵
+        key = (a.subject_id, a.teacher_id)
+        if key in seen_subject_teacher:
+            continue
+        seen_subject_teacher.add(key)
+        # 현재와 완전히 동일한 경우는 제안 불필요
+        if a.subject_id == subject_id and a.teacher_id == teacher_id:
+            continue
+        # 배치 가능성 검증
+        if not _can_place_class(class_id, day, period, class_slots):
+            continue
+        if not _can_place_teacher(a.teacher_id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
+            continue
+        # 교실: 기존 room_id 를 그대로 사용하거나, 배정의 preferred_room_id 사용
+        target_room_id = a.preferred_room_id if a.preferred_room_id is not None else room_id
+        if not _can_place_room(target_room_id, day, period, room_slots):
+            continue
+
+        subj_obj = db.get(Subject, a.subject_id)
+        tchr_obj = db.get(Teacher, a.teacher_id)
+        room_obj = db.get(Room, target_room_id) if target_room_id else None
+        label = f"{subj_obj.name}({tchr_obj.name})"
+        if room_obj:
+            label += f" — {room_obj.name}"
+        subjects.append(SuggestionOption(
+            subject_id=a.subject_id,
+            teacher_id=a.teacher_id,
+            room_id=target_room_id,
+            label=label,
+            reason=f"{tchr_obj.name} 선생님이 해당 교시에 수업이 없으며 일일 최대 수업을 초과하지 않습니다."
+        ))
+
+    # ── 교사 대체 제안 ───────────────────────────────────────────────────
+    # 현재 과목을 가르칠 수 있고 해당 교시에 갈 수 있는 교사
+    current_subject = db.get(Subject, subject_id)
+    for t in all_teachers:
+        if t.id == teacher_id:
+            continue
+        if not _can_place_teacher(t.id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
+            continue
+        # 현재 과목에 대한 배정이 있는 교사를 우선 제안
+        has_assignment = any(
+            a.subject_id == subject_id and a.school_class_id == class_id and a.term_id == term_id
+            for a in t.subject_assignments
+        )
+        reason = f"{t.name} 선생님이 해당 교시에 수업이 없습니다."
+        if has_assignment:
+            reason = f"{t.name} 선생님이 {cls.display_name if cls else '해당 반'}의 {current_subject.name} 담당 교사이며 해당 교시에 수업이 없습니다."
+        teachers.append(SuggestionOption(
+            teacher_id=t.id,
+            label=f"{t.name} 선생님",
+            reason=reason,
+        ))
+
+    # ── 교실 대체 제안 ────────────────────────────────────────────────────
+    all_rooms = db.query(Room).all()
+    for r in all_rooms:
+        if r.id == room_id:
+            continue
+        if not _can_place_room(r.id, day, period, room_slots):
+            continue
+        # 특별실 필요 과목이면 특별실 위주로 제안
+        if current_subject and current_subject.needs_special_room and r.room_type == "일반":
+            continue
+        rooms.append(SuggestionOption(
+            room_id=r.id,
+            label=f"{r.name}({r.room_type})",
+            reason=f"{r.name} 교실이 해당 교시에 비어 있습니다."
+        ))
+
+    # ── 교환(swap) 제안 ───────────────────────────────────────────────────
+    swaps: list[SuggestionOption] = []
+    partner_entries = (
+        db.query(TimetableEntry)
+        .filter(
+            TimetableEntry.term_id == term_id,
+            TimetableEntry.id != entry.id,
+        )
+        .all()
+    )
+
+    for p in partner_entries:
+        p_slot = (p.day_of_week, p.period)
+        # 교환 후 entry 의 교사(teacher_id)가 p_slot 에 갈 수 있는지
+        # (p_slot 에서 partner 를 제외하고 검증)
+        p_class_slots, p_teacher_slots, p_room_slots, p_teacher_daily = _build_conflict_maps(db, term_id, p.id)
+        if not _can_place_class(class_id, p.day_of_week, p.period, p_class_slots):
+            continue
+        if not _can_place_teacher(teacher_id, p.day_of_week, p.period, p_teacher_slots, p_teacher_daily, teacher_max, unavailable):
+            continue
+        if room_id is not None and not _can_place_room(room_id, p.day_of_week, p.period, p_room_slots):
+            continue
+
+        # 교환 후 partner 의 교사(p.teacher_id)가 entry 의 slot 에 갈 수 있는지
+        # (entry slot 에서 entry 를 제외한 맵 teacher_slots/room_slots 재사용)
+        if not _can_place_class(p.school_class_id, day, period, class_slots):
+            continue
+        if not _can_place_teacher(p.teacher_id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
+            continue
+        if p.room_id is not None and not _can_place_room(p.room_id, day, period, room_slots):
+            continue
+
+        p_teacher = db.get(Teacher, p.teacher_id)
+        p_subject = db.get(Subject, p.subject_id)
+        label = (
+            f"{p_teacher.name} 선생님의 {_day_name(p.day_of_week)}요일 {p.period}교시 "
+            f"{p_subject.name} 수업과 교환"
+        )
+        reason = (
+            f"양쪽 교사 모두 상대 슬롯에 수업이 없고, 반/교실 충돌이 없습니다."
+        )
+        swaps.append(SuggestionOption(
+            swap_partner_entry_id=p.id,
+            label=label,
+            reason=reason,
+        ))
+
+    return SuggestionResponse(
+        current=current,
+        subjects=subjects,
+        teachers=teachers,
+        rooms=rooms,
+        swaps=swaps,
+    )
