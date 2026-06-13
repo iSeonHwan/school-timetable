@@ -25,7 +25,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 
 import uuid
 
@@ -42,19 +42,16 @@ if not _SECRET_KEY:
 _ALGORITHM = "HS256"
 _EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
 # ── 비밀번호 ───────────────────────────────────────────────────────────────
 
 def hash_password(plain: str) -> str:
     """평문 비밀번호를 bcrypt 해시로 변환합니다."""
-    return _pwd_ctx.hash(plain)
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     """평문과 해시를 비교합니다."""
-    return _pwd_ctx.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────

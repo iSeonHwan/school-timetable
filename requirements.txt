@@ -9,7 +9,7 @@ openpyxl>=3.1.0
 fastapi>=0.111.0          # API 서버 프레임워크
 uvicorn[standard]>=0.29.0 # ASGI 서버 (WebSocket 지원 포함)
 python-jose[cryptography]>=3.3.0  # JWT 생성·검증
-passlib[bcrypt]>=1.7.4    # 비밀번호 해싱 (bcrypt)
+bcrypt>=4.0.0             # 비밀번호 해싱 (passlib 대신 직접 사용)
 pydantic>=2.0.0           # 데이터 검증 스키마 (FastAPI 내장)
 
 # ── 클라이언트 앱 (admin_app/, teacher_app/) ───────────────────────────────
