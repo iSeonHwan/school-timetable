@@ -40,10 +40,10 @@ async def lifespan(app: FastAPI):
     """
     db_url = os.getenv("DB_URL")
     init_db(db_url)
+    _migrate_columns()               # 기존 DB에 누락된 컬럼 일괄 추가 (가장 먼저 실행)
     _ensure_admin()
     _ensure_assignment_terms()       # 기존 시수 배정 term_id 백필
     _ensure_default_workflow()
-    _migrate_add_change_snapshot()   # change_snapshot 컬럼 추가 (없는 경우에만)
 
     # 채팅 메시지 자동 정리 백그라운드 태스크 시작
     _cleanup_task = start_cleanup_task()
@@ -192,36 +192,92 @@ def _ensure_assignment_terms():
         db.close()
 
 
-def _migrate_add_change_snapshot():
+def _migrate_columns():
     """
-    timetable_change_requests 테이블에 change_snapshot 컬럼을 추가합니다.
+    서버 업데이트 시 기존 DB 에 누락된 컬럼을 일괄 추가합니다.
 
-    change_snapshot 은 변경 신청 시점의 슬롯 상태를 JSON 으로 기록하여
-    최종 승인 시 타이밍 충돌(race condition)을 감지하는 데 사용됩니다.
+    SQLAlchemy 의 create_all() 은 새 테이블은 생성하지만, 기존 테이블에
+    새로 추가된 컬럼은 자동으로 반영하지 않습니다. 이 함수가 그 역할을 합니다.
 
-    멱등성(idempotent) 보장:
-      이미 컬럼이 존재하면 ALTER TABLE 이 오류를 반환합니다.
-      try/except 로 이 오류를 무시하여 반복 실행해도 안전합니다.
+    멱등성 보장:
+      각 ALTER TABLE 은 개별 try/except 로 감싸져 있습니다.
+      컬럼이 이미 존재하면 DB 가 오류를 반환하고 무시합니다.
+      반복 실행해도 안전합니다.
 
-    SQLite 와 PostgreSQL 모두 동작합니다:
-      - SQLite: ALTER TABLE ... ADD COLUMN 은 이미 있는 컬럼에서 오류 반환
-      - PostgreSQL: 동일 동작 (column already exists)
+    실행 순서:
+      init_db() 직후, 다른 ensure/migrate 함수보다 반드시 먼저 실행해야 합니다.
+      (다른 함수들이 이 컬럼들을 읽거나 쓰기 때문)
+
+    SQLite 와 PostgreSQL 모두 동작합니다.
     """
     from sqlalchemy import text
 
+    # 추가할 컬럼 목록: (SQL 문, 설명)
+    # 새로운 컬럼이 추가될 때마다 이 목록에 append 하세요.
+    migrations = [
+        # ── subject_class_assignments ─────────────────────────────────────────
+        # 2026-06-13: 학기별 시수 배정 분리를 위해 term_id 추가
+        (
+            "ALTER TABLE subject_class_assignments ADD COLUMN term_id INTEGER REFERENCES academic_terms(id)",
+            "subject_class_assignments.term_id",
+        ),
+        # ── timetable_change_requests — 동적 결재 워크플로우 필드 ──────────────
+        # 하드코딩된 2단계 결재에서 동적 워크플로우로 전환할 때 추가된 컬럼들
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN current_step INTEGER NOT NULL DEFAULT 0",
+            "timetable_change_requests.current_step",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN approval_history TEXT DEFAULT '[]'",
+            "timetable_change_requests.approval_history",
+        ),
+        # ── timetable_change_requests — 피교사 동의(consent) 필드 ─────────────
+        # 2026-06-13: 교사 간 수업 교체 시 피교사 사전 동의 기능 추가
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN affected_teacher_id INTEGER REFERENCES teachers(id)",
+            "timetable_change_requests.affected_teacher_id",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN consent_status VARCHAR(20) NOT NULL DEFAULT 'not_required'",
+            "timetable_change_requests.consent_status",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN consent_by_user_id INTEGER REFERENCES users(id)",
+            "timetable_change_requests.consent_by_user_id",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN consent_at DATETIME",
+            "timetable_change_requests.consent_at",
+        ),
+        # ── timetable_change_requests — 교환(swap) 필드 ───────────────────────
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN swap_partner_entry_id INTEGER REFERENCES timetable_entries(id)",
+            "timetable_change_requests.swap_partner_entry_id",
+        ),
+        # ── timetable_change_requests — 스냅샷(race condition 감지) ───────────
+        # 2026-06-13: swap 신청 시점 슬롯 상태 저장 → 최종 승인 시 충돌 감지
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN change_snapshot TEXT",
+            "timetable_change_requests.change_snapshot",
+        ),
+    ]
+
     db = get_session()
+    added = []
     try:
-        db.execute(text(
-            "ALTER TABLE timetable_change_requests "
-            "ADD COLUMN change_snapshot TEXT DEFAULT NULL"
-        ))
-        db.commit()
-        print("[마이그레이션] timetable_change_requests.change_snapshot 컬럼 추가 완료.")
-    except Exception:
-        # 이미 컬럼이 존재하면 DB 가 오류를 반환합니다 — 정상 상황이므로 무시합니다.
-        db.rollback()
+        for sql, label in migrations:
+            try:
+                db.execute(text(sql))
+                db.commit()
+                added.append(label)
+            except Exception:
+                # 컬럼이 이미 존재하거나 다른 오류 — 무시하고 계속 진행
+                db.rollback()
     finally:
         db.close()
+
+    if added:
+        print(f"[마이그레이션] {len(added)}개 컬럼 추가: {', '.join(added)}")
 
 
 def _ensure_default_workflow():
