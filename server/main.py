@@ -41,8 +41,9 @@ async def lifespan(app: FastAPI):
     db_url = os.getenv("DB_URL")
     init_db(db_url)
     _ensure_admin()
-    _ensure_assignment_terms()   # 기존 시수 배정 term_id 백필
+    _ensure_assignment_terms()       # 기존 시수 배정 term_id 백필
     _ensure_default_workflow()
+    _migrate_add_change_snapshot()   # change_snapshot 컬럼 추가 (없는 경우에만)
 
     # 채팅 메시지 자동 정리 백그라운드 태스크 시작
     _cleanup_task = start_cleanup_task()
@@ -89,11 +90,20 @@ def _ensure_admin():
             db.add(admin)
             db.commit()
             if not os.getenv("ADMIN_PASSWORD"):
-                print(f"[서버] 최초 일과계 선생님 계정 생성: {admin_username}")
-                print(f"  초기 비밀번호: {admin_password}")
-                print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
+                # 랜덤 생성된 초기 비밀번호를 출력합니다.
+                # ★ 보안 주의: 이 비밀번호는 서버 로그에 남습니다.
+                # CI/CD 파이프라인이나 로그 집계 시스템을 사용한다면
+                # 로그가 외부에 노출되지 않도록 주의하세요.
+                # 운영 환경에서는 ADMIN_PASSWORD 환경 변수로 직접 지정하는 것을 권장합니다.
+                print("\n" + "=" * 60)
+                print(f"[서버] 최초 일과계 선생님 계정이 생성되었습니다.")
+                print(f"  아이디   : {admin_username}")
+                print(f"  초기비밀번호: {admin_password}")
+                print(f"  ★ 이 비밀번호는 이번 한 번만 표시됩니다!")
+                print(f"  ★ 지금 바로 안전한 곳에 기록하고, 로그인 후 즉시 변경하세요.")
+                print("=" * 60 + "\n")
             else:
-                print(f"[서버] 최초 일과계 선생님 계정 생성: {admin_username} (비밀번호를 즉시 변경하세요!)")
+                print(f"[서버] 최초 일과계 선생님 계정 생성: {admin_username} (로그인 후 비밀번호를 변경하세요!)")
 
         # ── 교감 선생님 계정 (vice_principal) ───────────────────────────────
         vp_username = os.getenv("VP_USERNAME", "vice_principal")
@@ -107,11 +117,15 @@ def _ensure_admin():
             db.add(vp)
             db.commit()
             if not os.getenv("VP_PASSWORD"):
-                print(f"[서버] 최초 교감 선생님 계정 생성: {vp_username}")
-                print(f"  초기 비밀번호: {vp_password}")
-                print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
+                print("\n" + "=" * 60)
+                print(f"[서버] 최초 교감 선생님 계정이 생성되었습니다.")
+                print(f"  아이디   : {vp_username}")
+                print(f"  초기비밀번호: {vp_password}")
+                print(f"  ★ 이 비밀번호는 이번 한 번만 표시됩니다!")
+                print(f"  ★ 지금 바로 안전한 곳에 기록하고, 로그인 후 즉시 변경하세요.")
+                print("=" * 60 + "\n")
             else:
-                print(f"[서버] 최초 교감 선생님 계정 생성: {vp_username} (비밀번호를 즉시 변경하세요!)")
+                print(f"[서버] 최초 교감 선생님 계정 생성: {vp_username} (로그인 후 비밀번호를 변경하세요!)")
 
         # ── 교무부장 계정 (department_head) ──────────────────────────────
         dh_username = os.getenv("DH_USERNAME", "department_head")
@@ -125,11 +139,15 @@ def _ensure_admin():
             db.add(dh)
             db.commit()
             if not os.getenv("DH_PASSWORD"):
-                print(f"[서버] 최초 교무부장 계정 생성: {dh_username}")
-                print(f"  초기 비밀번호: {dh_password}")
-                print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
+                print("\n" + "=" * 60)
+                print(f"[서버] 최초 교무부장 계정이 생성되었습니다.")
+                print(f"  아이디   : {dh_username}")
+                print(f"  초기비밀번호: {dh_password}")
+                print(f"  ★ 이 비밀번호는 이번 한 번만 표시됩니다!")
+                print(f"  ★ 지금 바로 안전한 곳에 기록하고, 로그인 후 즉시 변경하세요.")
+                print("=" * 60 + "\n")
             else:
-                print(f"[서버] 최초 교무부장 계정 생성: {dh_username} (비밀번호를 즉시 변경하세요!)")
+                print(f"[서버] 최초 교무부장 계정 생성: {dh_username} (로그인 후 비밀번호를 변경하세요!)")
     finally:
         db.close()
 
@@ -170,6 +188,38 @@ def _ensure_assignment_terms():
         ), {"term_id": target_term.id})
         db.commit()
         print(f"[마이그레이션] {empty_count}개의 시수 배정에 term_id={target_term.id}({target_term})를 백필했습니다.")
+    finally:
+        db.close()
+
+
+def _migrate_add_change_snapshot():
+    """
+    timetable_change_requests 테이블에 change_snapshot 컬럼을 추가합니다.
+
+    change_snapshot 은 변경 신청 시점의 슬롯 상태를 JSON 으로 기록하여
+    최종 승인 시 타이밍 충돌(race condition)을 감지하는 데 사용됩니다.
+
+    멱등성(idempotent) 보장:
+      이미 컬럼이 존재하면 ALTER TABLE 이 오류를 반환합니다.
+      try/except 로 이 오류를 무시하여 반복 실행해도 안전합니다.
+
+    SQLite 와 PostgreSQL 모두 동작합니다:
+      - SQLite: ALTER TABLE ... ADD COLUMN 은 이미 있는 컬럼에서 오류 반환
+      - PostgreSQL: 동일 동작 (column already exists)
+    """
+    from sqlalchemy import text
+
+    db = get_session()
+    try:
+        db.execute(text(
+            "ALTER TABLE timetable_change_requests "
+            "ADD COLUMN change_snapshot TEXT DEFAULT NULL"
+        ))
+        db.commit()
+        print("[마이그레이션] timetable_change_requests.change_snapshot 컬럼 추가 완료.")
+    except Exception:
+        # 이미 컬럼이 존재하면 DB 가 오류를 반환합니다 — 정상 상황이므로 무시합니다.
+        db.rollback()
     finally:
         db.close()
 

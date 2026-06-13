@@ -338,12 +338,33 @@ class TimetableChangeRequest(Base):
     # 교환(swap) 상대 슬롯. swap 은 두 TimetableEntry 의 교사/과목을 동시에 바꿉니다.
     swap_partner_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
 
+    # ── 신청 시점 슬롯 스냅샷 (신규) ────────────────────────────────────────
+    # 변경 신청이 접수될 때 대상 슬롯(entry)과 교환 상대 슬롯(partner)의 현재
+    # 상태를 JSON 문자열로 저장합니다.
+    #
+    # 저장 형식:
+    # {
+    #   "entry":   {"subject_id": 1, "teacher_id": 2, "room_id": 3},
+    #   "partner": {"subject_id": 4, "teacher_id": 5, "room_id": 6}  # swap인 경우만
+    # }
+    #
+    # 용도:
+    #   결재 기간이 길어지는 경우(예: 며칠 뒤 최종 승인), 그 사이에 다른 변경 신청이
+    #   같은 슬롯을 수정했을 수 있습니다. 최종 승인 시 스냅샷과 현재 DB 상태를
+    #   비교하여 이 같은 타이밍 충돌(race condition)을 감지합니다.
+    #
+    # nullable=True 인 이유:
+    #   이 컬럼이 추가되기 전에 생성된 기존 레코드는 스냅샷이 없습니다.
+    #   None 이면 검증을 건너뜁니다 (하위 호환성 유지).
+    change_snapshot    = Column(Text, nullable=True)
+
     # ── [DEPRECATED] 하드코딩된 2단계 결재 필드 ──────────────────────────
     # approval_history 및 ApprovalWorkflow 로 대체되었습니다.
-    # 다음 메이저 버전에서 제거 예정.
+    # 기존 운영 데이터 보존을 위해 컬럼 자체는 유지하지만,
+    # 신규 코드에서는 사용하지 않습니다.
+    # TODO: 모든 운영 DB 마이그레이션 완료 후 다음 메이저 버전에서 제거 예정.
     scheduler_approved_by = Column(String(30), default="")
     scheduler_approved_at = Column(DateTime, nullable=True)
-    # 교감 선생님의 최종 승인 정보
     approved_by        = Column(String(30), default="")
     approved_at        = Column(DateTime, nullable=True)
     vice_principal_approved_by = Column(String(30), default="")

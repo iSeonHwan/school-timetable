@@ -13,10 +13,11 @@ GET  /timetable/suggestions      — 교체 가능한 대안 제안 (교사)
 PATCH /timetable/requests/{id}/consent — 피교사 동의/거절 (교사)
 """
 import json
+import logging                          # 로깅: 오류/경고를 콘솔·파일에 기록
 from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload  # joinedload: N+1 쿼리 방지용 즉시 로딩
 from shared.models import (
     AcademicTerm, TimetableEntry, TimetableChangeLog,
     TimetableChangeRequest, Subject, Teacher, Room, User,
@@ -34,6 +35,12 @@ from core.generator import generate_timetable
 from server.api.chat import create_and_send_notification
 
 router = APIRouter(prefix="/timetable", tags=["시간표"])
+
+# 모듈 수준 로거 — logging.getLogger(__name__) 은 파일 경로에 따라
+# 자동으로 이름이 결정됩니다 (예: "server.api.timetable").
+# uvicorn 기본 설정에서는 WARNING 이상만 콘솔에 출력됩니다.
+# 전체 로그를 보려면 uvicorn --log-level debug 옵션을 사용하세요.
+_logger = logging.getLogger(__name__)
 
 
 async def _notify_user_async(user_id: int, notif_type: str, change_request_id: Optional[int], message: str):
@@ -96,14 +103,27 @@ def list_entries(
     if teacher_id:
         q = q.filter(TimetableEntry.teacher_id == teacher_id)
 
+    # ── N+1 쿼리 방지: joinedload 로 관련 테이블을 한 번에 로드 ───────────────
+    # 기존 코드는 for 루프 안에서 db.get(Subject, ...) / db.get(Teacher, ...) /
+    # db.get(Room, ...) 를 매 항목마다 호출하여, 시간표 항목이 N개이면 최대
+    # 3N 번의 추가 SELECT 쿼리가 발생하는 N+1 문제가 있었습니다.
+    #
+    # joinedload(TimetableEntry.subject) 등을 지정하면 SQLAlchemy 가 첫 쿼리에
+    # LEFT OUTER JOIN 을 추가하여 연관 테이블을 한 번에 가져옵니다.
+    # 그 결과 e.subject, e.teacher, e.room 속성이 이미 메모리에 올라와 있으므로
+    # 루프 안에서 추가 DB 왕복이 발생하지 않습니다.
+    q = q.options(
+        joinedload(TimetableEntry.subject),   # subjects 테이블 JOIN
+        joinedload(TimetableEntry.teacher),   # teachers 테이블 JOIN
+        joinedload(TimetableEntry.room),      # rooms 테이블 JOIN (LEFT OUTER — room 없어도 OK)
+    )
+
     entries = q.order_by(TimetableEntry.day_of_week, TimetableEntry.period).all()
 
-    # 중첩 정보를 채워 TimetableEntryOut 으로 변환합니다.
+    # 이제 e.subject, e.teacher, e.room 은 이미 로드된 ORM 객체입니다.
+    # db.get() 을 다시 호출할 필요 없이 속성에 직접 접근합니다.
     result = []
     for e in entries:
-        subj = db.get(Subject, e.subject_id)
-        tchr = db.get(Teacher, e.teacher_id)
-        room = db.get(Room, e.room_id) if e.room_id else None
         out = TimetableEntryOut(
             id=e.id, term_id=e.term_id,
             school_class_id=e.school_class_id,
@@ -111,11 +131,12 @@ def list_entries(
             room_id=e.room_id,
             day_of_week=e.day_of_week, period=e.period,
             is_fixed=e.is_fixed,
-            subject_name=subj.name if subj else None,
-            subject_short=subj.short_name if subj else None,
-            subject_color=subj.color_hex if subj else None,
-            teacher_name=tchr.name if tchr else None,
-            room_name=room.name if room else None,
+            # 관계 속성에서 직접 읽기 — 추가 쿼리 없음
+            subject_name=e.subject.name if e.subject else None,
+            subject_short=e.subject.short_name if e.subject else None,
+            subject_color=e.subject.color_hex if e.subject else None,
+            teacher_name=e.teacher.name if e.teacher else None,
+            room_name=e.room.name if e.room else None,
         )
         result.append(out)
     return result
@@ -233,6 +254,29 @@ def submit_request(
         consent_status = "pending"
         current_step = 0
 
+    # ── 신청 시점 스냅샷 저장 ──────────────────────────────────────────────
+    # 결재 기간이 길어지면(예: 며칠 뒤 최종 승인) 그 사이에 다른 변경 신청이
+    # 같은 슬롯을 수정할 수 있습니다. 최종 승인 시 스냅샷과 현재 DB 상태를
+    # 비교하여 이 타이밍 충돌(race condition)을 감지합니다.
+    #
+    # 스냅샷에는 신청 시점의 entry(대상 슬롯) 상태와,
+    # 교환(swap) 신청인 경우 partner(상대 슬롯) 상태도 저장합니다.
+    _snap: dict = {
+        "entry": {
+            "subject_id": entry.subject_id,
+            "teacher_id": entry.teacher_id,
+            "room_id":    entry.room_id,
+        }
+    }
+    if body.swap_partner_entry_id is not None:
+        # partner 는 위의 swap 검증 블록에서 이미 fetch 되었습니다.
+        # (partner 가 None 이면 위에서 404 raise 되므로 여기에는 항상 존재)
+        _snap["partner"] = {
+            "subject_id": partner.subject_id,
+            "teacher_id": partner.teacher_id,
+            "room_id":    partner.room_id,
+        }
+
     req = TimetableChangeRequest(
         timetable_entry_id=body.timetable_entry_id,
         new_subject_id=body.new_subject_id,
@@ -245,6 +289,8 @@ def submit_request(
         affected_teacher_id=affected_teacher_id,
         consent_status=consent_status,
         swap_partner_entry_id=body.swap_partner_entry_id,
+        # 신청 시점 슬롯 상태를 JSON 으로 직렬화하여 저장
+        change_snapshot=json.dumps(_snap, ensure_ascii=False),
     )
     db.add(req)
     db.commit()
@@ -561,18 +607,91 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
     """
     최종 승인된 변경 신청을 실제 TimetableEntry 에 반영합니다.
 
-    2026-06-13 변경:
-      - 단순 변경(과목/교사/교실)과 교환(swap)을 모두 처리합니다.
-      - 교환인 경우 swap_partner_entry_id 의 슬롯도 함께 수정합니다.
-      - 모든 변경은 TimetableChangeLog 에 before/after 로 기록됩니다.
+    2026-06-13 개선:
+      1. entry 가 None 이면 조용히 실패하지 않고 에러 로그를 남깁니다.
+         (이전에는 return 만 하여 원인 추적이 불가능했습니다)
+      2. 교환(swap) 신청인 경우, 신청 시점 스냅샷(change_snapshot)과 현재
+         DB 상태를 비교합니다. 결재 기간 중 다른 변경이 상대 슬롯에 적용되었다면
+         409 Conflict 를 반환합니다.
+      3. partner(swap 상대 슬롯)도 None 체크 후 로그를 남기고 raise 합니다.
+      4. 모든 변경은 TimetableChangeLog 에 before/after 로 기록됩니다.
+
+    호출 위치: review_request() — DB 트랜잭션 안에서 호출됩니다.
+    raise HTTPException 은 트랜잭션 롤백을 유발하므로 안전합니다.
     """
     from core.change_logger import log_entry_update
 
+    # ── 1. 대상 슬롯 로드 및 존재 확인 ────────────────────────────────────
     entry = db.get(TimetableEntry, req.timetable_entry_id)
     if entry is None:
+        # 승인 처리 중 시간표 항목이 삭제된 예외 상황.
+        # 조용히 실패하지 않고 에러 로그를 남겨 나중에 원인을 추적할 수 있게 합니다.
+        _logger.error(
+            "변경 적용 실패 — TimetableEntry(id=%s) 를 찾을 수 없습니다. "
+            "요청 ID: %s (신청자: %s). 항목이 삭제되었거나 DB 불일치가 발생했습니다.",
+            req.timetable_entry_id, req.id, req.requested_by,
+        )
         return
 
-    before = {"subject_id": entry.subject_id, "teacher_id": entry.teacher_id, "room_id": entry.room_id}
+    # ── 2. 교환(swap) 신청: 상대 슬롯 검증 + 스냅샷 충돌 감지 ───────────
+    # 교환이 아닌 경우(단순 과목·교사·교실 변경)는 이 블록을 건너뜁니다.
+    partner = None
+    if req.swap_partner_entry_id is not None:
+        partner = db.get(TimetableEntry, req.swap_partner_entry_id)
+        if partner is None:
+            # 상대 슬롯이 결재 기간 중 삭제된 경우
+            _logger.error(
+                "교환 신청 적용 실패 — swap 상대 TimetableEntry(id=%s) 를 찾을 수 없습니다. "
+                "요청 ID: %s",
+                req.swap_partner_entry_id, req.id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"교환 상대 슬롯(entry_id={req.swap_partner_entry_id})이 "
+                    "결재 기간 중 삭제되었습니다. 변경 신청을 취소하고 다시 신청해 주세요."
+                ),
+            )
+
+        # 스냅샷 기반 충돌 감지 ─────────────────────────────────────────────
+        # change_snapshot 이 없는 기존 레코드(스냅샷 추가 전에 생성됨)는
+        # 검증 없이 통과합니다 (하위 호환성 유지).
+        if req.change_snapshot:
+            snap = json.loads(req.change_snapshot)
+            partner_snap = snap.get("partner")  # swap 이 아닌 경우 None
+            if partner_snap:
+                # 스냅샷과 현재 DB 상태를 비교합니다.
+                # 결재 기간 중 다른 신청이 상대 슬롯을 수정했다면 값이 달라집니다.
+                current_partner_state = {
+                    "subject_id": partner.subject_id,
+                    "teacher_id": partner.teacher_id,
+                    "room_id":    partner.room_id,
+                }
+                if current_partner_state != partner_snap:
+                    _logger.warning(
+                        "교환 신청 충돌 감지 — 요청 ID=%s, partner entry_id=%s. "
+                        "신청 시점 스냅샷=%s, 현재 상태=%s",
+                        req.id, req.swap_partner_entry_id,
+                        partner_snap, current_partner_state,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"교환 상대 슬롯(entry_id={req.swap_partner_entry_id})이 "
+                            "결재 기간 중 다른 변경으로 수정되었습니다. "
+                            "변경 신청을 취소하고 최신 상태로 다시 신청해 주세요."
+                        ),
+                    )
+
+    # ── 3. 단순 변경(과목/교사/교실) 적용 ─────────────────────────────────
+    # 변경 전 상태를 before 에 기록합니다. 이후 log_entry_update() 가
+    # before → after 를 TimetableChangeLog 에 저장합니다.
+    before = {
+        "subject_id": entry.subject_id,
+        "teacher_id": entry.teacher_id,
+        "room_id":    entry.room_id,
+    }
+    # new_* 필드가 None 이면 해당 속성은 변경하지 않습니다.
     if req.new_subject_id is not None:
         entry.subject_id = req.new_subject_id
     if req.new_teacher_id is not None:
@@ -581,17 +700,23 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
         entry.room_id = req.new_room_id
     log_entry_update(db, entry, before)
 
-    # 교환(swap)인 경우 상대 슬롯도 교환합니다.
-    if req.swap_partner_entry_id is not None:
-        partner = db.get(TimetableEntry, req.swap_partner_entry_id)
-        if partner is not None:
-            # swap 은 서로의 원래 값을 맞바꿉니다.
-            partner_before = {"subject_id": partner.subject_id, "teacher_id": partner.teacher_id, "room_id": partner.room_id}
-            # entry 의 원래 값(before)과 partner 의 원래 값을 교환
-            entry.subject_id, partner.subject_id = partner_before["subject_id"], before["subject_id"]
-            entry.teacher_id, partner.teacher_id = partner_before["teacher_id"], before["teacher_id"]
-            entry.room_id, partner.room_id = partner_before["room_id"], before["room_id"]
-            log_entry_update(db, partner, partner_before)
+    # ── 4. 교환(swap) 적용 ─────────────────────────────────────────────────
+    # 교환 신청인 경우, entry 와 partner 의 과목/교사/교실을 서로 맞바꿉니다.
+    # before(entry 원래 값) 와 partner_before(partner 원래 값) 를 서로 대입합니다.
+    if partner is not None:
+        partner_before = {
+            "subject_id": partner.subject_id,
+            "teacher_id": partner.teacher_id,
+            "room_id":    partner.room_id,
+        }
+        # 교환: entry 에는 partner 의 원래 값을, partner 에는 entry 의 원래 값을 씁니다.
+        entry.subject_id   = partner_before["subject_id"]
+        entry.teacher_id   = partner_before["teacher_id"]
+        entry.room_id      = partner_before["room_id"]
+        partner.subject_id = before["subject_id"]
+        partner.teacher_id = before["teacher_id"]
+        partner.room_id    = before["room_id"]
+        log_entry_update(db, partner, partner_before)
 
 
 def _notify_requester(
@@ -649,33 +774,57 @@ def _entries_for_term(db: Session, term_id: int):
     return db.query(TimetableEntry).filter_by(term_id=term_id).all()
 
 
-def _build_conflict_maps(db: Session, term_id: int, exclude_entry_id: Optional[int]):
+def _build_conflict_maps_from_list(
+    entries: list,
+    exclude_entry_id: Optional[int] = None,
+) -> tuple[dict, dict, dict, dict]:
     """
-    충돌 검증용 맵을 미리 계산합니다.
+    이미 로드된 TimetableEntry 리스트에서 충돌 검증용 맵을 계산합니다.
+    DB 접근 없음 — O(N) 메모리 연산만 수행합니다.
+
+    exclude_entry_id 가 지정된 경우 해당 항목의 슬롯은 맵에서 제외합니다.
+    이를 이용해 "특정 슬롯이 비어있다고 가정했을 때"의 맵을 계산합니다.
 
     반환값:
-      class_slots: {class_id: {(day, period)}}
-      teacher_slots: {teacher_id: {(day, period)}}
-      room_slots: {room_id: {(day, period)}}
-      teacher_daily: {(teacher_id, day): count}
+      class_slots:   {class_id:   {(day, period)}}   — 반별 사용 중인 슬롯
+      teacher_slots: {teacher_id: {(day, period)}}   — 교사별 사용 중인 슬롯
+      room_slots:    {room_id:    {(day, period)}}   — 교실별 사용 중인 슬롯
+      teacher_daily: {(teacher_id, day): count}       — 교사의 일별 수업 수
     """
-    entries = _entries_for_term(db, term_id)
-    class_slots: dict[int, set] = {}
-    teacher_slots: dict[int, set] = {}
-    room_slots: dict[int, set] = {}
+    class_slots:   dict[int, set]             = {}
+    teacher_slots: dict[int, set]             = {}
+    room_slots:    dict[int, set]             = {}
     teacher_daily: dict[tuple[int, int], int] = {}
 
     for e in entries:
         if e.id == exclude_entry_id:
-            continue
+            continue  # 이 항목은 제외(비어있는 것으로 간주)
         slot = (e.day_of_week, e.period)
         class_slots.setdefault(e.school_class_id, set()).add(slot)
         teacher_slots.setdefault(e.teacher_id, set()).add(slot)
         if e.room_id is not None:
             room_slots.setdefault(e.room_id, set()).add(slot)
-        teacher_daily[(e.teacher_id, e.day_of_week)] = teacher_daily.get((e.teacher_id, e.day_of_week), 0) + 1
+        teacher_daily[(e.teacher_id, e.day_of_week)] = (
+            teacher_daily.get((e.teacher_id, e.day_of_week), 0) + 1
+        )
 
     return class_slots, teacher_slots, room_slots, teacher_daily
+
+
+def _build_conflict_maps(db: Session, term_id: int, exclude_entry_id: Optional[int]):
+    """
+    DB 에서 해당 학기 항목을 로드한 뒤 충돌 맵을 계산합니다.
+
+    내부적으로 _build_conflict_maps_from_list 를 호출합니다.
+    단일 호출 시에는 이 함수를 사용하고, 여러 번 반복 호출할 때는
+    미리 로드한 entries 를 _build_conflict_maps_from_list 에 직접 넘겨
+    불필요한 DB 왕복을 줄이세요.
+
+    반환값:
+      class_slots, teacher_slots, room_slots, teacher_daily (위와 동일)
+    """
+    entries = _entries_for_term(db, term_id)
+    return _build_conflict_maps_from_list(entries, exclude_entry_id)
 
 
 def _teacher_max_map(db: Session) -> dict[int, int]:
@@ -736,20 +885,41 @@ def _build_suggestions(db: Session, entry: TimetableEntry) -> SuggestionResponse
       - 과목/교사/교실 대체 제안: 현재 슬롯의 반·교시에 배치 가능한 후보를 검색.
       - 교환 제안: 다른 슬롯과 서로 교사/과목을 맞바꿀 수 있는 경우를 검색.
       - 모든 제안은 반/교사/교실 중복, 불가 시간, 일일 최대 수업을 고려.
+
+    2026-06-13 개선 (N+1 및 O(N²) 쿼리 해소):
+      - 과목/교사/교실을 Dict 로 미리 로드하여 루프 안 db.get() 호출 제거.
+      - 교환 제안 루프에서 _build_conflict_maps() 대신 이미 로드된 entries 로
+        _build_conflict_maps_from_list() 를 사용. DB 쿼리 O(N) → O(1) 로 감소.
     """
-    term_id = entry.term_id
-    day = entry.day_of_week
-    period = entry.period
-    class_id = entry.school_class_id
+    term_id   = entry.term_id
+    day       = entry.day_of_week
+    period    = entry.period
+    class_id  = entry.school_class_id
     subject_id = entry.subject_id
     teacher_id = entry.teacher_id
-    room_id = entry.room_id
+    room_id    = entry.room_id
 
-    # 현재 슬롯의 표시 정보 구성
-    subj = db.get(Subject, subject_id)
-    tchr = db.get(Teacher, teacher_id)
-    room = db.get(Room, room_id) if room_id else None
-    cls = db.get(SchoolClass, class_id)
+    # ── 마스터 데이터 일괄 로드 (N+1 방지) ─────────────────────────────────
+    # 교사의 subject_assignments 도 함께 로드하여 "담당 과목 여부" 확인 시
+    # 추가 쿼리가 발생하지 않도록 합니다.
+    all_subjects_map: dict[int, Subject] = {
+        s.id: s for s in db.query(Subject).all()
+    }
+    all_teachers_list: list[Teacher] = (
+        db.query(Teacher)
+        .options(joinedload(Teacher.subject_assignments))  # 배정 정보 즉시 로드
+        .all()
+    )
+    all_teachers_map: dict[int, Teacher] = {t.id: t for t in all_teachers_list}
+    all_rooms_map: dict[int, Room] = {
+        r.id: r for r in db.query(Room).all()
+    }
+
+    # ── 현재 슬롯 표시 정보 ─────────────────────────────────────────────────
+    subj = all_subjects_map.get(subject_id)
+    tchr = all_teachers_map.get(teacher_id)
+    room = all_rooms_map.get(room_id) if room_id else None
+    cls  = db.get(SchoolClass, class_id)   # 반은 단일 조회 (1번)
     current = SuggestionCurrent(
         entry_id=entry.id,
         day_of_week=day,
@@ -764,52 +934,57 @@ def _build_suggestions(db: Session, entry: TimetableEntry) -> SuggestionResponse
         room_name=room.name if room else None,
     )
 
-    # 충돌 맵 구성 (현재 슬롯은 제외하여 비어있는 것처럼 취급)
-    class_slots, teacher_slots, room_slots, teacher_daily = _build_conflict_maps(db, term_id, entry.id)
+    # ── 학기 전체 시간표를 한 번에 로드 (swap 루프에서 재사용) ───────────────
+    # 이 리스트를 미리 로드해두면 이후 _build_conflict_maps_from_list() 가
+    # DB 왕복 없이 메모리에서 계산할 수 있습니다.
+    all_term_entries: list[TimetableEntry] = _entries_for_term(db, term_id)
 
-    # 교사 제약 및 최대 수업 맵
-    all_teachers = db.query(Teacher).all()
-    teacher_ids = [t.id for t in all_teachers]
+    # 현재 슬롯을 제외한 충돌 맵 (이 슬롯이 빈 것으로 가정한 상태)
+    class_slots, teacher_slots, room_slots, teacher_daily = (
+        _build_conflict_maps_from_list(all_term_entries, entry.id)
+    )
+
+    # 교사 불가 시간 제약 및 일일 최대 수업 맵
+    teacher_ids = list(all_teachers_map.keys())
     unavailable = _teacher_constraints_set(db, teacher_ids)
-    teacher_max = _teacher_max_map(db)
+    teacher_max = {t.id: max(t.max_daily_classes, 1) for t in all_teachers_list}
 
     subjects: list[SuggestionOption] = []
     teachers: list[SuggestionOption] = []
-    rooms: list[SuggestionOption] = []
+    rooms:    list[SuggestionOption] = []
 
-    slot = (day, period)
-
-    # ── 과목 대체 제안 ────────────────────────────────────────────────────
-    # 같은 반·학기의 SubjectClassAssignment 중, 해당 교시에 갈 수 있는 조합
+    # ── 과목 대체 제안 ──────────────────────────────────────────────────────
+    # 같은 반·학기의 SubjectClassAssignment 중, 해당 교시에 배치 가능한 조합.
     assignments = (
         db.query(SubjectClassAssignment)
         .filter_by(school_class_id=class_id, term_id=term_id)
         .all()
     )
-    seen_subject_teacher = set()
+    seen_subject_teacher: set[tuple[int, int]] = set()
     for a in assignments:
-        # 동일 (과목, 교사) 조합이면 스킵
         key = (a.subject_id, a.teacher_id)
         if key in seen_subject_teacher:
-            continue
+            continue  # 동일 조합 중복 건너뜀
         seen_subject_teacher.add(key)
-        # 현재와 완전히 동일한 경우는 제안 불필요
         if a.subject_id == subject_id and a.teacher_id == teacher_id:
-            continue
-        # 배치 가능성 검증
+            continue  # 현재와 동일한 경우 제안 불필요
         if not _can_place_class(class_id, day, period, class_slots):
             continue
-        if not _can_place_teacher(a.teacher_id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
+        if not _can_place_teacher(
+            a.teacher_id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable
+        ):
             continue
-        # 교실: 기존 room_id 를 그대로 사용하거나, 배정의 preferred_room_id 사용
-        target_room_id = a.preferred_room_id if a.preferred_room_id is not None else room_id
+        target_room_id = (
+            a.preferred_room_id if a.preferred_room_id is not None else room_id
+        )
         if not _can_place_room(target_room_id, day, period, room_slots):
             continue
 
-        subj_obj = db.get(Subject, a.subject_id)
-        tchr_obj = db.get(Teacher, a.teacher_id)
-        room_obj = db.get(Room, target_room_id) if target_room_id else None
-        label = f"{subj_obj.name}({tchr_obj.name})"
+        # 캐시된 dict 에서 가져오기 — 추가 쿼리 없음
+        subj_obj = all_subjects_map.get(a.subject_id)
+        tchr_obj = all_teachers_map.get(a.teacher_id)
+        room_obj = all_rooms_map.get(target_room_id) if target_room_id else None
+        label = f"{subj_obj.name}({tchr_obj.name})" if subj_obj and tchr_obj else "(알 수 없음)"
         if room_obj:
             label += f" — {room_obj.name}"
         subjects.append(SuggestionOption(
@@ -817,92 +992,113 @@ def _build_suggestions(db: Session, entry: TimetableEntry) -> SuggestionResponse
             teacher_id=a.teacher_id,
             room_id=target_room_id,
             label=label,
-            reason=f"{tchr_obj.name} 선생님이 해당 교시에 수업이 없으며 일일 최대 수업을 초과하지 않습니다."
+            reason=(
+                f"{tchr_obj.name} 선생님이 해당 교시에 수업이 없으며 "
+                "일일 최대 수업을 초과하지 않습니다."
+            ) if tchr_obj else "",
         ))
 
-    # ── 교사 대체 제안 ───────────────────────────────────────────────────
-    # 현재 과목을 가르칠 수 있고 해당 교시에 갈 수 있는 교사
-    current_subject = db.get(Subject, subject_id)
-    for t in all_teachers:
+    # ── 교사 대체 제안 ──────────────────────────────────────────────────────
+    # 해당 교시에 배치 가능한 모든 교사 (이미 로드된 리스트를 순회).
+    current_subject = all_subjects_map.get(subject_id)
+    for t in all_teachers_list:
         if t.id == teacher_id:
+            continue  # 현재 교사는 제외
+        if not _can_place_teacher(
+            t.id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable
+        ):
             continue
-        if not _can_place_teacher(t.id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
-            continue
-        # 현재 과목에 대한 배정이 있는 교사를 우선 제안
+        # t.subject_assignments 는 joinedload 로 이미 로드됨 — 추가 쿼리 없음
         has_assignment = any(
-            a.subject_id == subject_id and a.school_class_id == class_id and a.term_id == term_id
+            a.subject_id == subject_id
+            and a.school_class_id == class_id
+            and a.term_id == term_id
             for a in t.subject_assignments
         )
-        reason = f"{t.name} 선생님이 해당 교시에 수업이 없습니다."
-        if has_assignment:
-            reason = f"{t.name} 선생님이 {cls.display_name if cls else '해당 반'}의 {current_subject.name} 담당 교사이며 해당 교시에 수업이 없습니다."
+        if has_assignment and current_subject and cls:
+            reason = (
+                f"{t.name} 선생님이 {cls.display_name}의 "
+                f"{current_subject.name} 담당 교사이며 해당 교시에 수업이 없습니다."
+            )
+        else:
+            reason = f"{t.name} 선생님이 해당 교시에 수업이 없습니다."
         teachers.append(SuggestionOption(
             teacher_id=t.id,
             label=f"{t.name} 선생님",
             reason=reason,
         ))
 
-    # ── 교실 대체 제안 ────────────────────────────────────────────────────
-    all_rooms = db.query(Room).all()
-    for r in all_rooms:
+    # ── 교실 대체 제안 ──────────────────────────────────────────────────────
+    for r in all_rooms_map.values():
         if r.id == room_id:
-            continue
+            continue  # 현재 교실은 제외
         if not _can_place_room(r.id, day, period, room_slots):
             continue
-        # 특별실 필요 과목이면 특별실 위주로 제안
+        # 특별실이 필요한 과목이면 일반 교실은 제안하지 않음
         if current_subject and current_subject.needs_special_room and r.room_type == "일반":
             continue
         rooms.append(SuggestionOption(
             room_id=r.id,
             label=f"{r.name}({r.room_type})",
-            reason=f"{r.name} 교실이 해당 교시에 비어 있습니다."
+            reason=f"{r.name} 교실이 해당 교시에 비어 있습니다.",
         ))
 
-    # ── 교환(swap) 제안 ───────────────────────────────────────────────────
+    # ── 교환(swap) 제안 ─────────────────────────────────────────────────────
+    # 이전 구현: 각 partner 마다 _build_conflict_maps(db, ...) 를 호출 → O(N²) DB 쿼리
+    # 개선된 구현: 미리 로드된 all_term_entries 와 _build_conflict_maps_from_list 를 사용
+    #   → O(N²) 메모리 연산 (DB 왕복 0회)
+    #
+    # N(시간표 항목 수)이 학교 규모 기준 수백 개라면 O(N²) 메모리 연산은 충분히 빠릅니다.
+    # 수천 개 이상으로 늘어난다면 추가 최적화(인덱스, 이진 탐색 등)를 검토하세요.
     swaps: list[SuggestionOption] = []
-    partner_entries = (
-        db.query(TimetableEntry)
-        .filter(
-            TimetableEntry.term_id == term_id,
-            TimetableEntry.id != entry.id,
-        )
-        .all()
-    )
+    for p in all_term_entries:
+        if p.id == entry.id:
+            continue  # 자기 자신은 제외
 
-    for p in partner_entries:
-        p_slot = (p.day_of_week, p.period)
-        # 교환 후 entry 의 교사(teacher_id)가 p_slot 에 갈 수 있는지
-        # (p_slot 에서 partner 를 제외하고 검증)
-        p_class_slots, p_teacher_slots, p_room_slots, p_teacher_daily = _build_conflict_maps(db, term_id, p.id)
+        # partner p 를 제외한 충돌 맵 — DB 조회 없이 메모리에서 계산
+        p_class_slots, p_teacher_slots, p_room_slots, p_teacher_daily = (
+            _build_conflict_maps_from_list(all_term_entries, p.id)
+        )
+
+        # 교환 후 entry 의 교사(teacher_id)가 p 의 슬롯에 배치될 수 있는지 확인
         if not _can_place_class(class_id, p.day_of_week, p.period, p_class_slots):
             continue
-        if not _can_place_teacher(teacher_id, p.day_of_week, p.period, p_teacher_slots, p_teacher_daily, teacher_max, unavailable):
+        if not _can_place_teacher(
+            teacher_id, p.day_of_week, p.period,
+            p_teacher_slots, p_teacher_daily, teacher_max, unavailable
+        ):
             continue
-        if room_id is not None and not _can_place_room(room_id, p.day_of_week, p.period, p_room_slots):
+        if room_id is not None and not _can_place_room(
+            room_id, p.day_of_week, p.period, p_room_slots
+        ):
             continue
 
-        # 교환 후 partner 의 교사(p.teacher_id)가 entry 의 slot 에 갈 수 있는지
-        # (entry slot 에서 entry 를 제외한 맵 teacher_slots/room_slots 재사용)
+        # 교환 후 p 의 교사(p.teacher_id)가 entry 의 슬롯에 배치될 수 있는지 확인
+        # (entry 를 제외한 맵 class_slots, teacher_slots, room_slots 재사용)
         if not _can_place_class(p.school_class_id, day, period, class_slots):
             continue
-        if not _can_place_teacher(p.teacher_id, day, period, teacher_slots, teacher_daily, teacher_max, unavailable):
+        if not _can_place_teacher(
+            p.teacher_id, day, period,
+            teacher_slots, teacher_daily, teacher_max, unavailable
+        ):
             continue
-        if p.room_id is not None and not _can_place_room(p.room_id, day, period, room_slots):
+        if p.room_id is not None and not _can_place_room(
+            p.room_id, day, period, room_slots
+        ):
             continue
 
-        p_teacher = db.get(Teacher, p.teacher_id)
-        p_subject = db.get(Subject, p.subject_id)
+        # 캐시된 dict 에서 가져오기 — 추가 쿼리 없음
+        p_teacher = all_teachers_map.get(p.teacher_id)
+        p_subject = all_subjects_map.get(p.subject_id)
         label = (
-            f"{p_teacher.name} 선생님의 {_day_name(p.day_of_week)}요일 {p.period}교시 "
-            f"{p_subject.name} 수업과 교환"
-        )
-        reason = (
-            f"양쪽 교사 모두 상대 슬롯에 수업이 없고, 반/교실 충돌이 없습니다."
+            f"{p_teacher.name if p_teacher else '?'} 선생님의 "
+            f"{_day_name(p.day_of_week)}요일 {p.period}교시 "
+            f"{p_subject.name if p_subject else '?'} 수업과 교환"
         )
         swaps.append(SuggestionOption(
             swap_partner_entry_id=p.id,
             label=label,
-            reason=reason,
+            reason="양쪽 교사 모두 상대 슬롯에 수업이 없고, 반/교실 충돌이 없습니다.",
         ))
 
     return SuggestionResponse(

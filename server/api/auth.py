@@ -11,6 +11,7 @@ DELETE /auth/users/{id} — 사용자 삭제 (관리자 전용)
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 import time
+import threading   # Rate Limiter 스레드 안전성 확보용
 from shared.models import User
 from shared.schemas import (
     LoginRequest, TokenResponse, UserOut, UserCreate, UserUpdate,
@@ -20,15 +21,25 @@ from server.deps import get_db, get_current_user, require_scheduler
 
 router = APIRouter(prefix="/auth", tags=["인증"])
 
-# ── 로그인 실패 추적 (메모리 기반, 프로세스 재시작 시 초기화) ─────────────
+# ── 로그인 실패 추적 (메모리 기반 Rate Limiter) ───────────────────────────
 # 무차별 대입 공격(brute-force)을 방지하기 위한 간단한 rate limiter 입니다.
 # username 별로 실패 시각을 기록하고, 최근 _LOCK_MINUTES 분 내 _MAX_FAILED 회
 # 실패하면 429 Too Many Requests 를 반환합니다.
-# 프로덕션 환경에서는 Redis 등 영속적 저장소로 대체하여 여러 서버 인스턴스 간
-# 공유할 수 있도록 개선하세요. 현재는 단일 프로세스 메모리 기반입니다.
-_failed_attempts: dict[str, list[float]] = {}  # username → [timestamps]
-_MAX_FAILED = 5         # 5회 연속 실패 시 잠금
-_LOCK_MINUTES = 15      # 잠금 해제까지 대기 시간 (분)
+#
+# ※ 스레드 안전성(Thread Safety):
+#   FastAPI 는 동기 엔드포인트를 스레드 풀(ThreadPoolExecutor)에서 실행합니다.
+#   여러 요청이 동시에 _failed_attempts dict 를 읽고 쓰면 race condition 이 발생해
+#   실패 카운트가 누락될 수 있습니다. _lock 으로 dict 접근을 직렬화합니다.
+#
+# ※ 멀티 프로세스 한계:
+#   uvicorn --workers N (N > 1) 환경에서는 각 워커 프로세스가 _failed_attempts 를
+#   별도로 관리하므로 차단 효과가 N분의 1 로 줄어듭니다.
+#   운영 환경에서 복수 워커를 사용한다면 Redis + redis-py 로 분산 rate limiting 을
+#   구현하는 것을 강력히 권장합니다.
+_failed_attempts: dict[str, list[float]] = {}  # username → [실패 timestamp 목록]
+_lock = threading.Lock()   # dict 접근 직렬화 (단일 프로세스 내 스레드 안전)
+_MAX_FAILED = 5            # 이 횟수 이상 실패하면 잠금
+_LOCK_MINUTES = 15         # 잠금 해제까지 대기 시간 (분)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -36,30 +47,45 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     """아이디·비밀번호로 로그인하고 JWT 토큰을 발급합니다."""
     username = body.username
 
-    # ── Rate Limiting: 5회 실패 시 15분간 로그인 차단 ─────────────────────
+    # ── Rate Limiting: 스레드 안전하게 실패 횟수를 확인 ──────────────────
+    # Lock 안에서만 dict 를 읽고 씁니다 (race condition 방지).
+    # Lock 범위를 최소화하기 위해 DB 조회는 Lock 밖에서 수행합니다.
     now_ts = time.time()
-    attempts = _failed_attempts.get(username, [])
-    # 최근 _LOCK_MINUTES 분 이내 실패만 필터링
     cutoff = now_ts - (_LOCK_MINUTES * 60)
-    recent = [t for t in attempts if t > cutoff]
-    _failed_attempts[username] = recent
-    if len(recent) >= _MAX_FAILED:
-        remaining = int((recent[0] + _LOCK_MINUTES * 60 - now_ts) / 60) + 1
+    too_many = False
+    remaining_minutes = 0
+
+    with _lock:
+        # 최근 _LOCK_MINUTES 분 이내 실패만 유지 (오래된 항목 정리)
+        recent = [t for t in _failed_attempts.get(username, []) if t > cutoff]
+        _failed_attempts[username] = recent
+        if len(recent) >= _MAX_FAILED:
+            too_many = True
+            # 가장 오래된 실패 시각(recent[0])에서 잠금 기간이 지나면 해제됨
+            remaining_minutes = int((recent[0] + _LOCK_MINUTES * 60 - now_ts) / 60) + 1
+
+    if too_many:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"로그인 시도가 너무 많습니다. {remaining}분 후에 다시 시도하세요.",
+            detail=f"로그인 시도가 너무 많습니다. {remaining_minutes}분 후에 다시 시도하세요.",
         )
 
+    # ── 자격증명 검증 (DB 조회 — Lock 밖에서 수행) ─────────────────────────
+    # bcrypt 해시 비교는 의도적으로 느립니다(~100ms). Lock 안에서 하면
+    # 다른 사용자의 로그인까지 직렬화되어 전체 처리 성능에 영향을 줍니다.
     user = db.query(User).filter_by(username=username).first()
     if user is None or not verify_password(body.password, user.password_hash):
-        # 실패 기록
-        _failed_attempts.setdefault(username, []).append(now_ts)
+        # 실패 기록을 Lock 안에서 추가
+        with _lock:
+            _failed_attempts.setdefault(username, []).append(now_ts)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="아이디 또는 비밀번호가 올바르지 않습니다.",
         )
+
     # 로그인 성공 시 실패 기록 초기화
-    _failed_attempts.pop(username, None)
+    with _lock:
+        _failed_attempts.pop(username, None)
 
     if not user.is_active:
         raise HTTPException(

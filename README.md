@@ -28,6 +28,7 @@
 10. [설치 프로그램 빌드](#10-설치-프로그램-빌드)
 11. [기술 스택](#11-기술-스택)
 12. [장점과 한계](#12-장점과-한계)
+13. [코드 품질 개선 이력](#13-코드-품질-개선-이력-2026-06-13)
 
 ---
 
@@ -914,6 +915,138 @@ python3 installer/generate_icon.py
 **교사 선호/회피 제약조건 미반영**도 개선이 필요한 부분입니다. `TeacherConstraint` 모델에는 `preferred`(선호)와 `avoid`(회피) 타입이 정의되어 있지만, 자동 생성 알고리즘은 현재 `unavailable`(불가) 타입만 참조합니다.
 
 **채팅 메시지 자동 정리**도 지원합니다. 오래된 메시지는 `CHAT_RETENTION_DAYS`(기본 60일) 기준으로 서버가 12시간 간격으로 자동 삭제하며, 일과계 선생님은 필요시 수동으로 일괄 정리하거나 개별 메시지를 삭제할 수 있습니다. WebSocket 브로드캐스트로 모든 접속자의 UI 가 실시간 갱신됩니다.
+
+---
+
+## 13. 코드 품질 개선 이력 (2026-06-13)
+
+코드 리뷰를 통해 발견된 문제를 우선순위 순서로 개선했습니다.
+
+### 🔴 높음 — 즉시 수정
+
+#### 1. N+1 쿼리 문제 해소 (`server/api/timetable.py`)
+
+**문제**: `list_entries` (시간표 조회)와 `_build_suggestions` (대체 제안) 함수에서 시간표 항목이 N개일 때 교사·과목·교실을 가져오기 위해 최대 3N+α번 추가 SELECT 쿼리가 발생했습니다. 이를 **N+1 쿼리 문제**라 합니다.
+
+**원인**: `for` 루프 안에서 `db.get(Subject, id)` / `db.get(Teacher, id)` / `db.get(Room, id)`를 반복 호출하면, SQLAlchemy가 매 호출마다 개별 SELECT를 실행합니다.
+
+**해결 방법**: SQLAlchemy의 `joinedload()` 옵션을 사용합니다. 이 옵션을 지정하면 첫 번째 쿼리에 `LEFT OUTER JOIN`을 추가하여 연관 테이블의 데이터를 한 번에 가져옵니다.
+
+```python
+# 개선 전 (N+1 문제)
+entries = q.all()   # SELECT * FROM timetable_entries
+for e in entries:
+    subj = db.get(Subject, e.subject_id)   # +1 query 반복
+    tchr = db.get(Teacher, e.teacher_id)   # +1 query 반복
+    room = db.get(Room, e.room_id)         # +1 query 반복
+
+# 개선 후 (1+0 쿼리)
+entries = q.options(
+    joinedload(TimetableEntry.subject),    # JOIN subjects
+    joinedload(TimetableEntry.teacher),    # JOIN teachers
+    joinedload(TimetableEntry.room),       # JOIN rooms (LEFT OUTER)
+).all()   # SELECT ... FROM timetable_entries JOIN subjects JOIN teachers LEFT JOIN rooms
+for e in entries:
+    e.subject.name   # 이미 메모리에 있음 — 추가 쿼리 없음
+    e.teacher.name   # 이미 메모리에 있음 — 추가 쿼리 없음
+    e.room.name      # 이미 메모리에 있음 — 추가 쿼리 없음
+```
+
+`_build_suggestions`는 추가로 마스터 데이터(전체 교사·과목·교실)를 `dict`로 미리 로드하고, 교환(swap) 제안 루프에서 `_build_conflict_maps_from_list()`(DB 접근 없는 메모리 연산)를 사용하도록 개선했습니다. 이를 통해 기존 O(N²) DB 쿼리가 O(N²) 인-메모리 연산으로 대체되었습니다.
+
+#### 2. 교환(swap) 신청 타이밍 충돌(Race Condition) 감지 (`shared/models.py`, `server/api/timetable.py`)
+
+**문제**: 교환 신청(swap)은 두 슬롯 A와 B의 교사를 서로 맞바꾸는 작업입니다. 결재 기간이 길어지는 경우(예: 며칠 뒤 최종 승인), 그 사이에 다른 변경 신청이 슬롯 B를 수정했을 수 있습니다. 이 상태에서 교환을 적용하면 의도하지 않은 데이터로 시간표가 덮어써집니다.
+
+**해결 방법**:
+1. `TimetableChangeRequest` 모델에 `change_snapshot` (TEXT, nullable) 컬럼 추가
+2. 변경 신청 접수 시(`submit_request`) 대상 슬롯과 상대 슬롯의 현재 상태를 JSON으로 저장
+3. 최종 승인 시(`_apply_request_changes`) 스냅샷과 현재 DB 상태를 비교
+4. 불일치하면 `409 Conflict`를 반환하고 적용 중단
+
+```python
+# 신청 시 스냅샷 저장
+change_snapshot = json.dumps({
+    "entry":   {"subject_id": 1, "teacher_id": 2, "room_id": 3},
+    "partner": {"subject_id": 4, "teacher_id": 5, "room_id": 6},
+})
+
+# 승인 시 비교
+if current_partner_state != partner_snap:
+    raise HTTPException(409, "교환 상대 슬롯이 결재 기간 중 수정되었습니다.")
+```
+
+`change_snapshot` 컬럼은 서버 시작 시 `ALTER TABLE ... ADD COLUMN`으로 자동 추가되며, 기존 레코드의 `NULL` 값은 건너뜁니다(하위 호환성 유지).
+
+#### 3. `_apply_request_changes` 조용한 실패에 로그 추가 (`server/api/timetable.py`)
+
+**문제**: 최종 승인 처리 중 시간표 항목이 삭제된 경우, 기존 코드는 `if entry is None: return`으로 조용히 종료하여 원인을 추적할 방법이 없었습니다.
+
+**해결 방법**: `logging.getLogger(__name__)`로 모듈 수준 로거를 생성하고, `None` 체크 후 `_logger.error(...)`로 에러 정보를 기록합니다. `swap` 상대 슬롯이 없을 때도 동일하게 처리합니다.
+
+---
+
+### 🟡 중간 — 보안/안정성 개선
+
+#### 4. JWT_SECRET_KEY 미설정 시 운영 환경에서 서버 시작 거부 (`server/auth_utils.py`)
+
+**문제**: `JWT_SECRET_KEY` 미설정 시 임시 uuid4 키를 자동 생성했습니다. 운영 환경에서 서버가 재시작될 때마다 새로운 키가 생성되어 모든 로그인 토큰이 즉시 무효화되는 문제가 있었습니다.
+
+**해결 방법**: `APP_ENV` 환경 변수로 실행 환경을 구분합니다.
+- `APP_ENV=production` + `JWT_SECRET_KEY` 미설정 → `RuntimeError`로 서버 시작 거부
+- `APP_ENV=development` (기본) → 기존과 동일하게 임시 키 생성, 단 경고 메시지를 더 눈에 띄게 출력
+
+```bash
+# 올바른 운영 환경 설정
+export JWT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+export APP_ENV=production
+```
+
+#### 5. Rate Limiter 스레드 안전성 확보 (`server/api/auth.py`)
+
+**문제**: FastAPI는 동기 엔드포인트를 스레드 풀에서 실행합니다. 여러 요청이 동시에 `_failed_attempts` dict를 읽고 쓰면 race condition으로 실패 횟수가 누락될 수 있었습니다.
+
+**해결 방법**: `threading.Lock()`을 추가하여 dict 접근을 직렬화합니다. 단, bcrypt 해시 비교(~100ms)는 Lock 밖에서 수행하여 다른 사용자의 로그인을 차단하지 않도록 했습니다.
+
+```python
+_lock = threading.Lock()
+
+def login(...):
+    with _lock:
+        # dict 읽기/쓰기 (빠름)
+        recent = [t for t in _failed_attempts.get(username, []) if t > cutoff]
+        _failed_attempts[username] = recent
+        too_many = len(recent) >= _MAX_FAILED
+
+    # bcrypt 비교 (느림, Lock 밖)
+    if not verify_password(body.password, user.password_hash):
+        with _lock:
+            _failed_attempts[username].append(now_ts)
+```
+
+> ⚠️ **한계**: `uvicorn --workers N` (N > 1) 멀티 프로세스 환경에서는 프로세스별로 dict를 따로 관리하여 차단 효과가 감소합니다. 복수 워커를 사용하는 운영 환경에서는 Redis 기반 분산 rate limiting 도입을 권장합니다.
+
+---
+
+### 🟢 낮음 — 사용성 개선
+
+#### 6. 초기 비밀번호 출력 가시성 개선 (`server/main.py`)
+
+비밀번호가 자동 생성될 때 출력되는 메시지에 `=` 구분선을 추가하여 로그에서 쉽게 찾을 수 있도록 개선했습니다. CI/CD 파이프라인이나 로그 집계 시스템 사용 시 로그 노출에 주의하라는 경고도 추가했습니다.
+
+#### 7. `_migrate_add_change_snapshot()` 자동 마이그레이션 (`server/main.py`)
+
+`change_snapshot` 컬럼이 추가되기 전에 생성된 SQLite/PostgreSQL DB에 자동으로 컬럼을 추가합니다. 서버 시작 시 `ALTER TABLE ... ADD COLUMN`을 시도하고, 이미 컬럼이 있는 경우(`OperationalError`)는 무시합니다(멱등성 보장).
+
+---
+
+### 알려진 미반영 항목
+
+| 항목 | 이유 |
+|------|------|
+| `SubjectClassAssignment.term_id` NOT NULL 제약 | SQLite에서 `ALTER TABLE ... ALTER COLUMN`이 미지원. 애플리케이션 레벨에서 강제 |
+| WebSocket 멀티 서버 지원 | Redis Pub/Sub 도입이 필요한 큰 아키텍처 변경. 단일 서버 환경에서는 무관 |
+| DEPRECATED 컬럼 제거 | 기존 운영 DB와의 호환성 유지 필요. 다음 메이저 버전에서 Alembic 마이그레이션과 함께 제거 예정 |
 
 ---
 

@@ -31,13 +31,45 @@ import uuid
 
 _SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not _SECRET_KEY:
-    # JWT_SECRET_KEY 가 없으면 프로세스 수명 동안만 유효한 임시 키를 생성합니다.
-    # 프로세스 재시작 시 새 키가 생성되어 모든 기존 토큰이 무효화됩니다.
-    # 운영 환경에서는 반드시 환경 변수를 고정값으로 설정하세요.
+    # ── JWT_SECRET_KEY 미설정 처리 ──────────────────────────────────────────
+    # APP_ENV 환경 변수로 실행 환경을 구분합니다.
+    #   - APP_ENV=production  → 보안 오류로 서버 시작 거부
+    #   - APP_ENV=development (또는 미설정) → 임시 키 생성 후 경고 출력
+    #
+    # 임시 키(uuid4)의 문제점:
+    #   서버 프로세스가 재시작될 때마다 새로운 키가 생성됩니다.
+    #   그 결과 이전에 발급된 모든 JWT 토큰이 즉시 무효화되고,
+    #   로그인한 모든 사용자가 강제 로그아웃됩니다.
+    #
+    # 올바른 운영 환경 설정:
+    #   export JWT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    #   export APP_ENV=production
+    _app_env = os.getenv("APP_ENV", "development").strip().lower()
+    if _app_env == "production":
+        # 운영 환경에서 키 미설정은 심각한 보안 위험 — 서버 시작 자체를 거부합니다.
+        # RuntimeError 는 uvicorn 기동 단계에서 발생하여 서버가 시작되지 않습니다.
+        raise RuntimeError(
+            "\n"
+            "=" * 60 + "\n"
+            "[보안 오류] JWT_SECRET_KEY 환경 변수가 설정되지 않았습니다.\n"
+            "운영 환경(APP_ENV=production)에서는 반드시 고정된 강력한 키를\n"
+            "환경 변수로 설정해야 합니다.\n\n"
+            "설정 방법:\n"
+            "  export JWT_SECRET_KEY=$(python3 -c \"import secrets; print(secrets.token_hex(32))\")\n"
+            "  export APP_ENV=production\n"
+            "=" * 60
+        )
+
+    # 개발 환경: 임시 키 허용, 단 경고를 명확히 출력
     _SECRET_KEY = uuid.uuid4().hex
-    print("[보안] JWT_SECRET_KEY 환경 변수가 설정되지 않았습니다. "
-          "임시 키를 생성했으므로 서버 재시작 시 모든 토큰이 무효화됩니다. "
-          "운영 환경에서는 반드시 JWT_SECRET_KEY 환경 변수를 고정된 값으로 설정하세요.")
+    print(
+        "\n" + "!" * 60 + "\n"
+        "[보안 경고] JWT_SECRET_KEY 환경 변수가 설정되지 않았습니다.\n"
+        "  → 임시 키를 생성했습니다. 서버 재시작 시 모든 로그인 토큰이 무효화됩니다.\n"
+        "  → 이 동작은 개발 환경(APP_ENV=development)에서만 허용됩니다.\n"
+        "  → 운영 배포 전 반드시 JWT_SECRET_KEY 와 APP_ENV=production 을 설정하세요.\n"
+        "!" * 60 + "\n"
+    )
 
 _ALGORITHM = "HS256"
 _EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
