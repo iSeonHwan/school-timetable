@@ -71,9 +71,11 @@ def generate_timetable(
     """
     # ── 입력 데이터 수집 ────────────────────────────────────────────────
 
-    assignments = session.query(SubjectClassAssignment).all()
+    # 2026-06-13 변경: 해당 학기(term_id)의 시수 배정만 사용하도록 필터링.
+    # 그렇지 않으면 1학기/2학기 데이터가 섞여 잘못된 시간표가 생성됩니다.
+    assignments = session.query(SubjectClassAssignment).filter_by(term_id=term_id).all()
     if not assignments:
-        return False, "배정된 교과/시수 정보가 없습니다."
+        return False, "해당 학기에 배정된 교과/시수 정보가 없습니다."
 
     # 교사별 '불가' 슬롯을 set 으로 미리 수집합니다.
     # 딕셔너리 키: teacher_id, 값: {(day, period), ...}
@@ -82,9 +84,11 @@ def generate_timetable(
         unavailable.setdefault(c.teacher_id, set()).add((c.day_of_week, c.period))
 
     # 교사별 일 최대 수업 수를 미리 수집합니다.
+    # 2026-06-13 변경: max_daily_classes 가 1 미만이면 안전하게 기본값 5를 사용.
+    # (스키마/서버에서 이미 1 이상을 강제하지만, 방어 코드로 남겨둡니다.)
     from database.models import Teacher
     teacher_max: dict[int, int] = {
-        t.id: t.max_daily_classes
+        t.id: max(t.max_daily_classes, 1)
         for t in session.query(Teacher).all()
     }
 

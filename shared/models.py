@@ -166,7 +166,16 @@ class Teacher(Base):
 # ── 교과·반·교사 배정 ──────────────────────────────────────────────────────
 
 class SubjectClassAssignment(Base):
-    """반·교과·교사·주당시수 연결 테이블. 시간표 자동 생성의 입력 데이터."""
+    """
+    반·교과·교사·주당시수 연결 테이블. 시간표 자동 생성의 입력 데이터.
+
+    2026-06-13 변경:
+      - term_id 컬럼 추가. 학기별로 시수 배정을 분리하여, 2학기 데이터가
+        1학기 생성에 섞이지 않도록 합니다.
+      - term_id 는 모델상 nullable 로 유지하되, API/스키마에서 필수 입력을
+        요구합니다. 이는 기존 SQLite DB에 컬럼을 추가할 때 NOT NULL 제약으로
+        인한 마이그레이션 실패를 피하기 위함입니다.
+    """
     __tablename__ = "subject_class_assignments"
 
     id                = Column(Integer, primary_key=True)
@@ -175,11 +184,16 @@ class SubjectClassAssignment(Base):
     teacher_id        = Column(Integer, ForeignKey("teachers.id"), nullable=False)
     weekly_hours      = Column(Integer, nullable=False, default=1)
     preferred_room_id = Column(Integer, ForeignKey("rooms.id"), nullable=True)
+    # ── 학기 구분 (신규) ─────────────────────────────────────────────────
+    # nullable=True 인 이유: 기존 DB 마이그레이션 시 NOT NULL 추가가 SQLite 에서
+    # 까다로우므로, 애플리케이션 레벨에서 term_id 를 강제합니다.
+    term_id           = Column(Integer, ForeignKey("academic_terms.id"), nullable=True)
 
     school_class   = relationship("SchoolClass", back_populates="subject_assignments")
     subject        = relationship("Subject", back_populates="assignments")
     teacher        = relationship("Teacher", back_populates="subject_assignments")
     preferred_room = relationship("Room")
+    term           = relationship("AcademicTerm")
 
 
 # ── 시간표 항목 ────────────────────────────────────────────────────────────
@@ -269,8 +283,15 @@ class TimetableChangeRequest(Base):
     """
     당일 시간표 변경 신청.
 
-    status 흐름 (동적 결재 워크플로우):
-      교사 제출 → pending → [단계별 승인: current_step 진행] → approved (TimetableEntry 에 반영)
+    status 흐름 (동적 결재 워크플로우 + 교사 동의):
+      교사 제출
+        ↓
+      [피교사 동의가 필요하면] consent_status=pending
+        → affected_teacher_id 교사가 승인하면 consent_status=approved
+        → 거절하면 consent_status=rejected, status=rejected (최종)
+        ↓
+      status=pending, current_step=1
+        → [단계별 승인: current_step 진행] → approved (TimetableEntry 에 반영)
       어느 단계든 거절 가능 → rejected
 
     approval_history: JSON 배열로 모든 단계별 승인/거절 기록을 저장합니다.
@@ -280,6 +301,13 @@ class TimetableChangeRequest(Base):
     ]
 
     current_step: 현재 진행 중인 단계 번호 (1-based). approved 시에는 총 단계 수 + 1.
+                  동의 대기 중일 때는 0으로 시작하여, 동의 완료 후 1로 전환됩니다.
+
+    2026-06-13 변경:
+      - affected_teacher_id / consent_status / consent_by_user_id / consent_at:
+        교사 간 교체/대리 수업 시 피교사의 사전 동의를 기록합니다.
+      - swap_partner_entry_id: 두 시간표 슬롯을 맞바꾸는 교환 신청 시 상대 슬롯을
+        기록합니다. 이때 affected_teacher_id 는 상대 슬롯의 현재 교사가 됩니다.
     """
     __tablename__ = "timetable_change_requests"
 
@@ -293,8 +321,22 @@ class TimetableChangeRequest(Base):
     requested_by       = Column(String(30), default="")
     requested_at       = Column(DateTime, default=datetime.now)
     # 동적 결재 워크플로우 필드
-    current_step       = Column(Integer, nullable=False, default=1)
+    # 동의 단계가 있을 때는 0으로 시작하여, 동의 완료 후 1로 설정됩니다.
+    current_step       = Column(Integer, nullable=False, default=0)
     approval_history   = Column(Text, default="[]")  # JSON 배열
+
+    # ── 교사 동의(consent) 관련 필드 (신규) ─────────────────────────────
+    # 피교사 동의가 필요한 경우 affected_teacher_id 에 해당 교사의 ID 를 저장.
+    affected_teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True)
+    # not_required: 동의 불필요 (예: 교실만 변경)
+    # pending       : 피교사의 동의 대기 중
+    # approved      : 피교사 동의 완료
+    # rejected      : 피교사 거절 (status=rejected 로 최종 처리)
+    consent_status      = Column(String(20), nullable=False, default="not_required")
+    consent_by_user_id  = Column(Integer, ForeignKey("users.id"), nullable=True)
+    consent_at          = Column(DateTime, nullable=True)
+    # 교환(swap) 상대 슬롯. swap 은 두 TimetableEntry 의 교사/과목을 동시에 바꿉니다.
+    swap_partner_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
 
     # ── [DEPRECATED] 하드코딩된 2단계 결재 필드 ──────────────────────────
     # approval_history 및 ApprovalWorkflow 로 대체되었습니다.
@@ -307,10 +349,13 @@ class TimetableChangeRequest(Base):
     vice_principal_approved_by = Column(String(30), default="")
     vice_principal_approved_at = Column(DateTime, nullable=True)
 
-    timetable_entry = relationship("TimetableEntry")
-    new_subject     = relationship("Subject", foreign_keys=[new_subject_id])
-    new_teacher     = relationship("Teacher", foreign_keys=[new_teacher_id])
-    new_room        = relationship("Room", foreign_keys=[new_room_id])
+    timetable_entry     = relationship("TimetableEntry", foreign_keys=[timetable_entry_id])
+    swap_partner_entry  = relationship("TimetableEntry", foreign_keys=[swap_partner_entry_id])
+    new_subject         = relationship("Subject", foreign_keys=[new_subject_id])
+    new_teacher         = relationship("Teacher", foreign_keys=[new_teacher_id])
+    new_room            = relationship("Room", foreign_keys=[new_room_id])
+    affected_teacher    = relationship("Teacher", foreign_keys=[affected_teacher_id])
+    consent_by_user     = relationship("User", foreign_keys=[consent_by_user_id])
 
 
 # ── 사용자 계정 (신규) ─────────────────────────────────────────────────────
@@ -343,6 +388,7 @@ class User(Base):
 
     teacher       = relationship("Teacher", back_populates="user")
     chat_messages = relationship("ChatMessage", back_populates="user")
+    notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
 
     def __str__(self):
         return self.username
@@ -369,6 +415,39 @@ class ChatMessage(Base):
     created_at      = Column(DateTime, default=datetime.now)
 
     user = relationship("User", back_populates="chat_messages")
+
+
+# ── 알림 (신규) ──────────────────────────────────────────────────────────────
+
+class Notification(Base):
+    """
+    사용자별 알림 (시스템 알림).
+
+    교사 간 수업 교체 동의 요청, 동의 결과, 최종 승인/거절 등의 이벤트를
+    기록하고 실시간으로 전달합니다. WebSocket 으로 접속 중인 사용자에게는
+    즉시 전송되며, 오프라인 사용자는 재접속 후 GET /notifications 로 조회할
+    수 있습니다.
+
+    type 값:
+      - consent_request   : 피교사에게 동의를 요청하는 알림
+      - consent_approved  : 피교사가 동의한 알림 (요청자에게 전송)
+      - consent_rejected  : 피교사가 거절한 알림 (요청자에게 전송)
+      - status_update     : 변경 신청 상태가 진행된 알림
+      - approved          : 최종 승인된 알림
+      - rejected          : 최종 거절된 알림
+    """
+    __tablename__ = "notifications"
+
+    id                = Column(Integer, primary_key=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=False)
+    type              = Column(String(30), nullable=False)
+    change_request_id = Column(Integer, ForeignKey("timetable_change_requests.id"), nullable=True)
+    message           = Column(Text, nullable=False)
+    is_read           = Column(Boolean, default=False)
+    created_at        = Column(DateTime, default=datetime.now)
+
+    user          = relationship("User", back_populates="notifications")
+    change_request = relationship("TimetableChangeRequest")
 
 
 # ── 결재 워크플로우 (설정 가능) ──────────────────────────────────────────────

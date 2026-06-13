@@ -155,6 +155,16 @@ def list_teachers(db: Session = Depends(get_db), _: User = Depends(require_admin
 
 @router.post("/teachers", response_model=TeacherOut, status_code=201)
 def create_teacher(body: TeacherCreate, db: Session = Depends(get_db), _: User = Depends(require_scheduler)):
+    """
+    교사를 생성합니다.
+
+    2026-06-13 변경:
+      - max_daily_classes 가 1 이상인지 서버에서도 재검증합니다.
+        (Pydantic 스키마에서도 검증하지만, defence in depth 원칙에 따라
+        서버 측에서도 한 번 더 확인합니다.)
+    """
+    if body.max_daily_classes < 1:
+        raise HTTPException(400, "일 최대 수업 수는 1 이상이어야 합니다.")
     teacher = Teacher(
         name=body.name,
         employee_number=body.employee_number,
@@ -183,7 +193,11 @@ def update_teacher(
         "name", "employee_number", "is_homeroom",
         "homeroom_class_id", "max_daily_classes",
     }
-    for field, val in body.model_dump(exclude_none=True).items():
+    data = body.model_dump(exclude_none=True)
+    # 2026-06-13: max_daily_classes 변경 시 1 이상인지 서버에서 재검증
+    if "max_daily_classes" in data and data["max_daily_classes"] < 1:
+        raise HTTPException(400, "일 최대 수업 수는 1 이상이어야 합니다.")
+    for field, val in data.items():
         if field in _TEACHER_UPDATE_ALLOWED:
             setattr(teacher, field, val)
     db.commit()
@@ -236,8 +250,22 @@ def clear_constraints(teacher_id: int, db: Session = Depends(get_db), _: User = 
 # ── 시수 배정 ──────────────────────────────────────────────────────────────
 
 @router.get("/assignments", response_model=list[AssignmentOut])
-def list_assignments(db: Session = Depends(get_db), _: User = Depends(require_admin_or_vice_principal)):
-    return db.query(SubjectClassAssignment).all()
+def list_assignments(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin_or_vice_principal),
+    term_id: Optional[int] = None,
+):
+    """
+    시수 배정 목록을 반환합니다.
+
+    2026-06-13 변경:
+      - term_id 쿼리 파라미터 추가. 특정 학기의 배정만 조회할 수 있습니다.
+      - term_id 를 지정하지 않으면 전체 목록을 반환(하위 호환).
+    """
+    q = db.query(SubjectClassAssignment)
+    if term_id:
+        q = q.filter(SubjectClassAssignment.term_id == term_id)
+    return q.all()
 
 
 @router.post("/assignments", response_model=AssignmentOut, status_code=201)
@@ -246,11 +274,17 @@ def create_or_update_assignment(
     db: Session = Depends(get_db),
     _: User = Depends(require_scheduler),
 ):
-    """같은 (반, 교과, 교사) 조합이 있으면 시수만 업데이트합니다."""
+    """
+    같은 (반, 교과, 교사, 학기) 조합이 있으면 시수만 업데이트합니다.
+
+    2026-06-13 변경:
+      - term_id 를 포함하여 학기별 시수 배정을 구분합니다.
+    """
     existing = db.query(SubjectClassAssignment).filter_by(
         school_class_id=body.school_class_id,
         subject_id=body.subject_id,
         teacher_id=body.teacher_id,
+        term_id=body.term_id,
     ).first()
     if existing:
         existing.weekly_hours = body.weekly_hours
@@ -264,6 +298,7 @@ def create_or_update_assignment(
         teacher_id=body.teacher_id,
         weekly_hours=body.weekly_hours,
         preferred_room_id=body.preferred_room_id,
+        term_id=body.term_id,
     )
     db.add(a)
     db.commit()

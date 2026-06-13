@@ -73,11 +73,12 @@ class EditDialog(QDialog):
         change_group = QGroupBox("변경 내용")
         change_layout = QFormLayout(change_group)
 
-        # 새 과목 선택: 해당 반에 배정된 교과만 표시합니다.
+        # 새 과목 선택: 같은 학기·해당 반에 배정된 교과만 표시합니다.
         self._cmb_subject = QComboBox()
         self._cmb_subject.addItem("(변경 없음)", None)
         assignments = self._session.query(SubjectClassAssignment).filter_by(
-            school_class_id=self.entry.school_class_id
+            term_id=self.entry.term_id,
+            school_class_id=self.entry.school_class_id,
         ).all()
         seen_subject_ids = set()
         for a in assignments:

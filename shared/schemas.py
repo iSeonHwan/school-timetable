@@ -201,19 +201,32 @@ class TeacherOut(BaseModel):
 
 
 class TeacherCreate(BaseModel):
+    """
+    교사 생성 요청.
+
+    2026-06-13 변경:
+      - max_daily_classes 에 ge=1 검증 추가. 0 이하 값은 생성기에서
+        무한 루프/오류를 유발할 수 있으므로 차단합니다.
+    """
     name: str
     employee_number: str = ""
     is_homeroom: bool = False
     homeroom_class_id: Optional[int] = None
-    max_daily_classes: int = 5
+    max_daily_classes: int = Field(default=5, ge=1)
 
 
 class TeacherUpdate(BaseModel):
+    """
+    교사 수정 요청.
+
+    2026-06-13 변경:
+      - max_daily_classes 에 ge=1 검증 추가.
+    """
     name: Optional[str] = None
     employee_number: Optional[str] = None
     is_homeroom: Optional[bool] = None
     homeroom_class_id: Optional[int] = None
-    max_daily_classes: Optional[int] = None
+    max_daily_classes: Optional[int] = Field(None, ge=1)
 
 
 # ── 교사 제약 ──────────────────────────────────────────────────────────────
@@ -250,16 +263,25 @@ class AssignmentOut(BaseModel):
     teacher_id: int
     weekly_hours: int
     preferred_room_id: Optional[int]
+    term_id: Optional[int] = None
 
     model_config = {"from_attributes": True}
 
 
 class AssignmentCreate(BaseModel):
+    """
+    시수 배정 생성/수정 요청.
+
+    2026-06-13 변경:
+      - term_id 추가. 학기별로 시수 배정을 구분하여 생성기가 해당 학기
+        데이터만 사용하도록 합니다. 이 필드는 필수입니다.
+    """
     school_class_id: int
     subject_id: int
     teacher_id: int
     weekly_hours: int = Field(default=1, ge=1, le=50)
     preferred_room_id: Optional[int] = None
+    term_id: int
 
 
 # ── 시간표 항목 ────────────────────────────────────────────────────────────
@@ -290,10 +312,12 @@ class ChangeRequestOut(BaseModel):
     """
     변경 신청 응답.
 
-    동적 결재 워크플로우 지원:
-      - current_step: 현재 진행 중인 단계 (1-based)
+    동적 결재 워크플로우 + 교사 동의 지원:
+      - current_step: 현재 진행 중인 단계 (1-based). 동의 대기 중일 때는 0.
       - total_steps: 활성 워크플로우의 총 단계 수 (DB 컬럼 아님, API 응답 시 주입)
       - approval_history: JSON 배열로 모든 단계별 승인/거절 기록
+      - consent_status / affected_teacher_id: 피교사 동의 상태
+      - swap_partner_entry_id: 교환 상대 슬롯
     """
     id: int
     timetable_entry_id: int
@@ -305,9 +329,15 @@ class ChangeRequestOut(BaseModel):
     requested_by: str
     requested_at: datetime
     # 동적 결재 정보
-    current_step: int = 1
+    current_step: int = 0
     total_steps: int = 0           # API 응답 시 서버가 주입
     approval_history: str = "[]"   # JSON 배열
+    # 피교사 동의 정보 (신규)
+    affected_teacher_id: Optional[int] = None
+    consent_status: str = "not_required"
+    consent_by_user_id: Optional[int] = None
+    consent_at: Optional[datetime] = None
+    swap_partner_entry_id: Optional[int] = None
     # [DEPRECATED] 하드코딩된 2단계 결재 필드 — 하위 호환용 유지
     scheduler_approved_by: str = ""
     scheduler_approved_at: Optional[datetime] = None
@@ -318,11 +348,18 @@ class ChangeRequestOut(BaseModel):
 
 
 class ChangeRequestCreate(BaseModel):
+    """
+    변경 신청 생성 요청.
+
+    2026-06-13 변경:
+      - swap_partner_entry_id 추가. 두 슬롯을 맞바꾸는 교환 신청에 사용.
+    """
     timetable_entry_id: int
     new_subject_id: Optional[int] = None
     new_teacher_id: Optional[int] = None
     new_room_id: Optional[int] = None
     reason: str = ""
+    swap_partner_entry_id: Optional[int] = None
 
 
 class ChangeRequestReview(BaseModel):
@@ -336,6 +373,16 @@ class ChangeRequestReview(BaseModel):
     """
     action: str   # "approve" | "reject"
     approved_by: str = ""  # 서버가 무시하고 current_user.username 으로 덮어씁니다.
+
+
+class ConsentReview(BaseModel):
+    """
+    피교사 동의(승인/거절) 요청.
+
+    PATCH /timetable/requests/{id}/consent 의 요청 바디입니다.
+    피교사(로그인한 사용자의 teacher_id == affected_teacher_id)만 호출할 수 있습니다.
+    """
+    action: str  # "approve" | "reject"
 
 
 # ── 변경 이력 ──────────────────────────────────────────────────────────────
@@ -385,6 +432,47 @@ class GenerateRequest(BaseModel):
     max_retries: int = 30
 
 
+# ── 시간표 교체 제안 ─────────────────────────────────────────────────────────
+
+class SuggestionOption(BaseModel):
+    """
+    단일 제안 항목.
+
+    변경 신청자가 선택하면, 이 항목에 해당하는 new_*_id / swap_partner_entry_id 를
+    ChangeRequestCreate 에 담아 서버로 전송합니다.
+    """
+    subject_id: Optional[int] = None
+    teacher_id: Optional[int] = None
+    room_id: Optional[int] = None
+    swap_partner_entry_id: Optional[int] = None
+    label: str  # 화면에 표시할 설명 문구
+    reason: str  # 왜 이 제안이 가능한지에 대한 짧은 설명
+
+
+class SuggestionCurrent(BaseModel):
+    """현재 선택한 시간표 슬롯의 요약 정보."""
+    entry_id: int
+    day_of_week: int
+    period: int
+    school_class_id: int
+    school_class_name: str
+    subject_id: int
+    subject_name: str
+    teacher_id: int
+    teacher_name: str
+    room_id: Optional[int]
+    room_name: Optional[str]
+
+
+class SuggestionResponse(BaseModel):
+    """GET /timetable/suggestions 응답."""
+    current: SuggestionCurrent
+    subjects: list[SuggestionOption]
+    teachers: list[SuggestionOption]
+    rooms: list[SuggestionOption]
+    swaps: list[SuggestionOption]
+
+
 # ── 채팅 ───────────────────────────────────────────────────────────────────
 
 class ChatMessageOut(BaseModel):
@@ -421,6 +509,26 @@ class ChatMessageCreate(BaseModel):
         if len(stripped) > 10000:
             raise ValueError("메시지가 너무 깁니다. 10000자 이하로 입력하세요.")
         return stripped
+
+
+# ── 알림 ────────────────────────────────────────────────────────────────────
+
+class NotificationOut(BaseModel):
+    """알림 응답 스키마."""
+    id: int
+    user_id: int
+    type: str
+    change_request_id: Optional[int]
+    message: str
+    is_read: bool
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NotificationReadRequest(BaseModel):
+    """알림 읽음 처리 요청."""
+    is_read: bool = True
 
 
 # ── 결재 워크플로우 ─────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 from database.connection import get_session
-from database.models import Subject, SchoolClass, Grade, Teacher, SubjectClassAssignment
+from database.models import Subject, SchoolClass, Grade, Teacher, SubjectClassAssignment, AcademicTerm
 
 BTN_PRIMARY = "background:#1B4F8A; color:white; border-radius:4px; padding:6px 14px; font-weight:bold;"
 BTN_DANGER  = "background:#C0392B; color:white; border-radius:4px; padding:6px 14px;"
@@ -151,6 +151,13 @@ class SubjectSetupWidget(QWidget):
         f2_layout.addWidget(lbl2)
 
         row2 = QHBoxLayout()
+        row2.addWidget(QLabel("학기:"))
+
+        self.cb_term = QComboBox()
+        self.cb_term.setMinimumWidth(120)
+        row2.addWidget(self.cb_term)
+
+        row2.addSpacing(8)
         row2.addWidget(QLabel("학반:"))
 
         self.cb_class = QComboBox()
@@ -188,8 +195,8 @@ class SubjectSetupWidget(QWidget):
         f2_layout.addLayout(row2)
 
         # 배정 목록 테이블
-        self.tbl_assignments = QTableWidget(0, 5)
-        self.tbl_assignments.setHorizontalHeaderLabels(["ID", "학반", "교과", "교사", "주당시수"])
+        self.tbl_assignments = QTableWidget(0, 6)
+        self.tbl_assignments.setHorizontalHeaderLabels(["ID", "학기", "학반", "교과", "교사", "주당시수"])
         self.tbl_assignments.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl_assignments.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl_assignments.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -239,6 +246,20 @@ class SubjectSetupWidget(QWidget):
                 self.tbl_subjects.setItem(row, 4, QTableWidgetItem("예" if s.needs_special_room else "아니오"))
                 self.cb_subject.addItem(s.name, s.id)
 
+            # 학기 목록
+            terms = session.query(AcademicTerm).order_by(AcademicTerm.year, AcademicTerm.semester).all()
+            self.cb_term.clear()
+            for t in terms:
+                label = f"{t.year}년 {t.semester}학기"
+                if t.is_current:
+                    label += " (현재)"
+                self.cb_term.addItem(label, t.id)
+            # 현재 학기를 기본 선택
+            for idx, t in enumerate(terms):
+                if t.is_current:
+                    self.cb_term.setCurrentIndex(idx)
+                    break
+
             # 학반 목록
             classes = (
                 session.query(SchoolClass).join(Grade)
@@ -254,21 +275,25 @@ class SubjectSetupWidget(QWidget):
             for t in teachers:
                 self.cb_teacher.addItem(t.name, t.id)
 
-            # 배정 목록
+            # 배정 목록 (학기 포함)
             assignments = session.query(SubjectClassAssignment).all()
             self.tbl_assignments.setRowCount(len(assignments))
             for row, a in enumerate(assignments):
+                term_label = ""
+                if a.term:
+                    term_label = f"{a.term.year}-{a.term.semester}"
                 self.tbl_assignments.setItem(row, 0, QTableWidgetItem(str(a.id)))
-                self.tbl_assignments.setItem(row, 1, QTableWidgetItem(
+                self.tbl_assignments.setItem(row, 1, QTableWidgetItem(term_label))
+                self.tbl_assignments.setItem(row, 2, QTableWidgetItem(
                     a.school_class.display_name if a.school_class else ""
                 ))
-                self.tbl_assignments.setItem(row, 2, QTableWidgetItem(
+                self.tbl_assignments.setItem(row, 3, QTableWidgetItem(
                     a.subject.name if a.subject else ""
                 ))
-                self.tbl_assignments.setItem(row, 3, QTableWidgetItem(
+                self.tbl_assignments.setItem(row, 4, QTableWidgetItem(
                     a.teacher.name if a.teacher else ""
                 ))
-                self.tbl_assignments.setItem(row, 4, QTableWidgetItem(str(a.weekly_hours)))
+                self.tbl_assignments.setItem(row, 5, QTableWidgetItem(str(a.weekly_hours)))
         finally:
             session.close()
 
@@ -327,12 +352,16 @@ class SubjectSetupWidget(QWidget):
 
     def _add_assignment(self):
         """
-        학반·교과·교사·시수 배정을 추가합니다.
-        같은 (학반, 교과, 교사) 조합이 이미 있으면 시수만 업데이트합니다.
+        학기·학반·교과·교사·시수 배정을 추가합니다.
+        같은 (학기, 학반, 교과, 교사) 조합이 이미 있으면 시수만 업데이트합니다.
         """
+        term_id    = self.cb_term.currentData()
         class_id   = self.cb_class.currentData()
         subject_id = self.cb_subject.currentData()
         teacher_id = self.cb_teacher.currentData()
+        if not term_id:
+            QMessageBox.warning(self, "오류", "학기를 선택해 주세요.")
+            return
         if not class_id or not subject_id or not teacher_id:
             QMessageBox.warning(self, "오류", "학반, 교과, 교사를 모두 선택해 주세요.")
             return
@@ -341,6 +370,7 @@ class SubjectSetupWidget(QWidget):
         session = get_session()
         try:
             existing = session.query(SubjectClassAssignment).filter_by(
+                term_id=term_id,
                 school_class_id=class_id,
                 subject_id=subject_id,
                 teacher_id=teacher_id,
@@ -351,6 +381,7 @@ class SubjectSetupWidget(QWidget):
                 existing.weekly_hours = hours
             else:
                 a = SubjectClassAssignment(
+                    term_id=term_id,
                     school_class_id=class_id,
                     subject_id=subject_id,
                     teacher_id=teacher_id,

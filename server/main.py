@@ -29,6 +29,7 @@ from server.api.setup import router as setup_router
 from server.api.timetable import router as timetable_router
 from server.api.chat import router as chat_router, start_cleanup_task
 from server.api.workflow import router as workflow_router
+from server.api.notifications import router as notifications_router
 
 
 @asynccontextmanager
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
     db_url = os.getenv("DB_URL")
     init_db(db_url)
     _ensure_admin()
+    _ensure_assignment_terms()   # 기존 시수 배정 term_id 백필
     _ensure_default_workflow()
 
     # 채팅 메시지 자동 정리 백그라운드 태스크 시작
@@ -128,6 +130,46 @@ def _ensure_admin():
                 print(f"  이 비밀번호는 이번 한 번만 표시됩니다. 서버 로그에서 확인 후 안전한 곳에 보관하세요!")
             else:
                 print(f"[서버] 최초 교무부장 계정 생성: {dh_username} (비밀번호를 즉시 변경하세요!)")
+    finally:
+        db.close()
+
+
+def _ensure_assignment_terms():
+    """
+    기존 subject_class_assignments 데이터에 term_id 를 백필합니다.
+
+    2026-06-13 변경:
+      - SubjectClassAssignment 에 term_id 컬럼이 추가되면서, 기존 데이터의
+        term_id 가 비어 있을 경우 자동으로 현재 학기로 채웁니다.
+      - 현재 학기가 없으면 DB 의 첫 번째 학기를 사용합니다.
+      - 이미 term_id 가 설정된 행은 건드리지 않으므로 멱등성이 보장됩니다.
+    """
+    from sqlalchemy import text
+    from shared.models import AcademicTerm, SubjectClassAssignment
+
+    db = get_session()
+    try:
+        # term_id 가 비어있는 행이 있는지 먼저 확인
+        empty_count = db.query(SubjectClassAssignment).filter(
+            (SubjectClassAssignment.term_id.is_(None)) | (SubjectClassAssignment.term_id == 0)
+        ).count()
+        if empty_count == 0:
+            return
+
+        # 백필용 학기 결정: 현재 학기 → 첫 번째 학기
+        target_term = db.query(AcademicTerm).filter_by(is_current=True).first()
+        if target_term is None:
+            target_term = db.query(AcademicTerm).order_by(AcademicTerm.year, AcademicTerm.semester).first()
+        if target_term is None:
+            print("[마이그레이션] 학기가 하나도 없어 subject_class_assignments.term_id 를 백필할 수 없습니다.")
+            return
+
+        db.execute(text(
+            "UPDATE subject_class_assignments SET term_id=:term_id "
+            "WHERE term_id IS NULL OR term_id=0"
+        ), {"term_id": target_term.id})
+        db.commit()
+        print(f"[마이그레이션] {empty_count}개의 시수 배정에 term_id={target_term.id}({target_term})를 백필했습니다.")
     finally:
         db.close()
 
@@ -236,6 +278,7 @@ app.include_router(setup_router)
 app.include_router(timetable_router)
 app.include_router(chat_router)
 app.include_router(workflow_router)
+app.include_router(notifications_router)
 
 
 @app.get("/", tags=["상태"])
