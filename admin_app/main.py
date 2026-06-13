@@ -15,11 +15,16 @@ import os
 from PyQt6.QtWidgets import QApplication
 from admin_app.ui.login_window import LoginWindow
 from database.connection import init_db  # 관리자 앱은 DB에 직접 접근하므로 시작 시 초기화
+from shared.theme import LIGHT_THEME_QSS   # 다크 모드 충돌 방지용 전역 라이트 테마
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("시간표 관리 시스템 — 관리자")
+
+    # macOS 다크 모드에서 시스템 팔레트가 PyQt6 위젯에 흰 텍스트를 적용하면
+    # background:white 위젯에서 흰 글씨가 되는 문제를 방지합니다.
+    app.setStyleSheet(LIGHT_THEME_QSS)
 
     # ui/ 위젯들(ClassSetupWidget 등)이 get_session()을 직접 호출합니다.
     # AdminMainWindow 생성 전에 반드시 init_db()를 호출해야 합니다.
