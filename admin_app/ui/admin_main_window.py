@@ -31,7 +31,7 @@ from ui.setup.subject_setup import SubjectSetupWidget
 from ui.setup.room_setup import RoomSetupWidget
 from ui.timetable.class_view import ClassTimetableView
 from ui.timetable.teacher_view import TeacherTimetableView
-from ui.history.history_view import HistoryViewWidget
+from ui.history.history_view import HistoryWidget as HistoryViewWidget
 from ui.timetable.request_list import ChangeRequestWidget
 from ui.setup.workflow_setup import WorkflowSetupWidget
 

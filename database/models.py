@@ -21,4 +21,7 @@ from shared.models import (  # noqa: F401
     TimetableChangeRequest,
     User,
     ChatMessage,
+    Notification,
+    ApprovalWorkflow,
+    ApprovalStep,
 )
