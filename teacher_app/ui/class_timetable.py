@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from shared.api_client import ApiClient, ApiError
+from teacher_app.ui.suggest_dialog import SuggestDialog
 
 DAYS = ["월", "화", "수", "목", "금"]
 
@@ -45,6 +46,7 @@ class ClassTimetableWidget(QWidget):
         self._client = client
         self._worker = None
         self._term_id: int | None = None
+        self._entries: list[dict] = []
         self._init_ui()
 
     def _init_ui(self):
@@ -77,6 +79,7 @@ class ClassTimetableWidget(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(52)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         layout.addWidget(self.table)
 
     def refresh(self):
@@ -110,6 +113,7 @@ class ClassTimetableWidget(QWidget):
         self._worker.start()
 
     def _populate(self, entries: list):
+        self._entries = entries
         if not entries:
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
@@ -135,3 +139,23 @@ class ClassTimetableWidget(QWidget):
             color = e.get("subject_color", "#E3F2FD")
             item.setBackground(QColor(color))
             self.table.setItem(row, col, item)
+
+    def _on_cell_double_clicked(self, row: int, col: int):
+        """
+        학반 시간표 셀 더블클릭 시 교체 제안 다이얼로그를 엽니다.
+
+        col(0~4) → 요일(1~5), row → 교시(1-based).
+        """
+        if self._term_id is None:
+            return
+        day = col + 1
+        period = row + 1
+        entry = next(
+            (e for e in self._entries
+             if e["day_of_week"] == day and e["period"] == period),
+            None,
+        )
+        if entry is None:
+            return
+        dlg = SuggestDialog(client=self._client, entry_id=entry["id"], parent=self)
+        dlg.exec()

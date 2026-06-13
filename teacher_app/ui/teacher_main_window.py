@@ -12,17 +12,36 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFrame, QLabel, QPushButton, QStackedWidget,
+    QDialog,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from shared.api_client import ApiClient
 from admin_app.ui.chat_panel import ChatPanel   # 채팅 패널은 공용으로 재활용
 from teacher_app.ui.my_timetable import MyTimetableWidget
 from teacher_app.ui.class_timetable import ClassTimetableWidget
 from teacher_app.ui.request_widget import RequestWidget
+from teacher_app.ui.notification_panel import NotificationPanel
 
 SIDEBAR_W = 160
 CHAT_W = 260
+
+
+class _LoadUnreadCountWorker(QThread):
+    """GET /notifications/unread-count 를 비동기로 조회하는 워커."""
+    done = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, client: ApiClient):
+        super().__init__()
+        self._client = client
+
+    def run(self):
+        try:
+            result = self._client.get("/notifications/unread-count")
+            self.done.emit(result.get("unread_count", 0))
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class TeacherMainWindow(QMainWindow):
@@ -57,6 +76,16 @@ class TeacherMainWindow(QMainWindow):
         title.setFont(QFont("", 12, QFont.Weight.Bold))
         title.setStyleSheet("color:white; background:#145230; padding:16px 8px;")
         sb.addWidget(title)
+
+        # ── 알림 버튼 ─────────────────────────────────────────────────────
+        self.btn_notifications = QPushButton("🔔 알림 0")
+        self.btn_notifications.setStyleSheet(
+            "QPushButton { color:white; background:#1d7d47; border:none; "
+            "padding:10px 16px; text-align:left; font-size:12px; font-weight:bold; }"
+            "QPushButton:hover { background:#239a55; }"
+        )
+        self.btn_notifications.clicked.connect(self._show_notifications)
+        sb.addWidget(self.btn_notifications)
 
         nav_items = [("내 시간표", 0), ("학반 시간표", 1), ("교체 신청", 2)]
         for label, idx in nav_items:
@@ -101,6 +130,10 @@ class TeacherMainWindow(QMainWindow):
         self._chat.setFixedWidth(CHAT_W)
         root.addWidget(self._chat)
 
+        # WebSocket 실시간 알림 수신 시 읽지 않은 개수 갱신
+        self._chat.notification_received.connect(self._on_notification_received)
+        self._refresh_unread_count()
+
         self._switch_page(0)
 
     def _switch_page(self, idx: int):
@@ -110,6 +143,48 @@ class TeacherMainWindow(QMainWindow):
         page = self.stack.currentWidget()
         if hasattr(page, "refresh"):
             page.refresh()
+
+    def _show_notifications(self):
+        """알림 패널을 다이얼로그로 표시합니다."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("알림")
+        dlg.resize(420, 480)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        panel = NotificationPanel(client=self._client, parent=dlg)
+        layout.addWidget(panel)
+
+        # 다이얼로그가 닫히면 읽지 않은 개수를 다시 조회합니다.
+        dlg.finished.connect(self._refresh_unread_count)
+        dlg.exec()
+
+    def _on_notification_received(self, payload: dict):
+        """WebSocket 으로 실시간 알림 수신 시 벨 아이콘을 강조하고 개수를 갱신합니다."""
+        self.btn_notifications.setStyleSheet(
+            "QPushButton { color:white; background:#C0392B; border:none; "
+            "padding:10px 16px; text-align:left; font-size:12px; font-weight:bold; }"
+            "QPushButton:hover { background:#E74C3C; }"
+        )
+        self._refresh_unread_count()
+
+    def _refresh_unread_count(self):
+        """서버에서 읽지 않은 알림 개수를 조회해 벨 버튼에 표시합니다."""
+        self._unread_worker = _LoadUnreadCountWorker(self._client)
+        self._unread_worker.done.connect(self._update_badge)
+        self._unread_worker.error.connect(lambda _: None)
+        self._unread_worker.start()
+
+    def _update_badge(self, count: int):
+        """읽지 않은 알림 개수를 버튼 텍스트에 반영합니다."""
+        self.btn_notifications.setText(f"🔔 알림 {count}")
+        # 새 알림이 없으면 기본 색상으로 복원
+        if count == 0:
+            self.btn_notifications.setStyleSheet(
+                "QPushButton { color:white; background:#1d7d47; border:none; "
+                "padding:10px 16px; text-align:left; font-size:12px; font-weight:bold; }"
+                "QPushButton:hover { background:#239a55; }"
+            )
 
     def _logout(self):
         self._client.logout()
