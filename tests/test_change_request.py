@@ -234,6 +234,89 @@ def test_swap_request_requires_consent(client, dataset, teacher1_headers):
     assert data["swap_partner_entry_id"] == entry2_id
 
 
+def test_single_change_detects_concurrent_modification(client, dataset, teacher1_headers, db):
+    """단순 change 신청 — 결재 기간 중 entry 가 수정되면 최종 승인 시 409 충돌 감지."""
+    from database.models import TimetableChangeRequest
+
+    entry_id = dataset["entry1"].id
+    room2_id = dataset["room2"].id
+
+    # 1) 교실 변경 신청 (snapshot 저장 — version=1)
+    resp = client.post("/timetable/requests", headers=teacher1_headers, json={
+        "timetable_entry_id": entry_id,
+        "new_room_id": room2_id,
+        "reason": "교실 이동",
+    })
+    assert resp.status_code == 201
+    req_id = resp.json()["id"]
+
+    # 2) 1차 승인 (일과계) — 다음 단계로 진행만 하고 아직 적용은 아님
+    admin_h = auth_client_for_test(client, "admin_lock1a", "admin")
+    resp_admin = client.patch(f"/timetable/requests/{req_id}", headers=admin_h, json={
+        "action": "approve",
+    })
+    assert resp_admin.status_code == 200
+
+    # 3) 결재 기간 중 다른 트랜잭션이 entry 를 수정했다고 시뮬레이션
+    #    (직접 room_id 와 version 을 변경)
+    entry = db.get(TimetableEntry, entry_id)
+    entry.room_id = dataset["room2"].id  # 신청과 같은 값이더라도 version 변경이 핵심
+    entry.version = (entry.version or 0) + 1
+    db.commit()
+
+    # 4) 교감 최종 승인 시도 — _apply_request_changes 호출 → 409 Conflict
+    vp_h = auth_client_for_test(client, "vp_lock1", "vice_principal")
+    resp2 = client.patch(f"/timetable/requests/{req_id}", headers=vp_h, json={
+        "action": "approve",
+    })
+    assert resp2.status_code == 409
+    # 신청은 1단계 통과 상태 유지 — 롤백됨
+    req_after = db.get(TimetableChangeRequest, req_id)
+    assert req_after.status == "pending"
+
+
+def test_swap_detects_partner_concurrent_modification(client, dataset, teacher1_headers, teacher2_headers, db):
+    """swap 신청 — 결재 기간 중 상대 슬롯(partner)이 수정되면 최종 승인 시 409."""
+    from database.models import TimetableChangeRequest
+
+    entry1_id = dataset["entry1"].id
+    entry2_id = dataset["entry2"].id
+
+    # 1) 교환 신청 (snapshot 저장 — 양쪽 version=1)
+    resp = client.post("/timetable/requests", headers=teacher1_headers, json={
+        "timetable_entry_id": entry1_id,
+        "swap_partner_entry_id": entry2_id,
+        "reason": "수업 교환",
+    })
+    assert resp.status_code == 201
+    req_id = resp.json()["id"]
+
+    # 2) 피교사 동의 — 결재 라인 진입
+    resp_consent = client.patch(
+        f"/timetable/requests/{req_id}/consent", headers=teacher2_headers, json={"action": "approve"}
+    )
+    assert resp_consent.status_code == 200
+
+    # 3) 결재 기간 중 partner(entry2)가 다른 트랜잭션에 의해 수정되었다고 시뮬레이션
+    partner = db.get(TimetableEntry, entry2_id)
+    partner.subject_id = partner.subject_id  # 값은 동일해도 version 증가가 핵심
+    partner.version = (partner.version or 0) + 1
+    db.commit()
+
+    # 4) 관리자 최종 승인 시도 — partner version 불일치로 409 Conflict
+    admin_h = auth_client_for_test(client, "admin_lock2", "admin")
+    # 1차 승인 (일과계)
+    resp1 = client.patch(f"/timetable/requests/{req_id}", headers=admin_h, json={"action": "approve"})
+    assert resp1.status_code == 200  # 1차는 통과 — apply 단계가 아직 아님
+    # 2차 승인 (교감) — 이때 _apply_request_changes 호출 → 409
+    vp_h = auth_client_for_test(client, "vp_lock2", "vice_principal")
+    resp2 = client.patch(f"/timetable/requests/{req_id}", headers=vp_h, json={"action": "approve"})
+    assert resp2.status_code == 409
+    # 신청은 1단계 통과 상태 유지 — 롤백됨
+    req_after = db.get(TimetableChangeRequest, req_id)
+    assert req_after.status == "pending"
+
+
 # ── 내부 헬퍼 ───────────────────────────────────────────────────────────────
 
 def auth_client_for_test(client, username: str, role: str, password: str = "pass"):

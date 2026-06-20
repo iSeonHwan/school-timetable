@@ -196,6 +196,7 @@ def _apply_swap_step(
         target_before: target 의 원래 상태 {subject_id, teacher_id, room_id}
 
     변경 이력은 core.change_logger.log_entry_update 로 자동 기록됩니다.
+    2026-06-20: 양쪽 슬롯의 version 을 1씩 증가시켜 낙관적 잠금 충돌을 감지 가능하게 함.
     """
     from core.change_logger import log_entry_update
 
@@ -206,6 +207,10 @@ def _apply_swap_step(
     target.subject_id = source_before["subject_id"]
     target.teacher_id = source_before["teacher_id"]
     target.room_id    = source_before["room_id"]
+
+    # 낙관적 잠금 version 증가 — 이후 다른 신청이 같은 슬롯을 참조하면 버전 불일치로 409 유발
+    source.version = (source.version or 0) + 1
+    target.version = (target.version or 0) + 1
 
     # 변경 이력 — 양쪽 모두 기록 (감사 추적)
     log_entry_update(db, source, source_before)
@@ -229,6 +234,8 @@ def _apply_change_step(
         db: SQLAlchemy 세션
         entry: 변경 대상 슬롯
         new_subject_id / new_teacher_id / new_room_id: 새로 지정할 값 (None 이면 유지)
+
+    2026-06-20: entry.version 을 1 증가시켜 낙관적 잠금 충돌을 감지 가능하게 함.
     """
     from core.change_logger import log_entry_update
 
@@ -243,6 +250,7 @@ def _apply_change_step(
         entry.teacher_id = new_teacher_id
     if new_room_id is not None:
         entry.room_id = new_room_id
+    entry.version = (entry.version or 0) + 1
     log_entry_update(db, entry, before)
 
 
@@ -514,11 +522,14 @@ def submit_request(
     #
     # 스냅샷에는 신청 시점의 entry(대상 슬롯) 상태와,
     # 교환(swap) 신청인 경우 partner(상대 슬롯) 상태도 저장합니다.
+    # 2026-06-20: version 필드를 추가해 낙관적 잠금(optimistic locking)으로
+    # 이중 보호. 속성 값이 같아도 version 이 다르면 충돌로 처리.
     _snap: dict = {
         "entry": {
             "subject_id": entry.subject_id,
             "teacher_id": entry.teacher_id,
             "room_id":    entry.room_id,
+            "version":    entry.version,
         }
     }
     if body.swap_partner_entry_id is not None:
@@ -528,6 +539,7 @@ def submit_request(
             "subject_id": partner.subject_id,
             "teacher_id": partner.teacher_id,
             "room_id":    partner.room_id,
+            "version":    partner.version,
         }
 
     req = TimetableChangeRequest(
@@ -651,6 +663,7 @@ def _submit_chain_swap_request(
                 "subject_id": source.subject_id,
                 "teacher_id": source.teacher_id,
                 "room_id":    source.room_id,
+                "version":    source.version,
             }
         }
 
@@ -676,6 +689,7 @@ def _submit_chain_swap_request(
                 "subject_id": target.subject_id,
                 "teacher_id": target.teacher_id,
                 "room_id":    target.room_id,
+                "version":    target.version,
             }
         elif s.step_type == "change":
             # 단일 슬롯 변경 — new_teacher_id 가 현재와 다르면 동의 필요
@@ -1544,13 +1558,21 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
     전체 단계를 한 트랜잭션으로 묶어 원자성을 보장합니다.
     """
     from core.change_logger import log_entry_update
+    from sqlalchemy import select
 
     # ── 0. 연쇄 교체 분기 (신규) ──────────────────────────────────────
     if req.steps:
         return _apply_chain_swap_changes(db, req)
 
-    # ── 1. 대상 슬롯 로드 및 존재 확인 ────────────────────────────────────
-    entry = db.get(TimetableEntry, req.timetable_entry_id)
+    # ── 1. 대상 슬롯 로드 및 존재 확인 (FOR UPDATE 행잠금) ────────────────
+    # 2026-06-20: SELECT ... FOR UPDATE 로 행을 잠가 결재 적용 중
+    # 다른 트랜잭션이 같은 슬롯을 수정하지 못하게 합니다.
+    # SQLite 에서는 FOR UPDATE 가 no-op 이지만 PostgreSQL 에서는 실제 행 잠금.
+    entry = db.execute(
+        select(TimetableEntry)
+        .where(TimetableEntry.id == req.timetable_entry_id)
+        .with_for_update()
+    ).scalars().first()
     if entry is None:
         # 승인 처리 중 시간표 항목이 삭제된 예외 상황.
         # 조용히 실패하지 않고 에러 로그를 남겨 나중에 원인을 추적할 수 있게 합니다.
@@ -1561,11 +1583,60 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
         )
         return
 
-    # ── 2. 교환(swap) 신청: 상대 슬롯 검증 + 스냅샷 충돌 감지 ───────────
+    # ── 2. 스냅샷 기반 충돌 감지 (단순 change + swap 모두) ───────────────
+    # 2026-06-20: 기존에는 swap 신청의 partner 만 검증했으나, 단순 change 도
+    # entry 스냅샷을 검증하도록 확장. version 필드로 낙관적 잠금 이중 보호.
+    # change_snapshot 이 없는 기존 레코드(스냅샷 추가 전 생성)는 검증 건너뜀(하위 호환).
+    if req.change_snapshot:
+        try:
+            snap = json.loads(req.change_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            snap = {}
+        entry_snap = snap.get("entry")
+        if entry_snap:
+            current_entry_state = {
+                "subject_id": entry.subject_id,
+                "teacher_id": entry.teacher_id,
+                "room_id":    entry.room_id,
+            }
+            snap_entry_state = {
+                "subject_id": entry_snap.get("subject_id"),
+                "teacher_id": entry_snap.get("teacher_id"),
+                "room_id":    entry_snap.get("room_id"),
+            }
+            snap_entry_version = entry_snap.get("version")
+            # 속성 불일치 또는 version 불일치(낙관적 잠금) 둘 중 하나라도 어긋나면 충돌.
+            version_mismatch = (
+                snap_entry_version is not None
+                and entry.version is not None
+                and snap_entry_version != entry.version
+            )
+            if current_entry_state != snap_entry_state or version_mismatch:
+                _logger.warning(
+                    "변경 신청 충돌 감지 — 요청 ID=%s, entry_id=%s. "
+                    "스냅샷=%s(v%s), 현재=%s(v%s)",
+                    req.id, req.timetable_entry_id,
+                    snap_entry_state, snap_entry_version,
+                    current_entry_state, entry.version,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"대상 슬롯(entry_id={req.timetable_entry_id})이 "
+                        "결재 기간 중 다른 변경으로 수정되었습니다. "
+                        "변경 신청을 취소하고 최신 상태로 다시 신청해 주세요."
+                    ),
+                )
+
+    # ── 3. 교환(swap) 신청: 상대 슬롯 검증 + 스냅샷 충돌 감지 ───────────
     # 교환이 아닌 경우(단순 과목·교사·교실 변경)는 이 블록을 건너뜁니다.
     partner = None
     if req.swap_partner_entry_id is not None:
-        partner = db.get(TimetableEntry, req.swap_partner_entry_id)
+        partner = db.execute(
+            select(TimetableEntry)
+            .where(TimetableEntry.id == req.swap_partner_entry_id)
+            .with_for_update()
+        ).scalars().first()
         if partner is None:
             # 상대 슬롯이 결재 기간 중 삭제된 경우
             _logger.error(
@@ -1581,26 +1652,38 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
                 ),
             )
 
-        # 스냅샷 기반 충돌 감지 ─────────────────────────────────────────────
-        # change_snapshot 이 없는 기존 레코드(스냅샷 추가 전에 생성됨)는
-        # 검증 없이 통과합니다 (하위 호환성 유지).
+        # partner 스냅샷 검증 ───────────────────────────────────────────────
+        # entry 스냅샷은 위에서 검증했으므로 여기서는 partner 만.
         if req.change_snapshot:
-            snap = json.loads(req.change_snapshot)
-            partner_snap = snap.get("partner")  # swap 이 아닌 경우 None
+            try:
+                snap = json.loads(req.change_snapshot)
+            except (json.JSONDecodeError, TypeError):
+                snap = {}
+            partner_snap = snap.get("partner")
             if partner_snap:
-                # 스냅샷과 현재 DB 상태를 비교합니다.
-                # 결재 기간 중 다른 신청이 상대 슬롯을 수정했다면 값이 달라집니다.
                 current_partner_state = {
                     "subject_id": partner.subject_id,
                     "teacher_id": partner.teacher_id,
                     "room_id":    partner.room_id,
                 }
-                if current_partner_state != partner_snap:
+                snap_partner_state = {
+                    "subject_id": partner_snap.get("subject_id"),
+                    "teacher_id": partner_snap.get("teacher_id"),
+                    "room_id":    partner_snap.get("room_id"),
+                }
+                snap_partner_version = partner_snap.get("version")
+                version_mismatch = (
+                    snap_partner_version is not None
+                    and partner.version is not None
+                    and snap_partner_version != partner.version
+                )
+                if current_partner_state != snap_partner_state or version_mismatch:
                     _logger.warning(
                         "교환 신청 충돌 감지 — 요청 ID=%s, partner entry_id=%s. "
-                        "신청 시점 스냅샷=%s, 현재 상태=%s",
+                        "신청 시점 스냅샷=%s(v%s), 현재 상태=%s(v%s)",
                         req.id, req.swap_partner_entry_id,
-                        partner_snap, current_partner_state,
+                        snap_partner_state, snap_partner_version,
+                        current_partner_state, partner.version,
                     )
                     raise HTTPException(
                         status_code=409,
@@ -1611,7 +1694,7 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
                         ),
                     )
 
-    # ── 3. 단순 변경(과목/교사/교실) 적용 ─────────────────────────────────
+    # ── 4. 단순 변경(과목/교사/교실) 적용 ─────────────────────────────────
     # 변경 전 상태를 before 에 기록합니다. 이후 log_entry_update() 가
     # before → after 를 TimetableChangeLog 에 저장합니다.
     before = {
@@ -1626,9 +1709,11 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
         entry.teacher_id = req.new_teacher_id
     if req.new_room_id is not None:
         entry.room_id = req.new_room_id
+    # 낙관적 잠금 version 증가
+    entry.version = (entry.version or 0) + 1
     log_entry_update(db, entry, before)
 
-    # ── 4. 교환(swap) 적용 ─────────────────────────────────────────────────
+    # ── 5. 교환(swap) 적용 ─────────────────────────────────────────────────
     # 교환 신청인 경우, entry 와 partner 의 과목/교사/교실을 서로 맞바꿉니다.
     # before(entry 원래 값) 와 partner_before(partner 원래 값) 를 서로 대입합니다.
     if partner is not None:
@@ -1644,6 +1729,8 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
         partner.subject_id = before["subject_id"]
         partner.teacher_id = before["teacher_id"]
         partner.room_id    = before["room_id"]
+        # 양쪽 version 모두 증가
+        partner.version = (partner.version or 0) + 1
         log_entry_update(db, partner, partner_before)
 
 
@@ -1678,10 +1765,27 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
     # 이전 단계에서 이미 수정한 슬롯 ID 집합 — chain link 슬롯은
     # snapshot 검증을 건너뜀 (자신이 방금 수정한 결과이므로 당연히 다름).
     modified_in_this_tx: set[int] = set()
+    # FOR UPDATE 로 잠근 슬롯 ID 집합 — 같은 슬롯이 여러 단계에 참여할 때
+    # 중복 잠금 방지 (이미 잠근 슬롯은 다시 SELECT FOR UPDATE 하지 않음).
+    locked_in_this_tx: set[int] = set()
+
+    from sqlalchemy import select
+
+    def _lock_entry(entry_id: int) -> TimetableEntry:
+        """FOR UPDATE 로 슬롯을 잠근 뒤 반환. 이미 잠근 슬롯은 일반 get 사용."""
+        if entry_id in locked_in_this_tx:
+            return db.get(TimetableEntry, entry_id)
+        row = db.execute(
+            select(TimetableEntry)
+            .where(TimetableEntry.id == entry_id)
+            .with_for_update()
+        ).scalars().first()
+        locked_in_this_tx.add(entry_id)
+        return row
 
     for step in steps:
-        # source 슬롯 로드
-        source = db.get(TimetableEntry, step.source_entry_id)
+        # source 슬롯 로드 (FOR UPDATE)
+        source = _lock_entry(step.source_entry_id)
         if source is None:
             _logger.error(
                 "연쇄 교체 적용 실패 — source 슬롯(id=%s) 없음. 요청 ID=%s, 단계=%s",
@@ -1706,6 +1810,7 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
 
         # 스냅샷 충돌 감지 (source)
         # 단, 이전 단계에서 본 트랜잭션이 수정한 슬롯은 검증 건너뜀 (chain link).
+        # 2026-06-20: version 필드로 낙관적 잠금 이중 검증.
         if step.source_entry_id not in modified_in_this_tx:
             source_snap = snap.get("source")
             if source_snap:
@@ -1714,7 +1819,18 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
                     "teacher_id": source.teacher_id,
                     "room_id":    source.room_id,
                 }
-                if current_source_state != source_snap:
+                snap_source_state = {
+                    "subject_id": source_snap.get("subject_id"),
+                    "teacher_id": source_snap.get("teacher_id"),
+                    "room_id":    source_snap.get("room_id"),
+                }
+                snap_source_version = source_snap.get("version")
+                version_mismatch = (
+                    snap_source_version is not None
+                    and source.version is not None
+                    and snap_source_version != source.version
+                )
+                if current_source_state != snap_source_state or version_mismatch:
                     raise HTTPException(
                         status_code=409,
                         detail=(
@@ -1725,8 +1841,8 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
                     )
 
         if step.step_type == "swap":
-            # target 슬롯 로드
-            target = db.get(TimetableEntry, step.target_entry_id) if step.target_entry_id else None
+            # target 슬롯 로드 (FOR UPDATE)
+            target = _lock_entry(step.target_entry_id) if step.target_entry_id else None
             if target is None:
                 _logger.error(
                     "연쇄 교체 적용 실패 — target 슬롯(id=%s) 없음. 요청 ID=%s, 단계=%s",
@@ -1749,7 +1865,18 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
                         "teacher_id": target.teacher_id,
                         "room_id":    target.room_id,
                     }
-                    if current_target_state != target_snap:
+                    snap_target_state = {
+                        "subject_id": target_snap.get("subject_id"),
+                        "teacher_id": target_snap.get("teacher_id"),
+                        "room_id":    target_snap.get("room_id"),
+                    }
+                    snap_target_version = target_snap.get("version")
+                    version_mismatch = (
+                        snap_target_version is not None
+                        and target.version is not None
+                        and snap_target_version != target.version
+                    )
+                    if current_target_state != snap_target_state or version_mismatch:
                         raise HTTPException(
                             status_code=409,
                             detail=(

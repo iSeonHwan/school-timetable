@@ -156,3 +156,85 @@ def test_generate_fails_when_over_capacity(db):
     ok, msg = generate_timetable(db, term_id=data["term"].id, max_periods=3, max_retries=5)
     assert not ok
     assert "실패" in msg or "시도" in msg
+
+
+def test_generate_prefers_preferred_slot(db):
+    """preferred 제약이 설정된 슬롯이 비어있으면 해당 슬롯에 우선 배치됩니다."""
+    data = _build_minimal_dataset(db)
+    # 수업 1시간만 배정 (preferred 슬롯 1개 지정)
+    data["assignment"].weekly_hours = 1
+    db.commit()
+
+    # 화요일 2교시를 선호 슬롯으로 설정
+    db.add(TeacherConstraint(
+        teacher_id=data["teacher"].id,
+        day_of_week=2, period=2,
+        constraint_type="preferred",
+    ))
+    db.commit()
+
+    ok, msg = generate_timetable(db, term_id=data["term"].id, max_periods=7)
+    assert ok, msg
+
+    entries = db.query(TimetableEntry).filter_by(term_id=data["term"].id).all()
+    assert len(entries) == 1
+    # 선호 슬롯이 비어있으므로 해당 슬롯에 배치되어야 함
+    e = entries[0]
+    assert e.day_of_week == 2 and e.period == 2
+
+
+def test_generate_avoids_avoid_slot_when_alternative_available(db):
+    """avoid 슬롯 외에 다른 슬롯이 사용 가능하면 avoid 슬롯을 회피합니다."""
+    data = _build_minimal_dataset(db)
+    # 수업 1시간만 배정 (회피 슬롯 1개 + 다른 슬롯 모두 사용 가능)
+    data["assignment"].weekly_hours = 1
+    db.commit()
+
+    # 월요일 1교시를 회피 슬롯으로 설정
+    db.add(TeacherConstraint(
+        teacher_id=data["teacher"].id,
+        day_of_week=1, period=1,
+        constraint_type="avoid",
+    ))
+    db.commit()
+
+    ok, msg = generate_timetable(db, term_id=data["term"].id, max_periods=7, max_retries=10)
+    assert ok, msg
+
+    entries = db.query(TimetableEntry).filter_by(term_id=data["term"].id).all()
+    assert len(entries) == 1
+    # 다른 슬롯이 충분히 있으므로 avoid 슬롯(월 1교시)은 회피되어야 함
+    e = entries[0]
+    assert not (e.day_of_week == 1 and e.period == 1)
+
+
+def test_generate_uses_avoid_slot_when_only_option(db):
+    """avoid 슬롯밖에 남지 않으면 soft 이므로 배치를 허용합니다."""
+    data = _build_minimal_dataset(db)
+    # 수업 1시간 + max_periods=1 (사용 가능 슬롯 = 월~금 1교시 = 5슬롯)
+    data["assignment"].weekly_hours = 1
+    db.commit()
+
+    # 월~금 1교시 중 4개를 unavailable 로 막고, 금요일 1교시만 avoid 로 남김
+    for day in [1, 2, 3, 4]:
+        db.add(TeacherConstraint(
+            teacher_id=data["teacher"].id,
+            day_of_week=day, period=1,
+            constraint_type="unavailable",
+        ))
+    # 금요일 1교시는 avoid (회피하지만 배치 가능)
+    db.add(TeacherConstraint(
+        teacher_id=data["teacher"].id,
+        day_of_week=5, period=1,
+        constraint_type="avoid",
+    ))
+    db.commit()
+
+    ok, msg = generate_timetable(db, term_id=data["term"].id, max_periods=1, max_retries=5)
+    assert ok, msg
+
+    entries = db.query(TimetableEntry).filter_by(term_id=data["term"].id).all()
+    assert len(entries) == 1
+    # 유일하게 열린 슬롯(금 1교시, avoid)에 배치되어야 함 — soft 제약은 하드처럼 차단하지 않음
+    e = entries[0]
+    assert e.day_of_week == 5 and e.period == 1

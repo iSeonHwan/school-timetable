@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
     db_url = os.getenv("DB_URL")
     init_db(db_url)
     _migrate_columns()               # 기존 DB에 누락된 컬럼 일괄 추가 (가장 먼저 실행)
+    _ensure_alembic_state()          # Alembic 버전 테이블 동기화 (stamp 또는 upgrade)
     _ensure_admin()
     _ensure_assignment_terms()       # 기존 시수 배정 term_id 백필
     _ensure_default_workflow()
@@ -260,6 +261,13 @@ def _migrate_columns():
             "ALTER TABLE timetable_change_requests ADD COLUMN change_snapshot TEXT",
             "timetable_change_requests.change_snapshot",
         ),
+        # ── timetable_entries — 낙관적 잠금 version 컬럼 ─────────────────────
+        # 2026-06-20: 동시 편집 충돌 방지용 version 컬럼 추가.
+        # 기존 행은 자동으로 default=1 로 채워집니다.
+        (
+            "ALTER TABLE timetable_entries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+            "timetable_entries.version",
+        ),
     ]
 
     db = get_session()
@@ -278,6 +286,71 @@ def _migrate_columns():
 
     if added:
         print(f"[마이그레이션] {len(added)}개 컬럼 추가: {', '.join(added)}")
+
+
+def _ensure_alembic_state():
+    """
+    Alembic 마이그레이션 상태를 DB 에 동기화합니다 (2026-06-20 신규).
+
+    동작:
+      1. alembic_version 테이블이 없으면 — 아직 Alembic 관리를 시작하지 않은 DB.
+         create_all() + _migrate_columns() 가 이미 스키마를 최신 상태로 맞췄으므로
+         `alembic stamp head` 로 현재를 baseline 으로 마킹합니다.
+         (마이그레이션 파일을 재실행하지 않음 — 안전)
+      2. alembic_version 테이블이 있으면 — 이미 Alembic 관리 중인 DB.
+         `alembic upgrade head` 로 미적용 revision 이 있으면 적용.
+
+    이중 보호 설계:
+      - _migrate_columns() 는 레거시 DB 의 누락 컬럼을 보충 (하위 호환).
+      - Alembic 은 그 이후의 스키마 변경을 버전 관리.
+      - 신규 DB: create_all() 이 테이블 생성 → stamp head 로 초기화.
+      - 레거시 DB: _migrate_columns() 가 컬럼 보충 → stamp head 로 전환.
+      - 이미 Alembic 관리 중인 DB: upgrade head 로 최신 revision 적용.
+
+    실패 시 영향 최소화:
+      - Alembic 설정/마이그레이션 오류가 서버 부팅을 막지 않도록 예외를 잡아
+        경고 로그만 남기고 계속 진행합니다.
+        (운영 DB 는 여전히 create_all + _migrate_columns 로 정상 동작)
+    """
+    from sqlalchemy import inspect, text
+    from alembic.config import Config
+    from alembic import command
+
+    try:
+        # alembic_version 테이블 존재 여부로 상태 판단
+        engine = _get_engine()
+        insp = inspect(engine)
+        alembic_initialized = "alembic_version" in insp.get_table_names()
+
+        # alembic Config 구성 — alembic.ini 경로는 프로젝트 루트 기준
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        alembic_cfg_path = os.path.join(project_root, "alembic.ini")
+        if not os.path.exists(alembic_cfg_path):
+            # alembic.ini 가 없는 환경 (예: 일부 테스트) — 조용히 스킵
+            return
+
+        cfg = Config(alembic_cfg_path)
+        # DB URL 을 env.py 가 환경 변수에서 읽도록 그대로 둠
+
+        if not alembic_initialized:
+            # 신규/레거시 DB — 현재를 baseline 으로 마킹
+            command.stamp(cfg, "head")
+            print("[마이그레이션] Alembic baseline 으로 마킹했습니다 (stamp head).")
+        else:
+            # 이미 Alembic 관리 중 — 미적용 revision 이 있으면 적용
+            command.upgrade(cfg, "head")
+    except Exception as exc:
+        # Alembic 실패가 서버 부팅을 막지 않도록 경고만 남기고 진행.
+        # 운영 DB 는 create_all + _migrate_columns 로 정상 동작하므로 안전.
+        print(f"[마이그레이션] Alembic 상태 동기화 중 오류 (계속 진행): {exc}")
+
+
+def _get_engine():
+    """database.connection 모듈의 싱글턴 엔진을 반환 (init_db 이후 유효)."""
+    from database.connection import _engine
+    if _engine is None:
+        raise RuntimeError("DB 엔진이 초기화되지 않았습니다. init_db() 먼저 호출.")
+    return _engine
 
 
 def _ensure_default_workflow():

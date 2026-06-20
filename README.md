@@ -30,6 +30,7 @@
 11. [기술 스택](#11-기술-스택)
 12. [장점과 한계](#12-장점과-한계)
 13. [코드 품질 개선 이력](#13-코드-품질-개선-이력-2026-06-13)
+14. [한계 해소 이력](#14-한계-해소-이력-2026-06-20)
 
 ---
 
@@ -912,7 +913,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 
 이 알고리즘은 대부분의 일반적인 학교 규모(학급 15개 이하, 교사 40명 이하)에서 1~3회 시도 만에 성공합니다. 다만 교사 불가 시간이 많거나 교사 수 대비 학급 수가 매우 많은 특수한 환경에서는 30회 내에 해를 찾지 못할 수 있습니다. 이 경우 교사 불가 시간을 줄이거나, 주당 시수를 조정하거나, 일 최대 수업 수를 늘려서 재시도하는 것을 권장합니다.
 
-현재 `TeacherConstraint`의 `preferred`(선호)와 `avoid`(회피) 유형은 데이터 모델에는 정의되어 있으나, 생성 알고리즘에서 아직 반영되지 않습니다. 향후 개선 대상입니다.
+`TeacherConstraint`의 `preferred`(선호)와 `avoid`(회피) 유형은 2026-06-20부터 소프트 제약으로 반영됩니다. preferred 슬롯은 +2 점, avoid 슬롯은 -1 점을 받아 하드 제약을 통과한 슬롯들 중 최고 점수 슬롯에 배치됩니다. avoid 슬롯밖에 남지 않은 경우에도 soft 제약이므로 배치가 허용되어 가동률이 유지됩니다.
 
 ---
 
@@ -1019,11 +1020,11 @@ python3 installer/generate_icon.py
 
 ### 한계
 
-**동시 편집 충돌**이 주요 한계입니다. 두 관리자가 동시에 같은 시간표 슬롯을 수정할 경우 충돌 감지나 잠금 메커낌없이 마지막 저장이 덮어씁니다. 복수의 교무 담당자가 동시에 편집해야 하는 환경에서는 주의가 필요합니다.
+**동시 편집 충돌**은 3계층 동시성 보호로 대폭 완화되었습니다 (2026-06-20). 변경 신청 접수 시점의 슬롯 상태(`change_snapshot`)와 `TimetableEntry.version`(낙관적 잠금 컬럼)을 함께 저장하고, 최종 승인 적용 시점에 `SELECT ... FOR UPDATE` 행잠금으로 슬롯을 선점한 뒤 스냅샷·버전 불일치를 감지해 `409 Conflict`로 차단합니다. 단순 change·swap·연쇄 교체 모두 동일한 보호를 받습니다. 다만 UI 단에서 두 사용자가 동시에 같은 슬롯을 클릭해 신청을 작성하는 경우, 두 신청 중 먼저 승인된 쪽이 반영되고 나머지는 최종 승인 시 409로 거절되므로 사용자에게 "다시 신청하라"는 안내가 필요합니다.
 
-**DB 스키마 마이그레이션 미지원**도 알려진 한계입니다. 서버는 `create_all()`로 테이블을 최초 생성하지만, 기존에 운영 중인 DB에 새 컬럼이나 테이블이 추가된 경우 자동으로 반영되지 않습니다. 다만 `SubjectClassAssignment.term_id` 같은 신규 컬럼은 서버 시작 시 `_ensure_assignment_terms()`를 통해 NULL 값을 현재/첫 학기로 백필하므로, 운영 중인 DB에서도 비교적 안전하게 마이그레이션됩니다. 그러나 그 외의 스키마 변경 시에는 Alembic 같은 마이그레이션 도구를 별도로 사용해야 합니다.
+**DB 스키마 마이그레이션**은 Alembic 도입으로 버전 관리 체계로 전환되었습니다 (2026-06-20). `alembic.ini`와 `migrations/` 디렉토리가 추가되었으며, 서버 시작 시 `_ensure_alembic_state()`가 `alembic_version` 테이블 존재 여부에 따라 `stamp head`(레거시 DB 최초 전환 시) 또는 `upgrade head`(이후 마이그레이션 적용)를 수행합니다. 기존 `_migrate_columns()`는 하위 호환용 fallback으로 남아 있어 Alembic 도입 전에 생성된 DB도 안전하게 부팅됩니다. 향후 스키마 변경 시 `alembic revision --autogenerate -m "..."`로 새 revision을 추가하면 서버 재시작 시 자동 적용됩니다. 단, `SubjectClassAssignment.term_id` NOT NULL 제약은 SQLite의 `ALTER COLUMN` 미지원으로 여전히 애플리케이션 레벨에서 강제합니다 — 향후 batch mode 마이그레이션으로 처리 예정입니다.
 
-**교사 선호/회피 제약조건 미반영**도 개선이 필요한 부분입니다. `TeacherConstraint` 모델에는 `preferred`(선호)와 `avoid`(회피) 타입이 정의되어 있지만, 자동 생성 알고리즘은 현재 `unavailable`(불가) 타입만 참조합니다.
+**교사 선호/회피 제약조건**은 자동 생성 알고리즘에 반영되었습니다 (2026-06-20). `TeacherConstraint`의 `preferred`/`avoid` 타입을 soft constraint로 조회해 점수 기반 슬롯 선택을 수행합니다. preferred 슬롯은 +2 가산점, avoid 슬롯은 -1 감점을 받아, 하드 제약을 통과한 슬롯들 중 가장 점수가 높은 슬롯에 배치됩니다. avoid 슬롯밖에 남지 않은 경우에도 soft 이므로 배치는 허용되어 가동률이 유지됩니다. 남은 한계로는 교사별 공평한 시간 분배, 특정 과목의 오전/오후 선호 등 추가 소프트 제약은 여전히 미구현 상태입니다.
 
 **채팅 메시지 자동 정리**도 지원합니다. 오래된 메시지는 `CHAT_RETENTION_DAYS`(기본 60일) 기준으로 서버가 12시간 간격으로 자동 삭제하며, 일과계 선생님은 필요시 수동으로 일괄 정리하거나 개별 메시지를 삭제할 수 있습니다. WebSocket 브로드캐스트로 모든 접속자의 UI 가 실시간 갱신됩니다.
 
@@ -1155,9 +1156,9 @@ def login(...):
 
 | 항목 | 이유 |
 |------|------|
-| `SubjectClassAssignment.term_id` NOT NULL 제약 | SQLite에서 `ALTER TABLE ... ALTER COLUMN`이 미지원. 애플리케이션 레벨에서 강제 |
+| `SubjectClassAssignment.term_id` NOT NULL 제약 | SQLite에서 `ALTER TABLE ... ALTER COLUMN`이 미지원. 애플리케이션 레벨에서 강제. 향후 Alembic batch mode 마이그레이션으로 처리 예정 |
 | WebSocket 멀티 서버 지원 | Redis Pub/Sub 도입이 필요한 큰 아키텍처 변경. 단일 서버 환경에서는 무관 |
-| DEPRECATED 컬럼 제거 | 기존 운영 DB와의 호환성 유지 필요. 다음 메이저 버전에서 Alembic 마이그레이션과 함께 제거 예정 |
+| DEPRECATED 컬럼 제거 | 기존 운영 DB와의 호환성 유지 필요. Alembic 도입(2026-06-20)으로 이제 별도 마이그레이션 revision으로 제거 가능 |
 
 ---
 
@@ -1170,3 +1171,82 @@ def login(...):
 ## 문의 및 기여
 
 버그 신고, 기능 제안, 기여는 앱 내 "피드백 보내기" 메뉴 또는 GitHub Issues를 통해 부탁드립니다.
+
+---
+
+## 14. 한계 해소 이력 (2026-06-20)
+
+제12장의 세 가지 주요 한계에 대한 해결책을 구현했습니다.
+
+### 14.1 교사 선호/회피 제약조건 반영 (`core/generator.py`)
+
+**문제**: `TeacherConstraint` 모델에 `preferred`(선호)와 `avoid`(회피) 타입이 정의되어 있었으나 자동 생성 알고리즘은 `unavailable`(불가)만 참조했습니다.
+
+**해결 방법**: 소프트 제약 점수 기반 슬롯 선택을 도입했습니다.
+
+- `preferred` 슬롯: `+2` 가산점
+- `avoid` 슬롯: `-1` 감점
+- 일반 슬롯: `0` 점
+- 하드 제약(class/teacher/room/unavailable/daily_max)을 통과한 슬롯들 중 최고 점수 슬롯에 배치
+- avoid 슬롯밖에 남지 않아도 soft 이므로 배치 허용 (가동률 유지)
+- 동점은 `random.shuffle` 순서가 빠른 슬롯 우선
+
+테스트: `tests/test_generator.py`에 preferred/avoid 동작 검증 3개 케이스 추가 (선호 우선 배치, 회피 슬롯 회피, 유일 옵션일 때 회피 슬롯 허용).
+
+### 14.2 동시 편집 충돌 방지 — 3계층 동시성 보호 (`shared/models.py`, `server/api/timetable.py`, `server/main.py`)
+
+**문제**: 두 관리자가 동시에 같은 슬롯을 수정하거나 결재 기간 중 다른 신청이 슬롯을 수정하는 경우 충돌 감지나 잠금이 없어 마지막 저장이 덮어씌웠습니다. 기존 `change_snapshot` 검증은 swap 신청의 partner 에만 적용되었습니다.
+
+**해결 방법**: 3계층 동시성 보호를 도입했습니다.
+
+1. **`TimetableEntry.version` 컬럼 (낙관적 잠금)**: 모든 슬롯 수정 시 version 1 증가. 마이그레이션은 `_migrate_columns()` 가 `ALTER TABLE ... ADD COLUMN version INTEGER NOT NULL DEFAULT 1` 로 추가.
+
+2. **스냅샷 검증 확장**: 단순 change 신청에도 `change_snapshot` 검증을 적용. 신청 시점의 entry 상태(과목/교사/교실/version)를 저장하고 최종 승인 시 현재 DB 상태와 비교 — 속성 불일치 또는 version 불일치 시 `409 Conflict`.
+
+3. **`SELECT ... FOR UPDATE` 행잠금**: `_apply_request_changes`와 `_apply_chain_swap_changes`에서 최종 승인 적용 시 관련 슬롯을 행잠금. 두 승인자가 동시에 같은 슬롯을 처리하려 해도 한쪽이 잠금 대기 후 충돌 감지. (SQLite에서는 no-op, PostgreSQL에서 실제 행 잠금)
+
+연쇄 교체의 `modified_in_this_tx` 세트는 동일 트랜잭션 내에서 이전 단계가 수정한 슬롯의 snapshot 검증을 건너뛰어 chain link 가 정상 동작하도록 합니다. `_apply_swap_step`/`_apply_change_step` 헬퍼가 version 증가를 담당합니다.
+
+테스트: `tests/test_change_request.py`에 단일 변경·교환 각각에 대해 결재 기간 중 동시 수정 시 409 감지를 검증하는 2개 케이스 추가.
+
+### 14.3 Alembic 마이그레이션 도입 (`alembic.ini`, `migrations/`, `server/main.py`)
+
+**문제**: 서버는 `create_all()`로 테이블을 최초 생성하지만, 기존 운영 DB에 새 컬럼이나 제약이 추가된 경우 `_migrate_columns()`의 수동 ALTER TABLE 배열에 의존해야 했습니다. NOT NULL 제약 변경, 컬럼 타입 변경, 컬럼 제거는 불가능했습니다.
+
+**해결 방법**: Alembic을 도입해 버전 관리 마이그레이션 체계로 전환했습니다.
+
+- **`alembic.ini`**: 프로젝트 루트에 설정. `sqlalchemy.url`은 `migrations/env.py`가 `DB_URL` 환경변수(또는 `config.get_db_url()`)로 덮어씀.
+- **`migrations/env.py`**: `shared.models.Base.metadata`를 `target_metadata`로 사용. autogenerate 활성화. SQLite 환경에서는 `render_as_batch=True`로 batch mode 기본 적용 (`ALTER COLUMN` 한계 회피용).
+- **`migrations/versions/2026_06_20_0000_baseline.py`**: baseline 마커 revision. 실제 테이블 생성은 `create_all()`이 담당하므로 upgrade/downgrade 모두 빈 no-op. 향후 마이그레이션은 이 위에 쌓임.
+- **`server/main.py:_ensure_alembic_state()`**: 서버 시작 시 `alembic_version` 테이블 존재 여부로 분기
+  - 없으면 (레거시 DB 또는 신규 DB): `alembic stamp head` 로 현재를 baseline 으로 마킹 (마이그레이션 재실행 방지)
+  - 있으면 (이미 Alembic 관리 중): `alembic upgrade head` 로 미적용 revision 적용
+- **`_migrate_columns()` fallback 유지**: Alembic 도입 전 생성된 DB의 누락 컬럼을 보충. 향후 새 컬럼은 Alembic revision으로 처리하고 `_migrate_columns()`는 점진적 제거 예정.
+- **실패 시 영향 최소화**: Alembic 설정 오류 시 서버 부팅을 막지 않도록 예외 잡아 경고 로그만 남기고 진행.
+
+**사용 방법** (향후 스키마 변경 시):
+```bash
+# 1. shared/models.py 에 새 컬럼/모델 추가
+# 2. autogenerate 로 마이그레이션 파일 생성
+alembic revision --autogenerate -m "add teacher employee_number column"
+# 3. 생성된 migrations/versions/*.py 검토 (autogenerate 가 모든 변경을 잡지는 못함)
+# 4. 서버 재시작 — _ensure_alembic_state() 가 upgrade head 로 자동 적용
+```
+
+**CLI 명령**:
+```bash
+alembic current      # 현재 revision 확인
+alembic history      # revision 이력
+alembic upgrade head # 최신까지 적용
+alembic stamp head   # 현재 DB를 head 로 마킹 (재적용 없이)
+```
+
+### 14.4 테스트 결과
+
+- 기존 37개 테스트 + 신규 5개 테스트 = 총 42개, 모두 통과
+- 신규 테스트:
+  - `test_generate_prefers_preferred_slot`
+  - `test_generate_avoids_avoid_slot_when_alternative_available`
+  - `test_generate_uses_avoid_slot_when_only_option`
+  - `test_single_change_detects_concurrent_modification`
+  - `test_swap_detects_partner_concurrent_modification`

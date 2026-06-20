@@ -221,6 +221,13 @@ class TimetableEntry(Base):
     # 함수 객체를 전달하면 SQLAlchemy 가 삽입(default) 및 수정(onupdate) 시점에 각각 호출합니다.
     created_at      = Column(DateTime, default=datetime.now)
     updated_at      = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    # ── 낙관적 동시성 제어(optimistic locking) 버전 컬럼 (2026-06-20 신규) ──
+    # 모든 TimetableEntry 수정 시 1씩 증가합니다.
+    # 변경 신청 최종 승인 시점에 신청 저장 당시의 version 과 비교해
+    # 결재 기간 중 다른 수정이 끼어들었는지 감지합니다.
+    # 스냅샷(change_snapshot) 검증과 이중으로 보호하여 race condition 차단.
+    # 기존 DB 마이그레이션은 server/main.py:_migrate_columns() 가 담당.
+    version         = Column(Integer, nullable=False, default=1)
 
     term         = relationship("AcademicTerm", back_populates="timetable_entries")
     school_class = relationship("SchoolClass", back_populates="timetable_entries")

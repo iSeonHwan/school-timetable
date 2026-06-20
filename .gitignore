@@ -8,6 +8,8 @@ __pycache__/
 
 # Database & runtime data
 timetable.db
+timetable.db-shm
+timetable.db-wal
 db_config.json
 feedback.json
 
