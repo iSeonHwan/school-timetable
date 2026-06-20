@@ -24,4 +24,5 @@ from shared.models import (  # noqa: F401
     Notification,
     ApprovalWorkflow,
     ApprovalStep,
+    ChangeRequestStep,  # 2026-06-20 추가: 연쇄 교체 단계 모델
 )

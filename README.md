@@ -18,6 +18,7 @@
    - 2.8 [프로젝트 저장 및 불러오기](#28-프로젝트-저장-및-불러오기)
    - 2.9 [채팅 및 공지](#29-채팅-및-공지)
    - 2.10 [피교사 동의 및 알림 시스템](#210-피교사-동의-및-알림-시스템)
+   - 2.11 [연쇄 교체(chain swap)](#211-연쇄-교체chain-swap)
 3. [데이터 연결성 설계](#3-데이터-연결성-설계)
 4. [설치 및 실행 방법](#4-설치-및-실행-방법)
 5. [상세 사용 설명](#5-상세-사용-설명)
@@ -346,6 +347,109 @@ consent_status = "approved" 이후:
 
 ---
 
+### 2.11 연쇄 교체(chain swap)
+
+#### 2.11.1 배경
+
+A교사의 **월3 수학**과 B교사의 **화2 영어**를 맞바꾸고 싶지만, A교사는 화2 시간에 다른 수업이 있어 1:1 직접 교환이 불가능한 상황이 학교에서 자주 발생합니다. 이런 경우 중간에 C교사의 슬롯을 거쳐 **A ↔ C ↔ B** 식으로 연쇄 교체(chain swap)하면 가능해집니다. 또한 한 번의 교체에 대해 여러 경로가 존재할 수 있으며(예: A↔B를 위한 3가지 서로 다른 연쇄 경로), 연쇄 교체 시 관련 교사가 여러 명이므로 신청 한 번에 모두에게 동의 요청을 보내야 합니다.
+
+이번 업데이트에서는 다음 기능을 추가했습니다.
+
+1. **연쇄 교체 경로 자동 탐색**: 시스템이 source 슬롯에서 target 슬롯까지 도달하는 후보 경로들을 BFS 로 자동 탐색해 제시합니다. 사용자는 자동 탐색 결과 중 하나를 선택하거나 직접 단계를 편집할 수 있습니다.
+2. **다교사 동시 알림**: 연쇄 교체 신청 시 각 단계의 영향받는 교사(affected_teacher_id)들에게 한 번에 맞춤형 동의 요청 알림이 전송됩니다. 각 교사의 알림에는 본인이 관여하는 단계가 중심으로 표시됩니다.
+3. **단계별 동의 + 최종 1회 결재**: 모든 단계의 교사 동의가 완료되어야 기존 결재 라인(일과계 → 교감)으로 넘어가 1회 승인으로 시간표에 일괄 반영됩니다.
+4. **신청 화면 단계별 시각화**: 관리자 결재 화면에서 연쇄 교체 신청을 선택하면 각 단계의 교체 내용("1단계: 월3 수학(김) ↔ 화2 영어(이)")과 동의 상태("동의 완료 — 김선생님 03/15 14:30")가 단계별로 표시됩니다.
+
+#### 2.11.2 데이터 모델
+
+연쇄 교체는 기존 `TimetableChangeRequest` 부모 테이블에 자식 `ChangeRequestStep` 테이블을 추가해 표현합니다. 부모 1건에 여러 단계(step)가 연결되며, 각 단계는 1회의 swap 또는 change 연산을 나타냅니다.
+
+| `change_request_steps` 컬럼 | 설명 |
+|----------------------------|------|
+| `request_id` | 부모 TimetableChangeRequest.id (FK) |
+| `step_order` | 1부터 시작하는 단계 순서 |
+| `step_type` | `"swap"` (두 슬롯 맞교환) 또는 `"change"` (단일 슬롯의 과목/교사/교실 변경) |
+| `source_entry_id` | 이 단계의 주체 슬롯 (항상 존재) |
+| `target_entry_id` | swap 의 상대 슬롯 (change 인 경우 None) |
+| `new_subject_id` / `new_teacher_id` / `new_room_id` | change 인 경우 새 값 (swap 에서는 미사용) |
+| `affected_teacher_id` | 이 단계의 영향받는 교사 — 동의 필요 시 해당 교사의 User 로 알림 전송 |
+| `consent_status` | `not_required` / `pending` / `approved` / `rejected` |
+| `consent_by_user_id` / `consent_at` | 동의 처리 사용자 및 시각 |
+| `change_snapshot` | 단계 적용 시점의 슬롯 상태 JSON (race condition 감지용) |
+
+부모 신청의 `consent_status` 는 자식 단계들로부터 파생됩니다 — 모든 단계 `approved` 시 부모 `approved`, 하나라도 `rejected` 시 부모 `rejected`, 그 외 `pending`. 기존 단일 swap/변경 신청은 `steps` 가 빈 리스트로 응답되며, 클라이언트는 기존 필드(`swap_partner_entry_id`, `new_*_id`)를 그대로 사용합니다(하위 호환).
+
+#### 2.11.3 경로 탐색 API
+
+`GET /timetable/swap-paths?source_entry_id=X&target_entry_id=Y` 엔드포인트가 source 슬롯에서 target 슬롯까지 도달하는 연쇄 교체 경로들을 반환합니다.
+
+- **BFS 탐색**: 너비 우선 탐색으로 source 에서 target 까지의 경로를 찾습니다.
+- **깊이 제한**: 최대 3단계까지 (A → B → C → D 형태의 3-hop 경로).
+- **경로 수 상한**: 최대 5개 경로를 반환합니다.
+- **슬롯 중복 방문 차단**: 같은 경로 내에서 동일 슬롯을 두 번 방문하지 않습니다.
+- **`is_fixed=True` 슬롯 필터링**: 고정 슬롯은 경로에 포함되지 않습니다.
+- **충돌 검증**: 각 후보 경로는 `_validate_swap` 헬퍼로 반·교사·교실·불가시간·일일최대수업 제약을 모두 통과해야 합니다.
+
+응답의 각 경로는 단계별 라벨과 관련 교사 ID 목록을 포함합니다.
+
+```json
+{
+  "source_entry_id": 1,
+  "target_entry_id": 2,
+  "paths": [
+    {
+      "step_count": 2,
+      "related_teacher_ids": [3, 4, 5],
+      "summary": "2단계 연쇄 교체, 3명 동의 필요",
+      "steps": [
+        {"step_order": 1, "source_entry_id": 1, "target_entry_id": 10,
+         "label": "월3 수학(김선생) ↔ 화2 영어(이선생)",
+         "affected_teacher_ids": [3, 4]},
+        {"step_order": 2, "source_entry_id": 10, "target_entry_id": 2,
+         "label": "화2 영어(이선생) ↔ 수1 과학(박선생)",
+         "affected_teacher_ids": [4, 5]}
+      ]
+    }
+  ]
+}
+```
+
+#### 2.11.4 교사 프로그램 — 교환 탭 3서브모드
+
+교사 프로그램의 "시간표 교체 제안" 다이얼로그 교환 탭이 3개 서브모드로 확장되었습니다.
+
+1. **직접 교환**: 기존 1:1 swap 제안 목록. 서버가 제시하는 충돌 없는 교환 후보 중 하나를 선택.
+2. **경로 탐색**: source 슬롯(현재 슬롯 자동) + target 슬롯(콤보박스로 선택) → "경로 찾기" 버튼으로 `GET /timetable/swap-paths` 호출 → 각 경로가 단계별 시각화 카드로 표시됨.
+   ```
+   경로 1 (2단계, 관련 교사 3명)
+     ├ 1단계: 월3 수학(김○○) ↔ 화2 영어(이○○)
+     └ 2단계: 화2 영어(이○○) ↔ 수1 과학(박○○)
+   ```
+3. **수동 구성**: "단계 추가" 버튼으로 단계를 직접 추가. 각 단계마다 source/target 슬롯 콤보박스로 지정.
+
+신청 버튼 클릭 시 요약 다이얼로그로 "이 신청은 N단계, M명의 교사 동의가 필요합니다"를 확인한 뒤 `steps` 배열을 서버에 전송합니다.
+
+#### 2.11.5 관리자 결재 화면 — 부모-자식 행
+
+관리자 프로그램의 "변경 신청 관리" 화면이 연쇄 교체를 부모-자식 구조로 표시합니다.
+
+- **메인 테이블**: 각 신청 행에 "유형" 컬럼이 추가되어 `단일` 또는 `연쇄 N단계` 로 구분. "변경 내용" 컬럼은 연쇄 교체인 경우 "3단계, 2/3 동의" 같은 요약 표시.
+- **상세 패널**: 연쇄 교체 신청 선택 시 하단 패널에 단계별 시각화 표시. 각 단계의 교체 라벨과 동의 상태("동의 완료 — 김선생님 03/15 14:30" 등)를 한 줄씩 나열.
+- **승인 버튼 활성화 조건**: 모든 단계의 동의가 완료된 경우에만 승인 버튼 활성화. 미완료 시 툴팁으로 현재 동의 진행 상태 표시.
+- **최종 승인 시 일괄 반영**: 최종 결재자가 승인하면 각 단계를 step_order 순서대로 TimetableEntry 에 적용. 전체 단계를 한 트랜잭션으로 묶어 원자성 보장 — 중간 단계 충돌 시 전체 롤백.
+- **스냅샷 충돌 감지**: 각 단계의 `change_snapshot` 과 현재 DB 상태를 비교하여 결재 기간 중 다른 변경이 관련 슬롯에 적용된 경우 409 Conflict 로 신청 취소 안내.
+
+#### 2.11.6 교사 동의 처리 — 단계(step_id) 지원
+
+피교사가 알림 패널에서 "동의"/"거절" 버튼을 누르면 다음 절차로 처리됩니다.
+
+1. **단계 자동 식별**: 알림이 가리키는 `change_request_id` 로 `GET /timetable/requests` 에서 해당 신청을 찾고, 그 중 `affected_teacher_id == 본인 teacher_id` 이고 `consent_status == "pending"` 인 단계의 `step_id` 를 추출. (`Notification` 스키마에 `step_id` 컬럼이 없으므로 클라이언트에서 조회하는 방식을 채택해 DB 스키마 변경을 최소화했습니다.)
+2. **동의 제출**: `PATCH /timetable/requests/{id}/consent` 에 `{"action": "approve"|"reject", "step_id": <id>}` 전송. 단일 신청인 경우 `step_id` 없이 전송하여 기존 로직 유지.
+3. **서버 잠금**: 서버는 `SELECT ... FOR UPDATE` 로 부모 신청과 자식 단계를 잠근 후 동의 처리하여 동시 다교사 동의 레이스 조건을 방지합니다.
+4. **부모 상태 자동 갱신**: 모든 단계가 `approved` 가 되면 부모 `consent_status = "approved"`, `current_step = 1` 로 전환되어 결재 라인으로 진입. 하나라도 `rejected` 면 부모 `status = "rejected"` 로 종료.
+
+---
+
 ## 3. 데이터 연결성 설계
 
 이 프로그램의 가장 중요한 아키텍처 설계 중 하나는 **페이지 간 데이터 연결성**입니다. 기초 데이터 입력 페이지(0~3번)에서 입력한 내용이 후속 페이지의 콤보박스와 테이블에 실시간으로 반영되도록 설계되어 있습니다.
@@ -556,11 +660,15 @@ python -m teacher_app.main
 
 피교사 동의가 필요한 경우, 상대 교사에게 실시간 알림과 DB 알림이 전송됩니다. 상대 교사는 교사 프로그램 상단의 알림 벨 아이콘을 클릭하여 알림 목록을 확인하고, "승인" 또는 "거절"을 선택할 수 있습니다.
 
+**연쇄 교체** 신청 시(2.11절 참고) 교환 탭의 "경로 탐색" 모드에서 target 슬롯을 선택해 시스템이 자동 탐색한 연쇄 경로들 중 하나를 선택하거나, "수동 구성" 모드에서 단계를 직접 편집할 수 있습니다. 신청 한 번으로 각 단계의 관련 교사 전원에게 맞춤형 동의 요청 알림이 동시에 전송됩니다.
+
 ### 5.8 변경 신청 결재
 
-사이드바에서 **"변경 신청/결재"**를 선택하면 대기 중인 변경 신청 목록이 표시됩니다. 상태 컬럼에는 "대기 중 (1/3단계)"와 같이 현재 결재 진행 상황이 표시되며, **동의 상태** 컬럼에서는 피교사 동의 진행 상황을 확인할 수 있습니다. 동의 대기 중인 신청은 승인 버튼이 비활성화됩니다.
+사이드바에서 **"변경 신청/결재"**를 선택하면 대기 중인 변경 신청 목록이 표시됩니다. **유형** 컬럼에 `단일` 또는 `연쇄 N단계` 로 구분 표시되며, 상태 컬럼에는 "대기 중 (1/3단계)"와 같이 현재 결재 진행 상황이, **변경 내용** 컬럼에는 연쇄 교체인 경우 "3단계, 2/3 동의" 와 같이 동의 진행 요약이 표시됩니다. 동의 대기 중인 신청은 승인 버튼이 비활성화됩니다.
 
-승인자는 자신의 역할(role)에 해당하는 단계의 신청만 처리할 수 있습니다. 예를 들어, 2단계 결재(일과계 → 교감)인 경우 일과계는 1단계 신청만 승인할 수 있고, 교감은 1단계를 통과한 2단계 신청만 최종 승인할 수 있습니다. 목록에서 신청 항목을 선택한 후 "승인" 또는 "거절" 버튼을 클릭하여 처리합니다. 마지막 단계에서 승인되면 변경 내용이 즉시 시간표에 반영되고 변경 이력에 자동 기록됩니다.
+연쇄 교체 신청을 선택하면 하단 **연쇄 교체 단계 상세** 패널에 각 단계의 교체 내용과 동의 상태가 단계별로 시각화되어 표시됩니다.
+
+승인자는 자신의 역할(role)에 해당하는 단계의 신청만 처리할 수 있습니다. 예를 들어, 2단계 결재(일과계 → 교감)인 경우 일과계는 1단계 신청만 승인할 수 있고, 교감은 1단계를 통과한 2단계 신청만 최종 승인할 수 있습니다. 목록에서 신청 항목을 선택한 후 "승인" 또는 "거절" 버튼을 클릭하여 처리합니다. 마지막 단계에서 승인되면 변경 내용이 즉시 시간표에 반영되고 변경 이력에 자동 기록됩니다. 연쇄 교체는 모든 단계가 한 트랜잭션으로 일괄 반영되며 중간 충돌 시 전체 롤백됩니다.
 
 **결재 라인 설정** 페이지에서는 학교의 결재 구조에 맞게 워크플로우를 설정할 수 있습니다. 새 워크플로우 생성 다이얼로그에서 단계 수와 각 단계의 승인 역할·이름을 지정하고, 목록에서 원하는 워크플로우를 선택하여 "활성화" 버튼을 누르면 해당 워크플로우가 변경 신청 결재에 적용됩니다. 활성화된 워크플로우는 삭제할 수 없으므로, 먼저 다른 워크플로우를 활성화한 후 삭제해야 합니다.
 
@@ -664,7 +772,7 @@ school_timetable/
 
 ## 7. 데이터베이스 구조 (ERD)
 
-이 프로그램은 17개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
+이 프로그램은 18개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
 
 ```
 AcademicTerm (학기)
@@ -702,6 +810,7 @@ TimetableEntry (시간표 배정 1행 = 1수업 슬롯)
   ├── teacher_id       → Teacher
   └── room_id          → Room (nullable)
        └──< TimetableChangeRequest (변경 신청/결재)
+       │        └──< ChangeRequestStep (연쇄 교체 단계, cascade delete-orphan)
        └──< TimetableChangeLog    (변경 이력, 감사 로그)
 
 ApprovalWorkflow (결재 워크플로우 정의)
@@ -724,6 +833,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 | `SchoolEvent` | term_id, title, start_date, end_date, event_type, description |
 | `TimetableChangeLog` | timetable_entry_id, school_class_id, change_type, details(JSON), changed_at |
 | `TimetableChangeRequest` | timetable_entry_id, requester_id, reason, status, approved_by, new_subject_id, new_teacher_id, new_room_id, swap_partner_entry_id, affected_teacher_id, consent_status, consent_by_user_id, consent_at |
+| `ChangeRequestStep` | request_id, step_order, step_type(swap/change), source_entry_id, target_entry_id, new_subject_id, new_teacher_id, new_room_id, affected_teacher_id, consent_status, consent_by_user_id, consent_at, change_snapshot |
 | `Room` | name, room_type |
 | `User` | username, password_hash, role (admin/teacher), teacher_id, is_active |
 | `ChatMessage` | user_id, content, is_announcement, created_at |
@@ -752,6 +862,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 | 3 | ↓ | `notifications` | users, timetable_change_requests |
 | 4 | 최하위 | `timetable_change_logs` | timetable_entries, school_classes |
 | 4 | 최하위 | `timetable_change_requests` | timetable_entries, subjects, teachers, rooms |
+| 5 | 하위 | `change_request_steps` | timetable_change_requests, timetable_entries, subjects, teachers, users |
 | 5 | 독립 | `approval_workflows` | 없음 |
 | 5 | 하위 | `approval_steps` | approval_workflows |
 

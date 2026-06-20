@@ -344,6 +344,60 @@ class ChangeRequestOut(BaseModel):
     approved_by: str = ""
     approved_at: Optional[datetime] = None
 
+    # ── 연쇄 교체(chain swap) 단계 목록 (2026-06-20 신규) ───────────────────
+    # 신규 연쇄 교체 신청의 경우 steps 가 채워집니다.
+    # 기존 단일 swap/변경 신청은 steps 가 빈 리스트([]) 로 응답되며,
+    # 클라이언트는 기존 필드(swap_partner_entry_id, new_*_id)를 그대로 사용합니다.
+    # 서버가 응답 생성 시 자동으로 주입합니다(모델 컬럼 아님).
+    steps: list["ChangeRequestStepOut"] = []
+
+    model_config = {"from_attributes": True}
+
+
+# ── 변경 신청 단계 (연쇄 교체 지원, 2026-06-20 신규) ───────────────────────
+
+class ChangeRequestStepCreate(BaseModel):
+    """
+    변경 신청 단계 생성 요청.
+
+    연쇄 교체 신청 시 클라이언트가 ChangeRequestCreate.steps 로 전달합니다.
+
+    step_type 별 필수 필드:
+      - "swap": target_entry_id 필수. new_*_id 는 모두 None.
+      - "change": new_subject_id / new_teacher_id / new_room_id 중 최소 하나.
+                  target_entry_id 는 None.
+
+    affected_teacher_id:
+      서버가 단계 유형에 따라 자동으로 설정합니다. 클라이언트가 명시적으로
+      지정할 필요는 없지만(무시됨), 스키마 호환성을 위해 필드는 남겨둡니다.
+    """
+    step_type: str = "swap"            # "swap" | "change"
+    source_entry_id: int
+    target_entry_id: Optional[int] = None
+    new_subject_id: Optional[int] = None
+    new_teacher_id: Optional[int] = None
+    new_room_id: Optional[int] = None
+
+
+class ChangeRequestStepOut(BaseModel):
+    """변경 신청 단계 응답."""
+    id: int
+    step_order: int
+    step_type: str
+    source_entry_id: int
+    target_entry_id: Optional[int]
+    new_subject_id: Optional[int]
+    new_teacher_id: Optional[int]
+    new_room_id: Optional[int]
+    affected_teacher_id: Optional[int]
+    consent_status: str
+    consent_by_user_id: Optional[int]
+    consent_at: Optional[datetime]
+    # 단계 표시용 라벨 (서버가 채움 — 예: "월3 수학(김) ↔ 화2 영어(이)")
+    label: str = ""
+    # 동의한 사용자 이름 (있으면 서버가 채움)
+    consent_by_username: str = ""
+
     model_config = {"from_attributes": True}
 
 
@@ -353,6 +407,11 @@ class ChangeRequestCreate(BaseModel):
 
     2026-06-13 변경:
       - swap_partner_entry_id 추가. 두 슬롯을 맞바꾸는 교환 신청에 사용.
+
+    2026-06-20 변경:
+      - steps 추가. 연쇄 교체(chain swap) 신청 시 여러 단계를 한 번에 제출.
+      - steps 가 있으면 연쇄 교체로 처리되고, 없으면 기존 단일 신청 로직 유지.
+        (하위 호환성 보장 — 기존 클라이언트 코드 수정 없이 동작)
     """
     timetable_entry_id: int
     new_subject_id: Optional[int] = None
@@ -360,6 +419,8 @@ class ChangeRequestCreate(BaseModel):
     new_room_id: Optional[int] = None
     reason: str = ""
     swap_partner_entry_id: Optional[int] = None
+    # 연쇄 교체 단계들. 비어 있으면 단일 신청으로 취급.
+    steps: Optional[list[ChangeRequestStepCreate]] = None
 
 
 class ChangeRequestReview(BaseModel):
@@ -381,8 +442,14 @@ class ConsentReview(BaseModel):
 
     PATCH /timetable/requests/{id}/consent 의 요청 바디입니다.
     피교사(로그인한 사용자의 teacher_id == affected_teacher_id)만 호출할 수 있습니다.
+
+    2026-06-20 변경:
+      - step_id 추가. 연쇄 교체 신청의 경우 각 단계마다 별도 동의가 필요하므로,
+        어느 단계에 대한 동의인지 명시해야 합니다.
+      - step_id 가 None 이면 기존 단일 동의 로직(부모의 affected_teacher_id 사용).
     """
     action: str  # "approve" | "reject"
+    step_id: Optional[int] = None  # 연쇄 교체인 경우 처리할 단계 ID
 
 
 # ── 변경 이력 ──────────────────────────────────────────────────────────────
@@ -471,6 +538,48 @@ class SuggestionResponse(BaseModel):
     teachers: list[SuggestionOption]
     rooms: list[SuggestionOption]
     swaps: list[SuggestionOption]
+
+
+# ── 연쇄 교체 경로 탐색 (2026-06-20 신규) ───────────────────────────────────
+
+class SwapStepOut(BaseModel):
+    """
+    연쇄 교체 경로의 개별 단계.
+
+    한 단계는 두 슬롯(source_entry_id ↔ target_entry_id) 간의 단순 swap 을 나타냅니다.
+    연쇄 교체는 여러 단계의 시퀀스로 구성됩니다.
+    """
+    step_order: int                 # 1부터 시작하는 단계 순서
+    source_entry_id: int
+    target_entry_id: int
+    # 사용자 표시용 라벨 — 예: "월3 수학(김선생) ↔ 화2 영어(이선생)"
+    label: str
+    # 이 단계에서 동의가 필요한 교사 ID 목록
+    affected_teacher_ids: list[int] = []
+
+
+class SwapPathOut(BaseModel):
+    """
+    연쇄 교체 경로 하나.
+
+    source_entry_id 에서 target_entry_id 로 가는 검증된 단계들의 시퀀스입니다.
+    시스템이 자동 탐색한 후보 경로를 사용자에게 제시할 때 사용됩니다.
+    """
+    steps: list[SwapStepOut]
+    step_count: int                  # 단계 수 (len(steps) 와 동일하지만 UI 편의용)
+    # 이 경로 전체에서 동의가 필요한 모든 교사 ID (중복 제거)
+    related_teacher_ids: list[int] = []
+    # 경로 요약 — 예: "3단계 연쇄 교체, 3명 동의 필요"
+    summary: str
+
+
+class SwapPathsResponse(BaseModel):
+    """GET /timetable/swap-paths 응답."""
+    source_entry_id: int
+    target_entry_id: int
+    paths: list[SwapPathOut]
+    # 탐색 제한/성능 안내용 메시지
+    note: str = ""
 
 
 # ── 채팅 ───────────────────────────────────────────────────────────────────

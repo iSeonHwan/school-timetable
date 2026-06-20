@@ -509,6 +509,77 @@ async def create_and_send_notification(
     await manager.send_to_user(user_id, payload)
 
 
+async def create_and_send_notifications_multi(
+    db: Session,
+    user_messages: dict[int, str],
+    notif_type: str,
+    change_request_id: Optional[int],
+):
+    """
+    여러 사용자에게 각각 다른 메시지를 담은 알림을 생성·전송합니다 (2026-06-20 신규).
+
+    연쇄 교체(chain swap) 신청 시 여러 교사에게 "본인 단계"를 중심으로 한
+    개인화된 동의 요청 메시지를 한 번에 전송하기 위해 추가되었습니다.
+
+    각 사용자마다:
+      1. Notification 레코드를 DB 에 저장
+      2. WebSocket manager.send_to_user 로 실시간 전송 (오프라인이면 DB 에만 남음)
+
+    한 번의 commit 으로 모든 Notification 을 일괄 저장한 뒤 전송하므로,
+    다수 사용자 알림이 부분적으로만 저장되는 일이 없습니다.
+
+    Args:
+        db: SQLAlchemy 세션
+        user_messages: {user_id: message} 매핑. 각 사용자마다 다른 메시지 가능.
+        notif_type: Notification.type 값 (모두 동일)
+        change_request_id: 연결된 TimetableChangeRequest.id
+
+    Returns:
+        생성된 Notification 객체 리스트 (전송 결과와 무관하게 DB 에 남은 것)
+    """
+    from shared.models import Notification
+
+    if not user_messages:
+        return []
+
+    # ── 1. 모든 Notification 레코드를 한 트랜잭션으로 저장 ───────────────
+    # 개별 commit 을 피해 일괄 저장 — 부분 실패로 일부 사용자에게만 알림이
+    # 가는 문제를 방지합니다.
+    notifs: list[Notification] = []
+    for user_id, message in user_messages.items():
+        notif = Notification(
+            user_id=user_id,
+            type=notif_type,
+            change_request_id=change_request_id,
+            message=message,
+            is_read=False,
+        )
+        db.add(notif)
+        notifs.append(notif)
+    db.commit()
+    for n in notifs:
+        db.refresh(n)
+
+    # ── 2. WebSocket 으로 실시간 전송 ──────────────────────────────────
+    # 접속 중인 사용자에게만 즉시 도달하며, 오프라인 사용자는 재접속 후
+    # GET /notifications 로 조회 가능합니다.
+    for notif in notifs:
+        payload = {
+            "type": "notification",
+            "payload": {
+                "id": notif.id,
+                "type": notif.type,
+                "change_request_id": notif.change_request_id,
+                "message": notif.message,
+                "is_read": notif.is_read,
+                "created_at": notif.created_at.isoformat(),
+            },
+        }
+        await manager.send_to_user(notif.user_id, payload)
+
+    return notifs
+
+
 # ── 백그라운드 자동 정리 태스크 ────────────────────────────────────────────────
 
 async def _auto_cleanup_loop():
