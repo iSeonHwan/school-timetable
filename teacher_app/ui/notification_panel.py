@@ -15,6 +15,9 @@
   - status_update     : 변경 신청 상태 변화
   - approved          : 변경 신청 최종 승인
   - rejected          : 변경 신청 최종 거절
+  - invigilation_swap_request : 다른 교사가 본인에게 감독 스왑을 요청함
+  - exam_published    : 시험이 게시됨 (전 교사 대상 공지)
+  - invigilation_assigned     : 감독 배정 확정 안내
 
 2026-06-20 변경 (연쇄 교체 지원):
   - 연쇄 교체 신청의 경우 한 알림이 여러 단계(step) 중 하나에 대한 동의 요청.
@@ -22,6 +25,12 @@
     먼저 GET /timetable/requests 로 해당 신청을 조회해 본인(teacher_id)이
     affected_teacher_id 인 pending 단계를 찾아 step_id 로 전달합니다.
   - 단일 신청(기존 방식)은 step_id 없이 처리되어 하위 호환성 유지.
+
+2026-09-19 변경 (시험 감독 기능):
+  - 감독 스왑 동의 요청(invigilation_swap_request)도 consent_request 와
+    동일하게 동의/거절 버튼을 표시합니다. 승인 라인은 수업 교체와
+    공용(상대 동의 → 일과계 → 교감)이므로 처리 로직 변경이 필요 없습니다.
+  - 시험 게시(exam_published)·감독 배정(invigilation_assigned) 알림 유형 추가.
 """
 from __future__ import annotations
 from datetime import datetime
@@ -293,6 +302,12 @@ class NotificationPanel(QWidget):
             "consent_rejected": "#7F8C8D",
             "approved": "#27AE60",
             "rejected": "#C0392B",
+            # ── 시험 감독 알림 (2026-09-19) ──
+            # 스왑 요청은 동의 액션이 필요한 알림이므로 consent_request 와
+            # 같은 계열색(빨강)으로 강조, 나머지는 안내성 정보색을 사용합니다.
+            "invigilation_swap_request": "#E74C3C",
+            "exam_published": "#8E44AD",
+            "invigilation_assigned": "#1B4F8A",
         }
         type_label.setStyleSheet(f"color:{type_colors.get(ntype, '#1B4F8A')}; margin-right:8px;")
         header.addWidget(type_label)
@@ -316,9 +331,11 @@ class NotificationPanel(QWidget):
         msg_label.setStyleSheet("font-size:12px; color:#2C3E50;")
         layout.addWidget(msg_label)
 
-        # consent_request 일 경우 승인/거절 버튼 추가
+        # consent_request(수업 교체) 또는 invigilation_swap_request(감독 스왑)
+        # 일 경우 승인/거절 버튼 추가 — 두 유형 모두 동일한 동의 API 를 사용합니다.
         # 연쇄 교체인 경우 단계(step_id)를 먼저 찾은 뒤 동의 요청을 전송합니다.
-        if ntype == "consent_request" and change_request_id:
+        # (감독 스왑은 단계가 없는 단일 동의 신청 → step_id=None 으로 처리됨)
+        if ntype in ("consent_request", "invigilation_swap_request") and change_request_id:
             btn_row = QHBoxLayout()
             btn_row.addStretch()
 
@@ -465,6 +482,10 @@ class NotificationPanel(QWidget):
             "status_update": "상태 변경",
             "approved": "승인 완료",
             "rejected": "거절됨",
+            # ── 시험 감독 알림 (2026-09-19) ──
+            "invigilation_swap_request": "감독 교체 동의 요청",
+            "exam_published": "시험 게시",
+            "invigilation_assigned": "감독 배정",
         }
         return labels.get(ntype, ntype)
 

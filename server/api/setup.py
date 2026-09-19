@@ -69,6 +69,9 @@ def create_class(body: SchoolClassCreate, db: Session = Depends(get_db), _: User
         class_number=body.class_number,
         display_name=body.display_name,
         homeroom_room_id=body.homeroom_room_id,
+        # 2026-09-19: 반별 학생 수 — 시험 감독 2인 1조(20명 이상) 판단 근거.
+        # 미입력 시 감독 배정이 기본값(30명)을 가정해 2인 1조로 처리합니다.
+        student_count=body.student_count,
     )
     db.add(sc)
     db.commit()

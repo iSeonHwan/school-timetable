@@ -32,12 +32,21 @@ server/, admin_app/, teacher_app/ 세 프로그램이 모두 이 파일을 참�
                           A↔C↔B 식의 연쇄 교체를 표현 가능
                         — 단계별로 별도의 affected_teacher_id/consent_status 를
                           가져 다교사 병렬 동의를 안전하게 처리
+
+  [2026-09-19 신규 — 시험 시간표 + 시험 감독 시간표 지원]
+  Exam                 시험 종류·기간 (중간/기말/모의고사, 교시 운영 규칙 포함)
+  ExamPeriod           시험 날짜×교시 (시작/종료 시각 보관)
+  ExamEntry            시험 시간표 한 칸 (날짜·교시·학년에 배치된 과목)
+  InvigilationAssignment  감독 배정 (교시×반×조 슬롯에 배정된 교사)
+  InvigilationConstraint  날짜 기반 감독 불가 신청 (기존 TeacherConstraint 는
+                        요일+교시 기준이라 시험처럼 특정 날짜 기반 불가 신청을
+                        담을 수 없어 별도 테이블로 추가)
 """
 import json
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Boolean, ForeignKey,
-    Date, DateTime, Text,
+    Date, DateTime, Text, Time, UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -113,6 +122,14 @@ class SchoolClass(Base):
     class_number     = Column(Integer, nullable=False)
     display_name     = Column(String(20), nullable=False)
     homeroom_room_id = Column(Integer, ForeignKey("rooms.id"), nullable=True)
+    # ── 반별 학생 수 (2026-09-19 신규 — 시험 감독 조 구성용) ────────────────
+    # 시험 감독 배정에서 2인 1조 여부를 판단하는 기준 데이터입니다.
+    #   - student_count >= 20 : 감독교사 2인 1조로 배정
+    #   - student_count <  20 : 감독교사 1인 배정
+    # nullable=True 인 이유: 기존 DB 마이그레이션 시 NOT NULL 추가 제약으로
+    # 실패하지 않도록 애플리케이션 레벨에서 관리하며, 값이 없으면
+    # 감독 배정 알고리즘이 기본값(30명)을 가정해 2인 1조로 처리합니다.
+    student_count    = Column(Integer, nullable=True)
 
     grade               = relationship("Grade", back_populates="classes")
     homeroom_room       = relationship("Room")
@@ -326,7 +343,26 @@ class TimetableChangeRequest(Base):
     __tablename__ = "timetable_change_requests"
 
     id                 = Column(Integer, primary_key=True)
-    timetable_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=False)
+    # ── 신청 대상 식별 (2026-09-19 변경: nullable 로 완화) ────────────────────
+    # 기존에는 수업 시간표 슬롯만 변경 대상이었으므로 NOT NULL 이었지만,
+    # 시험 감독 스왑 신청(request_type="invigilation")은 시간표 슬롯이 아닌
+    # 감독 배정(InvigilationAssignment)을 대상으로 하므로 NULL 이 됩니다.
+    # 기존 수업 시간표 신청(request_type="timetable")은 여전히 필수 값이며,
+    # API 레벨에서 유형별로 검증합니다 (DB 제약 완화는 Alembic 마이그레이션 담당).
+    timetable_entry_id = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
+    # ── 신청 유형 (2026-09-19 신규) ─────────────────────────────────────────
+    # "timetable"    : 기존 수업 시간표 변경 신청 (기본값 — 기존 데이터 하위 호환)
+    # "invigilation": 시험 감독 스왑 신청 (대상은 invigilation_assignment_id)
+    # 감독 스왑도 수업 시간표 변경과 동일한 결재 라인(피교사 동의 → 동적
+    # 워크플로우 승인)을 재사용하므로 별도 신청 테이블을 만들지 않고
+    # 유형 컬럼으로 분기합니다.
+    request_type       = Column(String(20), nullable=False, default="timetable")
+    # ── 감독 스왑 대상 감독 배정 (2026-09-19 신규) ───────────────────────────
+    # request_type="invigilation" 인 경우에만 사용됩니다.
+    # invigilation_assignment_id  : 신청자(본인)가 현재 맡고 있는 감독 슬롯
+    # swap_partner_invigilation_id : 감독을 맞바꾸고자 하는 상대의 감독 슬롯
+    invigilation_assignment_id = Column(Integer, ForeignKey("invigilation_assignments.id"), nullable=True)
+    swap_partner_invigilation_id = Column(Integer, ForeignKey("invigilation_assignments.id"), nullable=True)
     new_subject_id     = Column(Integer, ForeignKey("subjects.id"), nullable=True)
     new_teacher_id     = Column(Integer, ForeignKey("teachers.id"), nullable=True)
     new_room_id        = Column(Integer, ForeignKey("rooms.id"), nullable=True)
@@ -386,6 +422,16 @@ class TimetableChangeRequest(Base):
 
     timetable_entry     = relationship("TimetableEntry", foreign_keys=[timetable_entry_id])
     swap_partner_entry  = relationship("TimetableEntry", foreign_keys=[swap_partner_entry_id])
+    # ── 감독 스왑 대상 관계 (2026-09-19 신규) ────────────────────────────────
+    # 감독 스왑 신청(request_type="invigilation")에서 두 감독 배정을 조회하기
+    # 위한 관계입니다. foreign_keys 를 명시하지 않으면 두 FK 컬럼 중 어느 것이
+    # 어느 관계인지 SQLAlchemy 가 판단하지 못하므로 반드시 명시합니다.
+    invigilation_assignment = relationship(
+        "InvigilationAssignment", foreign_keys=[invigilation_assignment_id]
+    )
+    swap_partner_invigilation = relationship(
+        "InvigilationAssignment", foreign_keys=[swap_partner_invigilation_id]
+    )
     new_subject         = relationship("Subject", foreign_keys=[new_subject_id])
     new_teacher         = relationship("Teacher", foreign_keys=[new_teacher_id])
     new_room            = relationship("Room", foreign_keys=[new_room_id])
@@ -446,10 +492,20 @@ class ChangeRequestStep(Base):
     # "swap"  : source_entry_id 와 target_entry_id 의 과목/교사/교실을 맞바꿈
     # "change": source_entry_id 의 과목/교사/교실을 new_*_id 로 변경
     step_type          = Column(String(20), nullable=False, default="swap")
-    # 주체 슬롯 (항상 존재)
-    source_entry_id    = Column(Integer, ForeignKey("timetable_entries.id"), nullable=False)
+    # ── 주체/상대 슬롯 (2026-09-19 변경: source nullable 로 완화) ────────────
+    # 기존에는 수업 시간표 슬롯만 대상이었으나, 감독 연쇄 스왑 확장을 대비해
+    # 감독 배정(InvigilationAssignment)을 단계 대상으로 지정할 수 있게 됩니다.
+    # 감독 단계의 경우 source_entry_id/target_entry_id 는 NULL 이고
+    # source_invigilation_id/target_invigilation_id 가 대신 사용됩니다.
+    # (현재 구현은 1:1 감독 스왑이므로 request 레벨 필드만 사용하지만,
+    #  연쇄 감독 스왑 지원 시 이 컬럼들이 사용됩니다 — 확장 대비 설계)
+    source_entry_id    = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
     # 교환 상대 슬롯 (step_type="swap" 인 경우만, 그 외 None)
     target_entry_id    = Column(Integer, ForeignKey("timetable_entries.id"), nullable=True)
+    # ── 감독 배정 기준 단계 대상 (2026-09-19 신규) ──────────────────────────
+    # 감독 연쇄 스왑 단계에서 사용합니다. 수업 시간표 단계에서는 NULL 입니다.
+    source_invigilation_id = Column(Integer, ForeignKey("invigilation_assignments.id"), nullable=True)
+    target_invigilation_id = Column(Integer, ForeignKey("invigilation_assignments.id"), nullable=True)
     # 단일 슬롯 변경(step_type="change")인 경우의 새 값 (swap 에서는 미사용)
     new_subject_id     = Column(Integer, ForeignKey("subjects.id"), nullable=True)
     new_teacher_id     = Column(Integer, ForeignKey("teachers.id"), nullable=True)
@@ -469,6 +525,14 @@ class ChangeRequestStep(Base):
     request            = relationship("TimetableChangeRequest", back_populates="steps")
     source_entry       = relationship("TimetableEntry", foreign_keys=[source_entry_id])
     target_entry       = relationship("TimetableEntry", foreign_keys=[target_entry_id])
+    # ── 감독 배정 단계 대상 관계 (2026-09-19 신규) ───────────────────────────
+    # 감독 연쇄 스왑 단계에서 두 감독 배정을 조회하기 위한 관계입니다.
+    source_invigilation = relationship(
+        "InvigilationAssignment", foreign_keys=[source_invigilation_id]
+    )
+    target_invigilation = relationship(
+        "InvigilationAssignment", foreign_keys=[target_invigilation_id]
+    )
     new_subject        = relationship("Subject", foreign_keys=[new_subject_id])
     new_teacher        = relationship("Teacher", foreign_keys=[new_teacher_id])
     new_room           = relationship("Room", foreign_keys=[new_room_id])
@@ -614,3 +678,246 @@ class ApprovalStep(Base):
     step_name     = Column(String(50), nullable=False)
 
     workflow = relationship("ApprovalWorkflow", back_populates="steps")
+
+
+# ── 시험 시간표 + 시험 감독 시간표 (2026-09-19 신규) ─────────────────────────
+#
+# 이 섹션은 시험 기간 업무를 자동화하기 위해 추가되었습니다.
+# 기존 수업 시간표(TimetableEntry)가 "요일×교시" 반복 구조인 반면,
+# 시험 시간표는 "특정 날짜×시험 교시"의 1회성 구조라 별도 테이블이 필요합니다.
+#
+# 데이터 흐름:
+#   1. 일과계가 Exam 생성 (기간·교시 운영 규칙 포함) → ExamPeriod 자동 생성
+#   2. 시험 시간표(ExamEntry) 자동 배치 또는 수동 편집
+#   3. 감독 배정(InvigilationAssignment) 자동 배정 또는 수동 조정
+#   4. publish 시 교사 앱에서 조회 가능 + 전체 알림 발송
+#   5. 교사는 감독 불가 신청(InvigilationConstraint) 또는 감독 스왑 신청 가능
+
+class Exam(Base):
+    """
+    시험 종류·기간과 교시 운영 규칙.
+
+    시험 한 번(예: "1학기 중간고사")을 나타냅니다. 시험 기간의 날짜별 교시는
+    자식 테이블 ExamPeriod 로 관리하며, 시험 시간표 칸은 ExamEntry 로 관리합니다.
+
+    주요 필드 설계 배경:
+      - target_grade_ids: 전 학년이 아닌 일부 학년만 시험을 치르는 경우
+        (예: 1·2학년 중간고사, 3학년 수업) 어떤 학년이 시험인지 명시합니다.
+        JSON 배열(문자열)로 저장하며, 감독 배정 시 "시험 치르지 않는 학년의
+        반은 그 교시에도 수업이 있다"는 검증(수업 병행 검증)의 기준이 됩니다.
+      - first_period_start / break_minutes / prep_minutes / exam_minutes:
+        시험기간 교시 운영 시간표는 일반 수업과 다르므로(쉬는시간 → 준비령 →
+        5분 → 시험시간 → 종료령과 동시 종료) 사용자가 직접 입력할 수 있도록
+        시험 단위로 보관합니다. 기본값은 요구사항 기준(08:30 시작, 10분 쉬는
+        시간, 5분 준비, 50분 시험, 하루 3교시)입니다.
+      - ban_homeroom_invigilation / ban_own_subject:
+        감독 금지 규칙(담임 반 감독 금지 / 담당 과목 시험 감독 금지).
+        기본값 True 이지만 학교 사정에 따라 관리자가 해제할 수 있습니다.
+      - status: draft(작성 중, 관리자만 조회) → published(확정, 교사 앱 조회 가능).
+        감독 배정이 진행 중인 미완성 시험표가 교사에게 조기 노출되는 것을
+        방지하기 위해 2단계 상태를 둡니다.
+    """
+    __tablename__ = "exams"
+
+    id         = Column(Integer, primary_key=True)
+    term_id    = Column(Integer, ForeignKey("academic_terms.id"), nullable=False)
+    name       = Column(String(100), nullable=False)
+    # 시험 유형 — 표기·분류용 (midterm=중간, final=기말, mock=모의고사 등)
+    exam_type  = Column(String(20), nullable=False, default="midterm")
+    # 학교급 모드 — 기본 고등학교("high"), 중학교 모드("middle").
+    # 기능상 차이는 없고 표기·기본값 수준에서만 사용합니다 (요구사항 1).
+    school_level = Column(String(10), nullable=False, default="high")
+    # 시험 치르는 학년 ID 목록 — JSON 배열 문자열 (예: "[1, 2, 3]").
+    # 빈 리스트 "[]" 면 해당 학기의 전체 학년이 시험 대상으로 간주됩니다.
+    target_grade_ids = Column(Text, nullable=False, default="[]")
+    # ── 시험 기간 (2026-09-19 추가) ────────────────────────────────────────
+    # 기간의 날짜별 교시(ExamPeriod) 생성 근거가 됩니다. PATCH 로 기간이
+    # 바뀌면 서버가 periods 를 재생성합니다.
+    start_date = Column(Date, nullable=False)
+    end_date   = Column(Date, nullable=False)
+    # ── 교시 운영 규칙 (사용자 입력 가능, 기본값은 요구사항 4 기준) ───────────
+    first_period_start = Column(Time, nullable=False)   # 1교시 시작 시각
+    periods_per_day    = Column(Integer, nullable=False, default=3)  # 하루 교시 수
+    break_minutes      = Column(Integer, nullable=False, default=10)  # 쉬는시간(분)
+    prep_minutes       = Column(Integer, nullable=False, default=5)  # 준비령(분, 시험 종료 N분 전)
+    exam_minutes       = Column(Integer, nullable=False, default=50)  # 시험 시간(분)
+    # ── 시험 시간표 자동 배치 규칙 ─────────────────────────────────────────
+    max_subjects_per_day = Column(Integer, nullable=False, default=3)  # 하루 최대 과목 수
+    # ── 감독 금지 규칙 (기본 ON, 관리자 설정에서 해제 가능 — 요구사항 2) ─────
+    ban_homeroom_invigilation = Column(Boolean, nullable=False, default=True)  # 담임 반 감독 금지
+    ban_own_subject           = Column(Boolean, nullable=False, default=True)  # 담당 과목 시험 감독 금지
+    # ── 게시 상태 ─────────────────────────────────────────────────────────
+    status    = Column(String(20), nullable=False, default="draft")
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    term = relationship("AcademicTerm")
+    # 시험 기간의 날짜×교시들 — 시험 삭제 시 함께 삭제 (cascade)
+    periods = relationship(
+        "ExamPeriod", back_populates="exam", cascade="all, delete-orphan",
+        order_by="ExamPeriod.exam_date, ExamPeriod.period",
+    )
+    # 시험 시간표 칸들 — 시험 삭제 시 함께 삭제 (cascade)
+    entries = relationship(
+        "ExamEntry", back_populates="exam", cascade="all, delete-orphan"
+    )
+    # 감독 배정들 — 시험 삭제 시 함께 삭제 (cascade).
+    # 감독 배정은 시험 시간표(ExamEntry)와 독립적으로 존재할 수 있으므로
+    # Exam 에 직접 연결합니다 (시험 치르는 모든 반이 감독 대상이며,
+    # 시험 표에 과목이 아직 없는 교시에도 감독은 필요할 수 있음).
+    invigilations = relationship(
+        "InvigilationAssignment", back_populates="exam", cascade="all, delete-orphan"
+    )
+    # 감독 불가 신청들 — 시험 삭제 시 함께 삭제 (cascade)
+    constraints = relationship(
+        "InvigilationConstraint", back_populates="exam", cascade="all, delete-orphan"
+    )
+
+    def __str__(self):
+        return self.name
+
+
+class ExamPeriod(Base):
+    """
+    시험 날짜×교시 한 칸의 시간 정보.
+
+    Exam 생성 시 기간(start_date~end_date)과 하루 교시 수(periods_per_day)에
+    따라 자동으로 생성됩니다. 예: 10/20~10/22, 하루 3교시 → 9개의 ExamPeriod.
+
+    시각 계산 규칙 (요구사항 4의 시험기간 운영 방식):
+      - N교시 시작 = 1교시 시작 + (N-1) × (exam_minutes + break_minutes)
+      - N교시 종료 = N교시 시작 + exam_minutes (종료령과 동시 종료)
+      - 준비령 시각 = N교시 종료 - prep_minutes
+        → 준비령은 파생값이라 DB 에 저장하지 않고 필요 시 계산합니다.
+        (쉬는시간 → 준비령 → 5분 → 시험시간 → 종료령 순서로 진행)
+
+    UniqueConstraint: 같은 시험에서 같은 날짜·같은 교시가 중복 생성되는 것을
+    DB 레벨에서 차단합니다.
+    """
+    __tablename__ = "exam_periods"
+    __table_args__ = (
+        UniqueConstraint("exam_id", "exam_date", "period", name="uq_exam_period_slot"),
+    )
+
+    id         = Column(Integer, primary_key=True)
+    exam_id    = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    exam_date  = Column(Date, nullable=False)   # 시험 날짜
+    period     = Column(Integer, nullable=False)  # 교시 번호 (1 ~ periods_per_day)
+    start_time = Column(Time, nullable=False)  # 시험 시작 시각
+    end_time   = Column(Time, nullable=False)  # 시험 종료 시각 (= 시작 + exam_minutes)
+
+    exam = relationship("Exam", back_populates="periods")
+    # 이 교시에 배치된 시험 과목들 (학년별 1개씩) 과 감독 배정들
+    entries = relationship("ExamEntry", back_populates="period", cascade="all, delete-orphan")
+    invigilations = relationship(
+        "InvigilationAssignment", back_populates="period", cascade="all, delete-orphan"
+    )
+
+
+class ExamEntry(Base):
+    """
+    시험 시간표의 한 칸: 특정 교시(ExamPeriod)에 특정 학년이 응시하는 과목.
+
+    학년 단위로 배치하는 이유:
+      시험은 같은 학년의 모든 반이 동시에 같은 과목을 응시하므로, 반 단위가
+      아니라 학년 단위로 배치합니다. (예: 10/20 1교시 1학년 국어 — 1반~N반 전체)
+
+    is_manual: 관리자가 더블클릭으로 수동 편집한 칸임을 표시합니다.
+      자동 배치를 다시 실행하면 전체가 재배치되므로, 수동 편집 칸이 있었다는
+      사실을 결과 메시지로 안내하는 근거로 사용합니다.
+
+    UniqueConstraint: 같은 시험에서 같은 교시·같은 학년에 과목이 2개
+    배치되는 것을 DB 레벨에서 차단합니다.
+    """
+    __tablename__ = "exam_entries"
+    __table_args__ = (
+        UniqueConstraint("exam_id", "period_id", "grade_id", name="uq_exam_entry_slot"),
+    )
+
+    id         = Column(Integer, primary_key=True)
+    exam_id    = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    period_id  = Column(Integer, ForeignKey("exam_periods.id"), nullable=False)
+    grade_id   = Column(Integer, ForeignKey("grades.id"), nullable=False)
+    subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False)
+    is_manual  = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    exam    = relationship("Exam", back_populates="entries")
+    period  = relationship("ExamPeriod", back_populates="entries")
+    grade   = relationship("Grade")
+    subject = relationship("Subject")
+
+
+class InvigilationAssignment(Base):
+    """
+    감독 배정: 시험 교시×반×조 슬롯에 배정된 감독교사.
+
+    감독 슬롯 생성 규칙 (요구사항 5 — 2인 1조 기준):
+      시험 치르는 각 반의 학생 수(SchoolClass.student_count)를 기준으로
+      해당 반×교시에 감독 슬롯을 몇 개 만들지 결정합니다.
+        - 학생 20명 이상 → pair_index 1, 2 두 슬롯 (2인 1조)
+        - 학생 20명 미만 → pair_index 1 한 슬롯 (1인 감독)
+      student_count 가 미입력이면 기본 30명을 가정해 2인 1조로 처리합니다.
+
+    teacher_id 가 nullable 인 이유:
+      감독 후보가 부족한 소규모 학교에서 자동 배정이 슬롯을 전부 채우지
+      못할 수 있습니다. 이때 슬롯 자체를 버리면 "미배정 감독 존재"라는
+      사실이 사라지므로, teacher_id=NULL 로 슬롯을 남겨두고 관리자가
+      수동 배정으로 채울 수 있게 합니다.
+
+    UniqueConstraint: 같은 교시에 같은 반의 같은 조 번호가 중복되는 것을
+    DB 레벨에서 차단합니다.
+    """
+    __tablename__ = "invigilation_assignments"
+    __table_args__ = (
+        UniqueConstraint("period_id", "school_class_id", "pair_index", name="uq_invigilation_slot"),
+    )
+
+    id              = Column(Integer, primary_key=True)
+    exam_id         = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    period_id       = Column(Integer, ForeignKey("exam_periods.id"), nullable=False)
+    school_class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=False)
+    # 감독교사 — NULL 이면 미배정 상태 (위 설명 참조)
+    teacher_id      = Column(Integer, ForeignKey("teachers.id"), nullable=True)
+    # 조 번호: 1 = 단독 감독 또는 2인 1조의 첫 번째, 2 = 2인 1조의 두 번째
+    pair_index      = Column(Integer, nullable=False, default=1)
+
+    exam         = relationship("Exam", back_populates="invigilations")
+    period       = relationship("ExamPeriod", back_populates="invigilations")
+    school_class = relationship("SchoolClass")
+    teacher      = relationship("Teacher")
+
+
+class InvigilationConstraint(Base):
+    """
+    날짜 기반 감독 불가/제한 신청.
+
+    기존 TeacherConstraint 가 "요일+교시" 기준(매주 반복)이라, 시험처럼
+    특정 날짜에만 발생하는 불가(공결, 출장, 연수 등)를 표현할 수 없어
+    별도 테이블로 추가했습니다.
+
+    period 가 NULL 이면 "해당 날짜 전체 교시 불가"를 의미합니다.
+      (교시를 지정하면 해당 교시만 불가)
+
+    승인 워크플로우:
+      교사가 신청(status=pending) → 일과계/교감이 승인(approved) 또는
+      거절(rejected) 처리합니다. 감독 자동 배정 알고리즘은 approved 상태인
+      신청만 하드 제약으로 반영합니다. pending/rejected 는 감독 배정에
+      영향을 주지 않습니다 (미승인 상태로 감독이 빠지는 사고 방지).
+    """
+    __tablename__ = "invigilation_constraints"
+
+    id           = Column(Integer, primary_key=True)
+    exam_id      = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    teacher_id   = Column(Integer, ForeignKey("teachers.id"), nullable=False)
+    exam_date    = Column(Date, nullable=False)   # 불가 날짜
+    period       = Column(Integer, nullable=True)  # 불가 교시 (None=전 교시)
+    reason       = Column(Text, default="")
+    status       = Column(String(20), nullable=False, default="pending")  # pending/approved/rejected
+    requested_at = Column(DateTime, default=datetime.now)
+    reviewed_by  = Column(String(30), default="")   # 승인/거절한 사용자명
+    reviewed_at  = Column(DateTime, nullable=True)
+
+    exam    = relationship("Exam", back_populates="constraints")
+    teacher = relationship("Teacher")

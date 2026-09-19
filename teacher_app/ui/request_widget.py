@@ -214,9 +214,17 @@ class RequestWidget(QWidget):
             else:
                 status_text = status
 
+            # 대상 표시 — 감독 스왑 신청(request_type="invigilation")은
+            # 수업 시간표 슬롯이 아니라 감독 배정 2개를 맞바꾸는 신청입니다.
+            # timetable_entry_id 가 None 이므로 "시간표#None" 이 나오지 않게 분기.
+            if req.get("request_type") == "invigilation":
+                target_text = "감독 교체"
+            else:
+                target_text = f"시간표#{req.get('timetable_entry_id', '')}"
+
             cells = [
                 at,
-                f"시간표#{req.get('timetable_entry_id', '')}",
+                target_text,
                 req.get("reason", ""),
                 status_text,
                 consent_labels.get(consent_status, consent_status),

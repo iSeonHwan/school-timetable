@@ -35,20 +35,31 @@ from ui.history.history_view import HistoryWidget as HistoryViewWidget
 from ui.timetable.request_list import ChangeRequestWidget
 from ui.setup.workflow_setup import WorkflowSetupWidget
 
+# 2026-09-19 추가: 시험 관리 3페이지 (시험 관리 / 시험 시간표 / 감독 시간표)
+from admin_app.ui.exam.exam_setup_page import ExamSetupWidget
+from admin_app.ui.exam.exam_grid_page import ExamGridWidget
+from admin_app.ui.exam.invigilation_grid_page import InvigilationGridWidget
+
 SIDEBAR_W = 180
 CHAT_W = 280  # 채팅 패널 고정 너비
 
 # ── 역할별 네비게이션 구성 ─────────────────────────────────────────────────────
 # (라벨, 페이지 인덱스) 튜플 목록
+# 인덱스는 QStackedWidget 내 위젯 등록 순서와 1:1 대응이므로,
+# 새 페이지는 반드시 스택 "맨 뒤"에 붙입니다 (기존 인덱스 변경 금지).
 NAV_SCHEDULER = [
     ("학년·반 관리", 0), ("교사 관리", 1), ("교과목·시수", 2),
     ("교실 관리", 3), ("학반별 시간표", 4),
     ("교사별 시간표", 5), ("변경 이력", 6), ("변경 신청/결재", 7),
     ("결재 라인 설정", 8),
+    ("시험 관리", 9), ("시험 시간표", 10), ("감독 시간표", 11),
 ]
 
 NAV_VICE_PRINCIPAL = [
     ("학반별 시간표", 4), ("교사별 시간표", 5), ("변경 신청/결재", 7),
+    # 교감용 감독 시간표 — 읽기 전용(열람)만 제공.
+    # 감독 변경은 결재 라인(변경 신청/결재 페이지)을 통해 처리합니다.
+    ("감독 시간표(열람)", 11),
 ]
 
 
@@ -152,6 +163,12 @@ class AdminMainWindow(QMainWindow):
         self.page_request_mgmt  = ChangeRequestWidget(role=self._role)   # index 7
         # 결재 라인 설정 위젯 — 일과계 전용
         self.page_workflow      = WorkflowSetupWidget()                  # index 8
+        # 시험 관리 3페이지 (2026-09-19 신규)
+        # ExamSetupWidget 에 ApiClient 를 전달해 게시 시 서버 알림 발송.
+        # 시간표·감독표 페이지는 기존 페이지와 동일하게 DB 직접 접근.
+        self.page_exam_setup    = ExamSetupWidget(api_client=self._client)  # index 9
+        self.page_exam_grid     = ExamGridWidget()                       # index 10
+        self.page_invigilation  = InvigilationGridWidget(read_only=read_only)  # index 11
 
         # 모든 페이지를 스택에 등록 (순서 중요: 인덱스 = 스택 내 위치)
         for page in [
@@ -164,6 +181,9 @@ class AdminMainWindow(QMainWindow):
             self.page_history,
             self.page_request_mgmt,
             self.page_workflow,
+            self.page_exam_setup,
+            self.page_exam_grid,
+            self.page_invigilation,
         ]:
             self.stack.addWidget(page)
 

@@ -58,6 +58,8 @@ from database.connection import get_session
 from database.models import (
     TimetableChangeRequest, TimetableEntry, Teacher, Subject, Room,
     ApprovalWorkflow, ApprovalStep, ChangeRequestStep, User,
+    # 2026-09-19 추가: 감독 스왑 신청(request_type="invigilation") 표시·반영용
+    InvigilationAssignment, ExamPeriod, SchoolClass,
 )
 from core.change_logger import log_entry_update
 
@@ -236,6 +238,16 @@ class ChangeRequestWidget(QWidget):
                 steps = list(req.steps)
                 is_chain = bool(steps)
 
+                # ── 감독 스왑 신청 (2026-09-19) ─────────────────────────
+                # request_type="invigilation" 신청은 TimetableEntry 가 아니라
+                # 감독 배정(InvigilationAssignment) 2개를 맞바꾸는 신청입니다.
+                # 기존 칼럼 구조(학반/요일/교시/현재/변경)에 감독 정보를
+                # 대입해 표시합니다.
+                is_invigilation = (req.request_type == "invigilation")
+                if is_invigilation:
+                    self._render_invigilation_row(row, req, session)
+                    continue
+
                 entry = req.timetable_entry
                 school_class = entry.school_class if entry else None
 
@@ -315,6 +327,78 @@ class ChangeRequestWidget(QWidget):
             self._clear_detail_panel()
         finally:
             session.close()
+
+    # ── 감독 스왑 신청 표시 (2026-09-19) ─────────────────────────────────
+
+    @staticmethod
+    def _invigilation_label(session, a: InvigilationAssignment) -> str:
+        """
+        감독 배정을 "10/05 1교시 1-1(1조)" 형태의 라벨로 변환합니다.
+
+        서버 timetable._invigilation_label 과 동일한 규칙을 관리자 앱
+        로컬 세션으로 재현한 것입니다 (관리자 앱은 DB 직접 접근 구조).
+        """
+        p = session.get(ExamPeriod, a.period_id)
+        sc = session.get(SchoolClass, a.school_class_id)
+        date_text = p.exam_date.strftime("%m/%d") if p else "?"
+        period_text = f"{p.period}교시" if p else "?교시"
+        class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+        return f"{date_text} {period_text} {class_text}({a.pair_index}조)"
+
+    def _render_invigilation_row(self, row: int, req: TimetableChangeRequest,
+                                 session) -> None:
+        """
+        감독 스왑 신청 한 건을 테이블 행으로 표시합니다.
+
+        기존 칼럼 구조를 그대로 사용하되 감독 정보를 대입합니다:
+          ID / 유형="감독 교체" / 학반=내 슬롯 반 / 요일=날짜 / 교시=시험 교시 /
+          현재 과목/교사=내 감독 라벨 / 변경 내용="↔ 상대 감독 라벨" / 사유 / 상태 /
+          결재 이력 / 신청일
+        """
+        a1 = session.get(InvigilationAssignment, req.invigilation_assignment_id)
+        a2 = session.get(InvigilationAssignment, req.swap_partner_invigilation_id)
+
+        self.table.setItem(row, 0, self._item(str(req.id)))
+
+        # 유형 — 연한 초록 배경으로 수업 교체와 구분
+        type_item = self._item("감독 교체")
+        type_item.setBackground(QBrush(QColor("#E8F5E9")))
+        self.table.setItem(row, 1, type_item)
+
+        # 내 슬롯 기준 반·날짜·교시 표기
+        p = session.get(ExamPeriod, a1.period_id) if a1 else None
+        sc = session.get(SchoolClass, a1.school_class_id) if a1 else None
+        self.table.setItem(row, 2, self._item(sc.display_name if sc else ""))
+        self.table.setItem(row, 3, self._item(p.exam_date.strftime("%m/%d") if p else ""))
+        self.table.setItem(row, 4, self._item(str(p.period) if p else ""))
+
+        # 현재/변경 내용 — "내 감독 ↔ 상대 감독" 라벨
+        label1 = self._invigilation_label(session, a1) if a1 else "삭제된 슬롯"
+        label2 = self._invigilation_label(session, a2) if a2 else "삭제된 슬롯"
+        t1 = session.get(Teacher, a1.teacher_id) if a1 else None
+        t2 = session.get(Teacher, a2.teacher_id) if a2 else None
+        self.table.setItem(row, 5, self._item(
+            f"{t1.name if t1 else '미배정'} ({label1})"))
+        self.table.setItem(row, 6, self._item(f"↔ {label2} ({t2.name if t2 else '?'})"))
+        self.table.setItem(row, 7, self._item(req.reason[:50]))
+
+        # 상태·이력·신청일 — 기존 헬퍼 재사용 (워크플로우는 수업 교체와 공용)
+        self.table.setItem(row, 8, self._item(self._format_status(req, [])))
+        self.table.setItem(row, 9, self._item(self._format_history(req)))
+        self.table.setItem(row, 10, self._item(
+            req.requested_at.strftime("%Y-%m-%d %H:%M") if req.requested_at else ""))
+
+        # 상태별 색상 — 기존 로직과 동일한 톤
+        status_item = self.table.item(row, 8)
+        if req.status == "pending":
+            status_item.setBackground(QBrush(QColor("#F39C12")))
+            status_item.setForeground(QBrush(QColor("white")))
+        elif req.status == "approved":
+            status_item.setBackground(QBrush(QColor("#27AE60")))
+            status_item.setForeground(QBrush(QColor("white")))
+        elif req.status == "rejected":
+            status_item.setBackground(QBrush(QColor("#E74C3C")))
+            status_item.setForeground(QBrush(QColor("white")))
 
     # ── 표시 헬퍼 ──────────────────────────────────────────────────────
 
@@ -829,9 +913,15 @@ class ChangeRequestWidget(QWidget):
                 )
             else:
                 # ── 마지막 단계 승인: 시간표에 변경 확정 적용 ────────────
-                # 단일 신청과 연쇄 교체를 분기 처리
+                # 단일 신청 / 연쇄 교체 / 감독 스왑 3종을 분기 처리
                 try:
-                    if steps:
+                    if req.request_type == "invigilation":
+                        # 감독 스왑 (2026-09-19): TimetableEntry 가 아니라
+                        # 감독 배정 2개의 교사를 상호 교환합니다.
+                        # 서버 _apply_invigilation_swap 과 동일한 규칙
+                        # (스냅샷 충돌 검사 포함)을 로컬 세션으로 수행합니다.
+                        success_msg = self._apply_invigilation_swap(session, req)
+                    elif steps:
                         # 연쇄 교체: 각 단계를 순회하며 TimetableEntry 반영
                         self._apply_chain_swap_changes(session, req, steps)
                         summary = self._format_chain_summary(steps)
@@ -911,6 +1001,51 @@ class ChangeRequestWidget(QWidget):
             self.refresh()
         finally:
             session.close()
+
+    def _apply_invigilation_swap(self, session, req: TimetableChangeRequest) -> str:
+        """
+        감독 스왑 신청 최종 승인 시 두 감독 배정의 교사를 상호 교환합니다.
+
+        서버의 _apply_invigilation_swap(timetable.py) 과 동일한 규칙을
+        관리자 앱의 직접 DB 세션으로 수행합니다:
+          1. 두 배정 로드 — 없으면 (이미 시험 수정으로 삭제된 경우) 오류
+          2. 신청 시점 스냅샷(change_snapshot) 과 현재 교사 비교 —
+             결재 진행 중 배정이 수동 변경된 경우 충돌로 거절
+             (승인된 내용과 실제 반영 내용이 달라지는 사고 방지)
+          3. teacher_id 상호 교환
+
+        Raises:
+            ValueError: 배정 삭제/스냅샷 충돌 — 호출부(_approve)의
+            except 절이 rollback 하고 안내 메시지를 표시합니다.
+
+        Returns:
+            성공 메시지 (무엇과 무엇을 맞바꿨는지 포함)
+        """
+        a1 = session.get(InvigilationAssignment, req.invigilation_assignment_id)
+        a2 = session.get(InvigilationAssignment, req.swap_partner_invigilation_id)
+        if a1 is None or a2 is None:
+            raise ValueError(
+                "감독 배정이 삭제되어 교체를 적용할 수 없습니다. "
+                "시험 정보가 수정된 것으로 보이니 신청을 다시 제출해 주세요.")
+
+        # 스냅샷 충돌 검사 — 신청 당시와 현재 배정이 같은지 확인
+        try:
+            snap = json.loads(req.change_snapshot or "{}")
+        except (json.JSONDecodeError, TypeError):
+            snap = {}
+        s1 = (snap.get("my_assignment") or {}).get("teacher_id")
+        s2 = (snap.get("partner_assignment") or {}).get("teacher_id")
+        if a1.teacher_id != s1 or a2.teacher_id != s2:
+            raise ValueError(
+                "신청 당시의 감독 배정과 현재 상태가 다릅니다(결재 중 변경 발생). "
+                "최신 감독표 상태로 신청을 다시 제출해 주세요.")
+
+        a1.teacher_id, a2.teacher_id = a2.teacher_id, a1.teacher_id
+        return (
+            f"감독 교체가 확정되었습니다: "
+            f"{self._invigilation_label(session, a1)} ↔ "
+            f"{self._invigilation_label(session, a2)}"
+        )
 
     def _apply_chain_swap_changes(self, session, req: TimetableChangeRequest,
                                    steps: list) -> None:

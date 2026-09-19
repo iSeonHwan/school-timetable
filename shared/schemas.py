@@ -10,7 +10,7 @@ admin_app, teacher_app 의 API 클라이언트도 이 스키마를 참조합니�
   XxxOut     — 응답 바디 (DB → JSON 직렬화)
 """
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
@@ -121,6 +121,10 @@ class SchoolClassOut(BaseModel):
     class_number: int
     display_name: str
     homeroom_room_id: Optional[int]
+    # ── 반별 학생 수 (2026-09-19 추가) ─────────────────────────────────────
+    # 시험 감독 2인 1조 판단 기준. 미입력(None)이면 감독 배정 알고리즘이
+    # 기본값 30명을 가정합니다.
+    student_count: Optional[int] = None
 
     model_config = {"from_attributes": True}
 
@@ -130,6 +134,10 @@ class SchoolClassCreate(BaseModel):
     class_number: int
     display_name: str
     homeroom_room_id: Optional[int] = None
+    # ── 반별 학생 수 (2026-09-19 추가 — 시험 감독 조 구성 기준) ─────────────
+    # 20명 이상 → 감독 2인 1조, 미만 → 1인. 선택 입력으로 두어 기존
+    # 반 관리 흐름(학생 수 모름)도 그대로 동작하게 합니다.
+    student_count: Optional[int] = Field(default=None, ge=1, le=200)
 
 
 # ── 교실 ───────────────────────────────────────────────────────────────────
@@ -320,7 +328,11 @@ class ChangeRequestOut(BaseModel):
       - swap_partner_entry_id: 교환 상대 슬롯
     """
     id: int
-    timetable_entry_id: int
+    # ── 신청 대상 (2026-09-19 변경: 감독 스왑 신청 지원) ─────────────────────
+    # request_type="timetable"     → timetable_entry_id 필수 (기존 동작)
+    # request_type="invigilation"  → timetable_entry_id=None, 감독 배정 ID 사용
+    request_type: str = "timetable"
+    timetable_entry_id: Optional[int]
     new_subject_id: Optional[int]
     new_teacher_id: Optional[int]
     new_room_id: Optional[int]
@@ -338,6 +350,12 @@ class ChangeRequestOut(BaseModel):
     consent_by_user_id: Optional[int] = None
     consent_at: Optional[datetime] = None
     swap_partner_entry_id: Optional[int] = None
+    # ── 감독 스왑 대상 감독 배정 (2026-09-19 신규) ───────────────────────────
+    # request_type="invigilation" 인 경우에만 값이 있습니다.
+    # invigilation_assignment_id     : 신청자 본인의 감독 슬롯
+    # swap_partner_invigilation_id   : 감독을 맞바꿀 상대의 감독 슬롯
+    invigilation_assignment_id: Optional[int] = None
+    swap_partner_invigilation_id: Optional[int] = None
     # [DEPRECATED] 하드코딩된 2단계 결재 필드 — 하위 호환용 유지
     scheduler_approved_by: str = ""
     scheduler_approved_at: Optional[datetime] = None
@@ -372,11 +390,16 @@ class ChangeRequestStepCreate(BaseModel):
       지정할 필요는 없지만(무시됨), 스키마 호환성을 위해 필드는 남겨둡니다.
     """
     step_type: str = "swap"            # "swap" | "change"
-    source_entry_id: int
+    source_entry_id: Optional[int] = None
     target_entry_id: Optional[int] = None
     new_subject_id: Optional[int] = None
     new_teacher_id: Optional[int] = None
     new_room_id: Optional[int] = None
+    # ── 감독 연쇄 스왑 확장 필드 (2026-09-19 신규) ───────────────────────────
+    # 감독 배정(InvigilationAssignment)을 대상으로 하는 단계에서 사용합니다.
+    # 수업 시간표 단계에서는 None 입니다.
+    source_invigilation_id: Optional[int] = None
+    target_invigilation_id: Optional[int] = None
 
 
 class ChangeRequestStepOut(BaseModel):
@@ -384,11 +407,15 @@ class ChangeRequestStepOut(BaseModel):
     id: int
     step_order: int
     step_type: str
-    source_entry_id: int
+    # 2026-09-19: 감독 연쇄 스왑 단계 지원을 위해 Optional 로 완화
+    source_entry_id: Optional[int]
     target_entry_id: Optional[int]
     new_subject_id: Optional[int]
     new_teacher_id: Optional[int]
     new_room_id: Optional[int]
+    # 감독 배정 대상 단계 확장 필드 (수업 시간표 단계에서는 None)
+    source_invigilation_id: Optional[int] = None
+    target_invigilation_id: Optional[int] = None
     affected_teacher_id: Optional[int]
     consent_status: str
     consent_by_user_id: Optional[int]
@@ -412,13 +439,27 @@ class ChangeRequestCreate(BaseModel):
       - steps 추가. 연쇄 교체(chain swap) 신청 시 여러 단계를 한 번에 제출.
       - steps 가 있으면 연쇄 교체로 처리되고, 없으면 기존 단일 신청 로직 유지.
         (하위 호환성 보장 — 기존 클라이언트 코드 수정 없이 동작)
+
+    2026-09-19 변경:
+      - request_type 추가. 기존 수업 시간표 변경("timetable", 기본값) 외에
+        시험 감독 스왑 신청("invigilation")을 같은 엔드포인트로 제출합니다.
+        감독 스왑은 timetable_entry_id 대신 invigilation_assignment_id 와
+        swap_partner_invigilation_id 로 대상을 지정합니다.
     """
-    timetable_entry_id: int
+    request_type: str = "timetable"   # "timetable" | "invigilation"
+    # timetable_entry_id: request_type="timetable" 인 경우 필수.
+    # 감독 스왑 신청에서는 None 입니다 (서버에서 유형별 검증).
+    timetable_entry_id: Optional[int] = None
     new_subject_id: Optional[int] = None
     new_teacher_id: Optional[int] = None
     new_room_id: Optional[int] = None
     reason: str = ""
     swap_partner_entry_id: Optional[int] = None
+    # ── 감독 스왑 신청 필드 (2026-09-19 신규, request_type="invigilation") ──
+    # invigilation_assignment_id   : 신청자 본인의 감독 슬롯 ID (필수)
+    # swap_partner_invigilation_id : 감독을 맞바꿀 상대 감독 슬롯 ID (필수)
+    invigilation_assignment_id: Optional[int] = None
+    swap_partner_invigilation_id: Optional[int] = None
     # 연쇄 교체 단계들. 비어 있으면 단일 신청으로 취급.
     steps: Optional[list[ChangeRequestStepCreate]] = None
 
@@ -707,3 +748,207 @@ class WsEvent(BaseModel):
     """WebSocket 으로 주고받는 이벤트 봉투."""
     type: str          # "chat" | "ping" | "history"
     payload: dict = {}
+
+
+# ── 시험 시간표 + 시험 감독 시간표 (2026-09-19 신규) ──────────────────────────
+#
+# 시험 기능의 입출력 스키마입니다. 관리자 앱은 직접 DB 접근이라 이 스키마를
+# 쓰지 않지만, 교사 앱(ApiClient)과 서버 간 직렬화에 사용됩니다.
+# 학급(student_count)·변경 신청(request_type) 관련 확장은 위 각 섹션 참조.
+
+
+class ExamOut(BaseModel):
+    """
+    시험 정보 응답.
+
+    target_grade_ids 는 DB 에 JSON 문자열("[1, 2]")로 저장되어 있어
+    그대로 전달합니다. 클라이언트에서 json.loads() 로 파싱해 사용합니다.
+    (관리자 앱은 직접 DB 를 읽으므로 동일하게 취급)
+    """
+    id: int
+    term_id: int
+    name: str
+    exam_type: str
+    school_level: str
+    target_grade_ids: str
+    start_date: date
+    end_date: date
+    first_period_start: time
+    periods_per_day: int
+    break_minutes: int
+    prep_minutes: int
+    exam_minutes: int
+    max_subjects_per_day: int
+    ban_homeroom_invigilation: bool
+    ban_own_subject: bool
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ExamCreate(BaseModel):
+    """
+    시험 생성 요청.
+
+    start_date ~ end_date 기간 동안 periods_per_day 만큼의 교시가 매일
+    자동 생성됩니다 (ExamPeriod). 시각은 first_period_start 와
+    exam_minutes / break_minutes 로 계산됩니다.
+
+    필드 제약:
+      - periods_per_day: ge=1, le=10 — 비현실적 교시 수 차단
+      - exam_minutes: ge=10, le=240 — 시험 시간 상하한
+      - target_grade_ids: 비어 있으면 전체 학년이 시험 대상
+    """
+    term_id: int
+    name: str = Field(..., min_length=1, max_length=100)
+    exam_type: str = "midterm"                       # midterm / final / mock
+    school_level: str = "high"                       # high / middle
+    start_date: date
+    end_date: date
+    target_grade_ids: list[int] = []                 # 비어 있으면 전체 학년
+    first_period_start: time = time(8, 30)           # 요구사항 기본값: 08:30
+    periods_per_day: int = Field(default=3, ge=1, le=10)
+    break_minutes: int = Field(default=10, ge=0, le=60)
+    prep_minutes: int = Field(default=5, ge=0, le=30)
+    exam_minutes: int = Field(default=50, ge=10, le=240)
+    max_subjects_per_day: int = Field(default=3, ge=1, le=10)
+    ban_homeroom_invigilation: bool = True
+    ban_own_subject: bool = True
+
+
+class ExamUpdate(BaseModel):
+    """
+    시험 수정 요청 (부분 수정).
+
+    기간(start_date/end_date)·시각·교시 수가 바뀌면 서버가 ExamPeriod 를
+    재생성합니다. 이때 기존 감독 배정/시험 칸은 대상 교시가 사라지면 함께
+    삭제되므로, 확정(published)된 시험은 수정을 거부합니다 (서버 측 검증).
+    """
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    exam_type: Optional[str] = None
+    school_level: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    target_grade_ids: Optional[list[int]] = None
+    first_period_start: Optional[time] = None
+    periods_per_day: Optional[int] = Field(None, ge=1, le=10)
+    break_minutes: Optional[int] = Field(None, ge=0, le=60)
+    prep_minutes: Optional[int] = Field(None, ge=0, le=30)
+    exam_minutes: Optional[int] = Field(None, ge=10, le=240)
+    max_subjects_per_day: Optional[int] = Field(None, ge=1, le=10)
+    ban_homeroom_invigilation: Optional[bool] = None
+    ban_own_subject: Optional[bool] = None
+
+
+class ExamPeriodOut(BaseModel):
+    """시험 교시(날짜×교시) 응답. 준비령 시각은 end_time - prep_minutes 로 파생."""
+    id: int
+    exam_id: int
+    exam_date: date
+    period: int
+    start_time: time
+    end_time: time
+
+    model_config = {"from_attributes": True}
+
+
+class ExamEntryOut(BaseModel):
+    """시험 시간표 칸 응답 (조회 편의용 이름 필드는 서버가 주입)."""
+    id: int
+    exam_id: int
+    period_id: int
+    grade_id: int
+    subject_id: int
+    is_manual: bool
+    subject_name: Optional[str] = None    # 서버가 주입 (Subject.name)
+    subject_short: Optional[str] = None   # 서버가 주입 (Subject.short_name)
+    subject_color: Optional[str] = None   # 서버가 주입 (Subject.color_hex)
+
+    model_config = {"from_attributes": True}
+
+
+class ExamEntryUpdate(BaseModel):
+    """
+    시험 시간표 칸 수동 편집 요청.
+
+    관리자가 그리드에서 칸을 더블클릭해 과목을 바꿀 때 사용합니다.
+    is_manual=True 로 표시되어, 이후 자동 배치 재실행 시 안내 메시지의
+    근거가 됩니다.
+    """
+    subject_id: int
+
+
+class InvigilationAssignmentOut(BaseModel):
+    """감독 배정 응답 (교시·반·교사 이름은 서버가 조인해 주입)."""
+    id: int
+    exam_id: int
+    period_id: int
+    school_class_id: int
+    teacher_id: Optional[int]
+    pair_index: int
+    # 조회 편의용 — 서버가 조인 결과로 채웁니다
+    exam_date: Optional[date] = None
+    period_number: Optional[int] = None      # ExamPeriod.period
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    class_name: Optional[str] = None         # SchoolClass.display_name
+    class_grade_id: Optional[int] = None     # SchoolClass.grade_id
+    teacher_name: Optional[str] = None       # Teacher.name (미배정이면 None)
+    subject_name: Optional[str] = None       # 그 교시 시험 과목명 (표시용)
+
+    model_config = {"from_attributes": True}
+
+
+class InvigilationUpdate(BaseModel):
+    """
+    감독 배정 수동 변경 요청.
+
+    관리자가 감독표에서 미배정/배정된 슬롯의 감독교사를 직접 바꿀 때
+    사용합니다. teacher_id=None 으로 미배정 상태로 되돌릴 수 있습니다.
+    """
+    teacher_id: Optional[int] = None
+
+
+class InvigilationConstraintCreate(BaseModel):
+    """
+    감독 불가 신청 생성 요청 (교사 제출).
+
+    period=None 이면 해당 날짜의 전 교시가 불가 대상입니다.
+    신청 즉시 감독 배정에 반영되지 않고 관리자 승인(approved) 후에만
+    하드 제약으로 반영됩니다 (미승인 상태로 감독이 빠지는 사고 방지).
+    exam_id 는 경로 파라미터(/exams/{exam_id}/constraints)에서 오므로
+    본문 스키마에는 포함하지 않습니다 — 두 곳에 두면 불일치 검증이 필요합니다.
+    """
+    exam_date: date
+    period: Optional[int] = Field(None, ge=1, le=10)  # None = 전 교시
+    reason: str = Field(default="", max_length=500)
+
+
+class InvigilationConstraintOut(BaseModel):
+    """감독 불가 신청 응답 (교사 이름은 서버가 주입)."""
+    id: int
+    exam_id: int
+    teacher_id: int
+    exam_date: date
+    period: Optional[int]
+    reason: str
+    status: str
+    requested_at: datetime
+    reviewed_by: str
+    reviewed_at: Optional[datetime]
+    teacher_name: Optional[str] = None    # 서버가 주입
+
+    model_config = {"from_attributes": True}
+
+
+class InvigilationConstraintReview(BaseModel):
+    """
+    감독 불가 신청 승인/거절 요청 (일과계/교감).
+
+    approved_by 는 서버가 무시하고 현재 로그인 사용자명으로 덮어씁니다
+    (ChangeRequestReview 와 동일한 actor impersonation 방지 정책).
+    """
+    action: str            # "approve" | "reject"
+    reviewed_by: str = ""  # 서버가 무시하고 current_user.username 사용

@@ -8,6 +8,8 @@
   1. 내 시간표    — 본인 teacher_id 로 필터된 TimetableEntryOut 그리드
   2. 학반 시간표  — 학반 선택 후 그리드
   3. 교체 신청   — 신청 제출 및 내 신청 목록
+  4. 내 감독      — 시험 감독 배정 조회·감독 스왑 신청·감독 불가 신청
+                   (2026-09-19 신규, 시험 기능)
 """
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -21,6 +23,7 @@ from admin_app.ui.chat_panel import ChatPanel   # 채팅 패널은 공용으로 
 from teacher_app.ui.my_timetable import MyTimetableWidget
 from teacher_app.ui.class_timetable import ClassTimetableWidget
 from teacher_app.ui.request_widget import RequestWidget
+from teacher_app.ui.my_invigilation_page import MyInvigilationWidget
 from teacher_app.ui.notification_panel import NotificationPanel
 
 SIDEBAR_W = 160
@@ -87,7 +90,9 @@ class TeacherMainWindow(QMainWindow):
         self.btn_notifications.clicked.connect(self._show_notifications)
         sb.addWidget(self.btn_notifications)
 
-        nav_items = [("내 시간표", 0), ("학반 시간표", 1), ("교체 신청", 2)]
+        nav_items = [
+            ("내 시간표", 0), ("학반 시간표", 1), ("교체 신청", 2), ("내 감독", 3),
+        ]
         for label, idx in nav_items:
             btn = QPushButton(label)
             btn.setCheckable(True)
@@ -117,8 +122,13 @@ class TeacherMainWindow(QMainWindow):
         self.page_my    = MyTimetableWidget(client=self._client)
         self.page_class = ClassTimetableWidget(client=self._client)
         self.page_req   = RequestWidget(client=self._client)
+        # 시험 감독 페이지 (2026-09-19 신규) — 내 감독 조회·스왑·불가 신청
+        self.page_invigilation = MyInvigilationWidget(client=self._client)
 
-        for page in [self.page_my, self.page_class, self.page_req]:
+        for page in [
+            self.page_my, self.page_class, self.page_req,
+            self.page_invigilation,
+        ]:
             self.stack.addWidget(page)
 
         root.addWidget(self.stack, stretch=1)

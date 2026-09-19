@@ -144,6 +144,23 @@ class ClassSetupWidget(QWidget):
         self.edit_class_name.setFixedWidth(100)
         class_row.addWidget(self.edit_class_name)
 
+        # 2026-09-19 추가: 반별 학생 수 입력 (요구사항 5 — 감독 2인 1조 판단 근거).
+        # 20명 이상 반은 시험 감독이 2인 1조로 배정됩니다.
+        # 0 을 입력하면 "미입력" 처리되며, 감독 자동 배정은 기본값(30명)을
+        # 가정해 안전하게 2인 1조로 배정합니다 (과소 배정 방지).
+        class_row.addSpacing(12)
+        class_row.addWidget(QLabel("학생 수:"))
+
+        self.spin_students = QSpinBox()
+        self.spin_students.setRange(0, 99)
+        self.spin_students.setValue(30)
+        self.spin_students.setFixedWidth(70)
+        self.spin_students.setToolTip(
+            "20명 이상 → 시험 감독 2인 1조 / 20명 미만 → 1인\n"
+            "0 으로 두면 미입력 처리(기본 30명 가정, 2인 1조)"
+        )
+        class_row.addWidget(self.spin_students)
+
         btn_add_class = QPushButton("반 추가")
         btn_add_class.setStyleSheet(BTN_PRIMARY)
         btn_add_class.clicked.connect(self._add_class)
@@ -152,8 +169,8 @@ class ClassSetupWidget(QWidget):
         cf_layout.addLayout(class_row)
 
         # 반 목록 테이블
-        self.tbl_classes = QTableWidget(0, 4)
-        self.tbl_classes.setHorizontalHeaderLabels(["ID", "학년", "반 번호", "표시명"])
+        self.tbl_classes = QTableWidget(0, 5)
+        self.tbl_classes.setHorizontalHeaderLabels(["ID", "학년", "반 번호", "표시명", "학생 수"])
         self.tbl_classes.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl_classes.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl_classes.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -198,6 +215,9 @@ class ClassSetupWidget(QWidget):
                 self.tbl_classes.setItem(row, 1, QTableWidgetItem(c.grade.name))
                 self.tbl_classes.setItem(row, 2, QTableWidgetItem(str(c.class_number)))
                 self.tbl_classes.setItem(row, 3, QTableWidgetItem(c.display_name))
+                # 학생 수 — 미입력(None)이면 "미입력" 표시 (감독 조 구성 안내)
+                students_text = str(c.student_count) if c.student_count is not None else "미입력"
+                self.tbl_classes.setItem(row, 4, QTableWidgetItem(students_text))
         finally:
             session.close()
 
@@ -276,7 +296,11 @@ class ClassSetupWidget(QWidget):
                 QMessageBox.warning(self, "중복", f"{cname} 반이 이미 존재합니다.")
                 return
 
-            cls = SchoolClass(grade_id=grade_id, class_number=cnum, display_name=cname)
+            cls = SchoolClass(
+                grade_id=grade_id, class_number=cnum, display_name=cname,
+                # 0 을 입력하면 미입력(None)으로 저장 — 기본 30명 가정 처리 유도
+                student_count=self.spin_students.value() or None,
+            )
             session.add(cls)
             session.commit()
             self._load_data()

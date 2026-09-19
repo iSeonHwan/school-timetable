@@ -22,6 +22,9 @@ from shared.models import (
     AcademicTerm, TimetableEntry, TimetableChangeLog,
     TimetableChangeRequest, ChangeRequestStep, Subject, Teacher, Room, User,
     ApprovalWorkflow, ApprovalStep, SubjectClassAssignment, SchoolClass,
+    # 2026-09-19 추가: 감독 스왑 신청(request_type="invigilation") 처리용.
+    # 감독 배정·시험 교시·시험 엔티티를 조회해 스왑 대상 검증 및 알림 문구 생성.
+    InvigilationAssignment, ExamPeriod, Exam,
 )
 from shared.schemas import (
     AcademicTermOut, AcademicTermCreate,
@@ -478,7 +481,20 @@ def submit_request(
         동의 요청 알림을 한 번에 일괄 전송합니다.
       - body.steps 가 None 이면 기존 단일 신청 로직을 그대로 사용합니다
         (하위 호환성 보장 — 기존 클라이언트 수정 불필요).
+
+    2026-09-19 변경 (감독 스왑 신청 — 요구사항 8):
+      - request_type="invigilation" 인 경우 시험 감독 교체 신청으로 분기합니다.
+        TimetableEntry 를 조회하는 기존 로직 앞에서 분기하지 않으면
+        timetable_entry_id=None 때문에 404 가 발생하므로 최상단에서 처리.
+        결재 라인(상대 교사 동의 → 일과계 → 교감)은 기존 파이프라인을
+        그대로 재사용합니다 — 감독 변경 업무 흐름이 수업 변경과 동일하기 때문.
     """
+    # ── 감독 스왑 신청 분기 (2026-09-19 신규) ─────────────────────────────
+    if body.request_type == "invigilation":
+        return _submit_invigilation_swap_request(
+            body, background_tasks, db, current_user,
+        )
+
     entry = db.get(TimetableEntry, body.timetable_entry_id)
     if entry is None:
         raise HTTPException(404, "시간표 항목을 찾을 수 없습니다.")
@@ -576,6 +592,158 @@ def submit_request(
                 req.id,
                 message,
             )
+
+    wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
+    total_steps = len(wf.steps) if wf else 0
+    return _enrich_response(req, total_steps)
+
+
+def _invigilation_label(db: Session, a: InvigilationAssignment) -> str:
+    """
+    감독 배정을 "10/05 1교시 1학년 1반" 형태의 라벨로 변환합니다.
+
+    감독 스왑 신청 알림·동의 화면에서 교사가 "무엇과 무엇을 바꾸는지"를
+    한눈에 파악할 수 있게 하기 위해 사용됩니다. TimetableEntry 라벨
+    (_entry_label) 의 감독판 역할입니다.
+
+    Args:
+        db: SQLAlchemy 세션 (교시·반 정보는 매번 소량 조회)
+        a: 감독 배정 레코드
+
+    Returns:
+        "MM/DD N교시 반표시" 라벨. 정보가 일부 없으면 알 수 있는 부분만 표기.
+    """
+    p = db.get(ExamPeriod, a.period_id)
+    sc = db.get(SchoolClass, a.school_class_id)
+    date_text = p.exam_date.strftime("%m/%d") if p else "?"
+    period_text = f"{p.period}교시" if p else "?교시"
+    class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+    return f"{date_text} {period_text} {class_text}"
+
+
+def _submit_invigilation_swap_request(
+    body: ChangeRequestCreate,
+    background_tasks: BackgroundTasks,
+    db: Session,
+    current_user: User,
+) -> ChangeRequestOut:
+    """
+    시험 감독 교체(스왑) 신청을 처리합니다 (2026-09-19 신규, 요구사항 8).
+
+    시험 당일 갑작스러운 사정(질병·출장 등)으로 감독을 맞바꾸는 신청입니다.
+    수업 시간표 변경과 결재 라인(상대 교사 동의 → 일과계 1차 → 교감 최종)이
+    동일하므로, 별도 테이블/워크플로우를 만들지 않고 TimetableChangeRequest 를
+    request_type="invigilation" 으로 확장 재사용합니다.
+
+    처리 순서:
+      1. 슬롯 검증 — 내 감독 배정이 맞는지, 상대 배정에 교사가 있는지,
+         같은 시험 소속인지, 게시된 시험인지 확인.
+      2. 스냅샷 저장 — 두 배정의 교사 ID 를 JSON 으로 기록해, 결재 기간 중
+         다른 변경(수동 배정·다른 스왑 승인)이 있었는지 최종 승인 시 감지.
+      3. 부모 신청 레코드 생성 — consent_status=pending, current_step=0
+         (상대 교사 동의 전에는 결재 라인 진입 불가).
+      4. 상대 교사에게 invigilation_swap_request 알림 전송.
+
+    검증 실패 사유:
+      - 403: 본인 감독 배정이 아닌 슬롯으로 신청 (남의 감독 임의 교체 차단)
+      - 400: 상대 슬롯 미배정/동일 교사/다른 시험 소속/게시 전 시험
+
+    Args:
+        body: request_type="invigilation" + invigilation_assignment_id(내 슬롯)
+              + swap_partner_invigilation_id(상대 슬롯) + reason
+        background_tasks: FastAPI 백그라운드 태스크 (알림 비동기 전송용)
+        db: SQLAlchemy 세션
+        current_user: 로그인한 사용자 (신청자 = 감독 교체 주체)
+
+    Returns:
+        _enrich_response 로 풍부해진 ChangeRequestOut
+    """
+    # ── 1. 슬롯 로드 + 기본 검증 ──────────────────────────────────────
+    a1 = db.get(InvigilationAssignment, body.invigilation_assignment_id)
+    if a1 is None:
+        raise HTTPException(404, "본인 감독 배정을 찾을 수 없습니다.")
+    a2 = db.get(InvigilationAssignment, body.swap_partner_invigilation_id)
+    if a2 is None:
+        raise HTTPException(404, "교체 상대 감독 배정을 찾을 수 없습니다.")
+
+    # 본인 감독 슬롯인지 — 다른 교사의 감독을 임의로 교체하는 것을 차단합니다.
+    if current_user.teacher_id is None or current_user.teacher_id != a1.teacher_id:
+        raise HTTPException(403, "본인에게 배정된 감독에 대해서만 교체를 신청할 수 있습니다.")
+
+    # 상대 슬롯에 배정된 교사가 있어야 맞바꿈이 성립합니다.
+    # 미배정 슬롯과의 "교체"는 감독 추가이므로 관리자 수동 배정 기능의 영역입니다.
+    if a2.teacher_id is None:
+        raise HTTPException(400, "교체 상대 감독 슬롯에 배정된 교사가 없습니다.")
+    if a2.teacher_id == a1.teacher_id:
+        raise HTTPException(400, "같은 교사가 감독 중인 슬롯은 교체할 수 없습니다.")
+
+    # 같은 시험 소속인지 — 날짜·교시 규칙이 시험마다 다르므로 시험 간 교체는 불가.
+    if a1.exam_id != a2.exam_id:
+        raise HTTPException(400, "같은 시험의 감독만 교체할 수 있습니다.")
+
+    # 게시된 시험만 교체 가능 — draft 상태에서는 관리자가 수동 배정으로
+    # 자유롭게 조정하면 되어 결재 라인이 불필요합니다.
+    exam = db.get(Exam, a1.exam_id)
+    if exam is None or exam.status != "published":
+        raise HTTPException(400, "게시된 시험의 감독만 교체 신청할 수 있습니다.")
+
+    # ── 2. 스냅샷 저장 ─────────────────────────────────────────────────
+    # 최종 승인 시점에 두 슬롯의 교사가 신청 때와 같은지 비교하기 위해
+    # 현재 상태를 JSON 으로 기록합니다 (수업 스왑의 change_snapshot 과 동일 패턴).
+    _snap: dict = {
+        "my_assignment": {
+            "teacher_id":       a1.teacher_id,
+            "period_id":        a1.period_id,
+            "school_class_id":  a1.school_class_id,
+        },
+        "partner_assignment": {
+            "teacher_id":       a2.teacher_id,
+            "period_id":        a2.period_id,
+            "school_class_id":  a2.school_class_id,
+        },
+    }
+
+    # ── 3. 부모 신청 레코드 생성 ────────────────────────────────────────
+    # 수업 변경 신청과 필드 구성만 다를 뿐 워크플로우 필드(current_step,
+    # consent_status, affected_teacher_id)는 동일한 규칙을 따릅니다.
+    req = TimetableChangeRequest(
+        request_type="invigilation",
+        timetable_entry_id=None,            # 감독 신청은 수업 슬롯 없음
+        invigilation_assignment_id=a1.id,  # 내 감독 배정
+        swap_partner_invigilation_id=a2.id,  # 상대 감독 배정
+        new_subject_id=None,
+        new_teacher_id=None,
+        new_room_id=None,
+        reason=body.reason,
+        requested_by=current_user.username,
+        requested_at=datetime.now(),
+        current_step=0,                    # 상대 교사 동의 전 결재 진입 불가
+        affected_teacher_id=a2.teacher_id,  # 동의자 = 상대 교사
+        consent_status="pending",
+        swap_partner_entry_id=None,
+        change_snapshot=json.dumps(_snap, ensure_ascii=False),
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+
+    # ── 4. 상대 교사에게 알림 전송 ─────────────────────────────────────
+    # 전용 알림 타입(invigilation_swap_request)을 사용해 교사 앱에서
+    # 수업 변경 동의 요청과 구분해 표시할 수 있게 합니다 (6단계 UI 지원).
+    affected_user = db.query(User).filter_by(teacher_id=a2.teacher_id, is_active=True).first()
+    if affected_user is not None:
+        message = (
+            f"{current_user.username} 선생님이 시험 감독 교체를 요청하셨습니다.\n"
+            f"{_invigilation_label(db, a1)} ↔ {_invigilation_label(db, a2)}\n"
+            f"사유: {body.reason or '미작성'}"
+        )
+        background_tasks.add_task(
+            _notify_user_async,
+            affected_user.id,
+            "invigilation_swap_request",
+            req.id,
+            message,
+        )
 
     wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
     total_steps = len(wf.steps) if wf else 0
@@ -1560,6 +1728,12 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
     from core.change_logger import log_entry_update
     from sqlalchemy import select
 
+    # ── 0. 감독 스왑 분기 (2026-09-19 신규) ────────────────────────────
+    # 감독 교체 신청(request_type="invigilation")은 TimetableEntry 가 아닌
+    # InvigilationAssignment 의 teacher_id 를 맞바꾸므로 여기서 별도 처리.
+    if req.request_type == "invigilation":
+        return _apply_invigilation_swap(db, req)
+
     # ── 0. 연쇄 교체 분기 (신규) ──────────────────────────────────────
     if req.steps:
         return _apply_chain_swap_changes(db, req)
@@ -1732,6 +1906,85 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
         # 양쪽 version 모두 증가
         partner.version = (partner.version or 0) + 1
         log_entry_update(db, partner, partner_before)
+
+
+def _apply_invigilation_swap(db: Session, req: TimetableChangeRequest) -> None:
+    """
+    최종 승인된 감독 스왑 신청을 InvigilationAssignment 에 반영합니다
+    (2026-09-19 신규, 요구사항 8).
+
+    두 감독 배정의 teacher_id 를 상호 교환합니다. 신청 시점 스냅샷
+    (change_snapshot) 과 현재 DB 상태를 비교하여 결재 기간 중 다른 변경
+    (관리자 수동 배정, 다른 스왑 승인)이 있었으면 409 로 차단합니다 —
+    수업 스왑의 충돌 감지와 동일한 안전장치입니다.
+
+    변경 이력을 TimetableChangeLog 에 남기지 않는 이유:
+      TimetableChangeLog 는 TimetableEntry 전용 테이블입니다. 감독 변경은
+      신청 레코드 자체의 approval_history(결재 이력 JSON) + 승인 알림으로
+      추적하며, 별도 로그 테이블을 추가하지 않습니다 (설계 단계 합의).
+
+    호출 위치: _apply_request_changes() — review_request() 의 DB 트랜잭션 안.
+    raise HTTPException 은 트랜잭션 롤백을 유발하므로 안전합니다.
+
+    Args:
+        db: SQLAlchemy 세션
+        req: 최종 승인된 감독 스왑 신청 (request_type="invigilation")
+    """
+    from sqlalchemy import select
+
+    # ── 1. 두 배정을 FOR UPDATE 로 잠금 ───────────────────────────────
+    # 최종 승인 적용 중 다른 트랜잭션이 같은 슬롯을 수정하지 못하게 합니다.
+    # SQLite 에서는 no-op, PostgreSQL 에서는 실제 행 잠금입니다.
+    a1 = db.execute(
+        select(InvigilationAssignment)
+        .where(InvigilationAssignment.id == req.invigilation_assignment_id)
+        .with_for_update()
+    ).scalars().first()
+    a2 = db.execute(
+        select(InvigilationAssignment)
+        .where(InvigilationAssignment.id == req.swap_partner_invigilation_id)
+        .with_for_update()
+    ).scalars().first()
+
+    if a1 is None or a2 is None:
+        _logger.error(
+            "감독 스왑 적용 실패 — 배정 없음 (a1=%s, a2=%s). 요청 ID=%s",
+            req.invigilation_assignment_id,
+            req.swap_partner_invigilation_id,
+            req.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="감독 배정이 결재 기간 중 삭제되었습니다. 신청을 다시 제출해 주세요.",
+        )
+
+    # ── 2. 스냅샷 충돌 감지 ────────────────────────────────────────────
+    # 신청 이후 어느 한쪽이라도 교사가 바뀌었다면(수동 배정·다른 스왑 승인)
+    # 이 신청의 전제가 무너진 것이므로 적용하지 않고 409 를 반환합니다.
+    if req.change_snapshot:
+        try:
+            snap = json.loads(req.change_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            snap = {}
+        my_snap = snap.get("my_assignment", {})
+        partner_snap = snap.get("partner_assignment", {})
+        if (my_snap.get("teacher_id") != a1.teacher_id
+                or partner_snap.get("teacher_id") != a2.teacher_id):
+            _logger.warning(
+                "감독 스왑 충돌 감지 — 요청 ID=%s. 스냅샷=(%s, %s), 현재=(%s, %s)",
+                req.id, my_snap.get("teacher_id"), partner_snap.get("teacher_id"),
+                a1.teacher_id, a2.teacher_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "감독 배정이 결재 기간 중 변경되었습니다. "
+                    "신청을 취소하고 최신 상태로 다시 신청해 주세요."
+                ),
+            )
+
+    # ── 3. 감독 교사 상호 교환 ─────────────────────────────────────────
+    a1.teacher_id, a2.teacher_id = a2.teacher_id, a1.teacher_id
 
 
 def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:

@@ -25,4 +25,9 @@ from shared.models import (  # noqa: F401
     ApprovalWorkflow,
     ApprovalStep,
     ChangeRequestStep,  # 2026-06-20 추가: 연쇄 교체 단계 모델
+    Exam,               # 2026-09-19 추가: 시험 시간표 + 감독 시간표 지원
+    ExamPeriod,
+    ExamEntry,
+    InvigilationAssignment,
+    InvigilationConstraint,
 )

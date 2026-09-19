@@ -1,6 +1,6 @@
 # 학교 시간표 관리 시스템
 
-**FastAPI 서버 + PyQt6 관리자 프로그램 + PyQt6 교사 프로그램**으로 구성된 3-프로그램 분산 아키텍처입니다. 서버 컴퓨터에서 FastAPI 백엔드가 24시간 데이터를 관리하고, 교감·일과계는 관리자 프로그램으로 시간표를 생성·편집·승인하며, 일반 교사는 교사 프로그램으로 시간표를 조회하고 교체 신청을 제출합니다. 실시간 공동 채팅창이 두 프로그램 모두에 내장되어 있으며, 변경 신청 과정에서 피교사의 사전 동의를 받는 워크플로우를 지원합니다.
+**FastAPI 서버 + PyQt6 관리자 프로그램 + PyQt6 교사 프로그램**으로 구성된 3-프로그램 분산 아키텍처입니다. 서버 컴퓨터에서 FastAPI 백엔드가 24시간 데이터를 관리하고, 교감·일과계는 관리자 프로그램으로 시간표를 생성·편집·승인하며, 일반 교사는 교사 프로그램으로 시간표를 조회하고 교체 신청을 제출합니다. 실시간 공동 채팅창이 두 프로그램 모두에 내장되어 있으며, 변경 신청 과정에서 피교사의 사전 동의를 받는 워크플로우를 지원합니다. 시험기간마다 수작업으로 작성하던 **시험 시간표(과목 배치)**와 **시험 감독 시간표(교사 배정)**도 자동 배치·자동 배정 기능으로 시스템에서 처리합니다.
 
 ---
 
@@ -19,6 +19,7 @@
    - 2.9 [채팅 및 공지](#29-채팅-및-공지)
    - 2.10 [피교사 동의 및 알림 시스템](#210-피교사-동의-및-알림-시스템)
    - 2.11 [연쇄 교체(chain swap)](#211-연쇄-교체chain-swap)
+   - 2.12 [시험 관리 (시험 시간표 / 시험 감독 시간표)](#212-시험-관리-시험-시간표--시험-감독-시간표)
 3. [데이터 연결성 설계](#3-데이터-연결성-설계)
 4. [설치 및 실행 방법](#4-설치-및-실행-방법)
 5. [상세 사용 설명](#5-상세-사용-설명)
@@ -31,6 +32,7 @@
 12. [장점과 한계](#12-장점과-한계)
 13. [코드 품질 개선 이력](#13-코드-품질-개선-이력-2026-06-13)
 14. [한계 해소 이력](#14-한계-해소-이력-2026-06-20)
+15. [시험 기능 추가](#15-시험-기능-추가-2026-09-19)
 
 ---
 
@@ -45,9 +47,9 @@
 | 프로그램 | 실행 위치 | 주요 역할 |
 |---|---|---|
 | **① FastAPI 서버** | 서버 컴퓨터 (24시간 상시 가동) | DB 관리, API 제공, 실시간 채팅 허브, 알림 중계 |
-| **② 관리자 프로그램** | 일과계·교감 PC | **일과계(admin)**: 편제·교사·교과 등록, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별) |
-| | | **교감(vice_principal)**: 시간표 열람(읽기 전용), 변경 신청 승인/거절 (워크플로우 설정에 따름) |
-| **③ 교사 프로그램** | 교사 PC | 시간표 조회, 교체 신청 제출·결과 확인, 피교사 동의/거절, 알림 수신 |
+| **② 관리자 프로그램** | 일과계·교감 PC | **일과계(admin)**: 편제·교사·교과 등록, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별), 시험 관리 |
+| | | **교감(vice_principal)**: 시간표 열람(읽기 전용), 감독 시간표 열람, 변경 신청 승인/거절 (워크플로우 설정에 따름) |
+| **③ 교사 프로그램** | 교사 PC | 시간표 조회, 교체 신청 제출·결과 확인, 피교사 동의/거절, 알림 수신, 내 감독 조회·감독 불가/스왑 신청 |
 
 서버 컴퓨터를 분리하는 이유는 업무용 PC를 24시간 켜놓기 어렵고, 다른 작업 중에 시간표 데이터가 의도치 않게 영향을 받을 수 있기 때문입니다. 모든 데이터는 서버의 PostgreSQL에서 중앙 관리됩니다.
 
@@ -57,10 +59,10 @@
 
 | 역할 | 코드상 role 값 | 권한 요약 |
 |---|---|---|
-| **일과계 선생님** | `admin` | **전체 관리**: 편제(학년·반·교실)·교사·교과목 CRUD, 계정 관리, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별) |
-| **교감 선생님** | `vice_principal` | **읽기 전용 + 승인 권한**: 시간표 열람(편집 불가), 변경 신청 승인/거절 (워크플로우 설정에 따름). 편제·계정·일정 수정 불가 |
+| **일과계 선생님** | `admin` | **전체 관리**: 편제(학년·반·교실)·교사·교과목 CRUD, 계정 관리, 시간표 생성·직접 수정, 결재 라인 설정, 변경 신청 승인 (워크플로우 설정에 따라 단계별), 시험 관리(생성·과목 배치·감독 배정·게시) |
+| **교감 선생님** | `vice_principal` | **읽기 전용 + 승인 권한**: 시간표 열람(편집 불가), 감독 시간표 열람, 변경 신청 승인/거절 (워크플로우 설정에 따름). 편제·계정·일정 수정 불가 |
 | **교무부장** | `department_head` | **읽기 전용 + 승인 권한**: 시간표 열람(편집 불가), 변경 신청 승인/거절 (워크플로우 설정에 따름). 3단계 이상 결재 라인에서 중간 승인자로 참여 가능 |
-| **교사** | `teacher` | 시간표 조회, 변경 신청 제출, 피교사 동의/거절. 편집·승인 권한 없음 |
+| **교사** | `teacher` | 시간표 조회, 변경 신청 제출, 피교사 동의/거절, 내 감독 조회·감독 불가/스왑 신청. 편집·승인 권한 없음 |
 
 서버 컴퓨터를 분리하는 이유는 업무용 PC를 24시간 켜놓기 어렵고, 다른 작업 중에 시간표 데이터가 의도치 않게 영향을 받을 수 있기 때문입니다. 모든 데이터는 서버의 PostgreSQL에서 중앙 관리됩니다.
 
@@ -451,6 +453,111 @@ A교사의 **월3 수학**과 B교사의 **화2 영어**를 맞바꾸고 싶지�
 
 ---
 
+### 2.12 시험 관리 (시험 시간표 / 시험 감독 시간표)
+
+#### 2.12.1 배경
+
+시험기간마다 일과계 선생님이 Excel과 종이 대장으로 수작업 작성해 오던 두 문서를 시스템으로 대체합니다.
+
+1. **시험 시간표(ExamEntry)**: 날짜×교시×학년 칸에 시험 과목을 배치. 자동 배치 + 셀 더블클릭 수동 편집 병행.
+2. **시험 감독 시간표(InvigilationAssignment)**: 교시×반마다 감독 교사를 배정. 하드 제약 검증 + 감독 횟수 균등 분배로 자동 배정.
+
+#### 2.12.2 시험 생성 및 교시 규칙
+
+시험(`Exam`)은 초안(draft) 상태로 생성되며, 이름·유형(중간/기말/모의)·대상 학년·날짜 범위를 입력합니다. 시험 생성 시 날짜 범위에 맞춰 교시(`ExamPeriod`)가 자동 생성됩니다.
+
+교시 시간표 규칙:
+
+```
+08:30 1교시 시작 → 시험 시간(기본 50분) → 종료령과 동시 종료
+  → 쉬는 시간(기본 10분) → 준비령(다음 교시 시작 5분 전) → 다음 교시
+```
+
+- 하루 교시 수(기본 3교시), 1교시 시작 시각(기본 08:30), 쉬는 시간(기본 10분), 준비령(기본 5분), 시험 시간(기본 50분)은 시험별로 직접 입력 가능합니다.
+- 학교급(고등학교/중학교)은 표기 수준의 설정이며 기능 차이는 없습니다.
+- 하루 최대 과목 수(기본 3) 제한이 시험 과목 배치에 적용됩니다.
+
+시험은 `draft`(초안) → `published`(게시) 2단계 상태로 관리됩니다. **게시 전에만** 과목 배치·감독 배정·규칙 변경이 가능하며, 게시하면 전 교사에게 "시험 게시" 알림이 전송되고 이후에는 편집할 수 없습니다. 시험 시간표·감독 시간표 조회는 게시된 시험만 대상으로 하므로, 초안 작업 중인 내용이 교사 앱에 노출되지 않습니다.
+
+#### 2.12.3 시험 과목 자동 배치
+
+`POST /exams/{id}/generate-entries` 가 대상 학년별로 시험 과목을 교시 칸에 자동 배치합니다.
+
+- 대상 학년의 반들에 배정된 과목 집합(`SubjectClassAssignment`, 학기 일치)을 학년별로 독립 배치
+- 같은 학년에서 과목당 하루 1회, 하루 최대 과목 수 상한 준수
+- 칸이 부족하면 `(False, 오류 메시지)` 반환 — 교시 수 또는 날짜 범위를 늘려야 함
+
+관리자 프로그램의 "시험 시간표" 페이지에서 배치 결과를 날짜×교시×학년 그리드로 확인하고, 셀을 더블클릭해 과목을 수동으로 편집할 수 있습니다.
+
+#### 2.12.4 감독 교사 자동 배정
+
+`POST /exams/{id}/assign-invigilations` 가 교시×반마다 감독 교사를 자동 배정합니다.
+
+**조 구성**: 학급의 학생 수가 20명 이상이면 2인 1조(감독 슬롯 2개), 미만이면 1인 감독입니다. 학급 편제 화면에서 반별 학생 수를 관리합니다.
+
+**하드 제약** — 다음에 해당하는 교사는 후보에서 제외됩니다.
+
+| 제약 | 설명 |
+|------|------|
+| 수업 병행 | 일부 학년만 시험을 보는 교시에, 해당 교시에 일반 시간표 수업이 있는 교사는 배제 (일반 시간표 교차 검증) |
+| 담임 반 | 담임 교사는 본인 담임 반의 감독 금지 (시험별 규칙 ON/OFF 가능, 기본 ON) |
+| 담당 과목 | 해당 교시에 치르는 시험 과목의 담당 교사 감독 금지 (시험별 규칙 ON/OFF 가능, 기본 ON) |
+| 감독 불가 신청 | 교사가 사전 제출하고 승인된 날짜/교시(또는 하루 전체)는 배제 |
+| 동시간 중복 | 같은 교시에 이미 다른 반 감독으로 배정된 교사는 배제 |
+
+**소프트 점수** — 하드 제약을 통과한 후보 중 점수가 가장 높은 교사를 선택합니다.
+
+- `-10 × 누적 감독 횟수`: 전 교사 감독 횟수 균등 분배의 핵심 가중치
+- `-3 × 같은 날 감독 횟수`: 특정 교사에게 감독이 몰리는 것 방지
+- `+2 × 인접 교시 감독`: 가능하면 이동을 최소화하도록 유도
+
+랜덤 재시작(10회)으로 감독 횟수 분산이 가장 작은 해를 채택합니다. 후보 교사가 부족한 슬롯은 미배정(NULL)으로 남기고 안내 메시지를 표시하며, 관리자 프로그램에서 수동 배정으로 보완할 수 있습니다.
+
+배정 결과는 교시×반 그리드로 표시되며 2인조는 "(1조)/(2조)"로 구분됩니다. 교사별 감독 횟수 요약이 하단에 표시되어 분배 공평성을 한눈에 확인할 수 있고, PDF/CSV로 내보낼 수 있습니다.
+
+#### 2.12.5 감독 불가 신청 (교사)
+
+교사 프로그램의 "내 감독" 페이지에서 시험 기간 중 감독이 불가한 날짜·교시(또는 하루 전체)와 사유를 제출할 수 있습니다. 신청 목록에는 게시된 시험과 **게시 예정인 초안 시험도 포함**되어, 시험 게시 전 미리 불가 신청을 받아 자동 배정에 반영하는 실무 순서를 지원합니다.
+
+```
+시험 등록(초안) → 교사 감독 불가 신청 → 일과계 승인 → 감독 자동 배정 → 시험 게시
+```
+
+#### 2.12.6 감독 교체(스왑) 신청 — 기존 승인 라인 재사용
+
+게시된 감독표에서 자기 감독 슬롯과 다른 교사의 감독 슬롯을 맞바꾸는 신청은 기존 변경 신청 승인 라인을 그대로 재사용합니다. `TimetableChangeRequest` 에 `request_type="invigilation"` 로 저장되며 수업 시간표와 구분됩니다.
+
+```
+교사 A가 스왑 신청 (내 슬롯 + 상대 슬롯 + 사유)
+  → 상대 교사 B에게 동의 요청 알림 (consent pending)
+  → B가 알림 패널에서 동의 → 일과계 1차 승인 → 교감 최종 승인
+  → 두 감독 배정의 teacher_id 상호 교환, 양쪽 교사에게 확정 알림
+```
+
+수업 교체와 마찬가지로 신청 시점의 두 배정 상태 스냅샷을 저장하고 최종 승인 시 비교하여, 결재 기간 중 배정이 변경된 경우 거부(충돌)됩니다. 관리자 프로그램의 신청 목록에는 "감독 교체" 유형으로 표시됩니다.
+
+#### 2.12.7 시험 알림
+
+시험 기능에 다음 알림 유형이 추가되었습니다.
+
+| type | 대상 | 내용 |
+|------|------|------|
+| `exam_published` | 전 교사 | 시험이 게시되었음을 안내 |
+| `invigilation_assigned` | 감독 배정 교사 | 시험 게시 시 본인 감독 일정 안내 |
+| `invigilation_swap_request` | 스왑 상대 교사 | 감독 교체 동의 요청 (동의/거절 버튼 표시) |
+| `invigilation_swap_approved` / `invigilation_swap_rejected` | 신청자·상대 | 스왑 승인/거절 결과 |
+| `invigilation_constraint_approved` / `invigilation_constraint_rejected` | 신청 교사 | 감독 불가 신청 승인/거절 결과 |
+
+#### 2.12.8 권한별 화면 구성
+
+| 역할 | 시험 관련 페이지 | 권한 |
+|------|------------------|------|
+| 일과계 | 시험 관리 / 시험 시간표 / 감독 시간표 | 생성·배치·배정·불가 신청 승인·게시 전체 |
+| 교감 | 감독 시간표(열람) | 읽기 전용 |
+| 교사 | 내 감독 | 내 감독 조회, 감독 불가 신청, 감독 스왑 신청 |
+
+---
+
 ## 3. 데이터 연결성 설계
 
 이 프로그램의 가장 중요한 아키텍처 설계 중 하나는 **페이지 간 데이터 연결성**입니다. 기초 데이터 입력 페이지(0~3번)에서 입력한 내용이 후속 페이지의 콤보박스와 테이블에 실시간으로 반영되도록 설계되어 있습니다.
@@ -592,8 +699,8 @@ export SERVER_URL="http://서버IP:8000"   # 서버 주소 지정
 python -m admin_app.main
 ```
 
-- **일과계 선생님**은 `admin` 계정으로 로그인합니다. 편제·교사·교과 등록 → 시간표 자동 생성 → 결재 라인 설정 → 변경 신청 승인 등 관리 기능 전체를 사용할 수 있습니다. 사이드바에는 9개 페이지가 표시됩니다.
-- **교감 선생님**은 `vice_principal` 계정으로 로그인합니다. 사이드바에는 시간표 열람(읽기 전용)과 변경 신청 승인 페이지만 표시됩니다(3개 페이지). 편제나 계정 관리 기능은 접근할 수 없습니다.
+- **일과계 선생님**은 `admin` 계정으로 로그인합니다. 편제·교사·교과 등록 → 시간표 자동 생성 → 결재 라인 설정 → 변경 신청 승인 → 시험 관리(생성·과목 배치·감독 배정·게시) 등 관리 기능 전체를 사용할 수 있습니다. 사이드바에는 12개 페이지가 표시됩니다.
+- **교감 선생님**은 `vice_principal` 계정으로 로그인합니다. 사이드바에는 시간표 열람(읽기 전용), 변경 신청 승인, 감독 시간표(열람) 페이지가 표시됩니다(4개 페이지). 편제나 계정 관리 기능은 접근할 수 없습니다.
 
 ### 4단계: 교사 프로그램 실행 (교사 PC에서)
 
@@ -602,7 +709,7 @@ export SERVER_URL="http://서버IP:8000"
 python -m teacher_app.main
 ```
 
-관리자가 생성해준 `teacher` 계정으로 로그인합니다. 시간표 조회, 교체 신청, 공동 채팅창, 알림 수신, 피교사 동의 처리를 할 수 있습니다.
+관리자가 생성해준 `teacher` 계정으로 로그인합니다. 시간표 조회, 교체 신청, 공동 채팅창, 알림 수신, 피교사 동의 처리, 내 감독 조회·감독 불가/스왑 신청을 할 수 있습니다.
 
 > **참고:** `SERVER_URL` 환경 변수를 설정하지 않으면 기본값 `http://localhost:8000`을 사용합니다. 서버와 앱을 같은 PC에서 실행하는 경우에는 별도 설정이 불필요합니다.
 
@@ -684,10 +791,10 @@ school_timetable/
 ├── build_installer.py            # PyInstaller 기반 설치 프로그램 빌드 스크립트
 │
 ├── shared/                       # 서버·관리자 앱·교사 앱이 함께 사용하는 공통 모듈
-│   ├── models.py                 # SQLAlchemy ORM 모델 16개 (정식 정의 위치)
+│   ├── models.py                 # SQLAlchemy ORM 모델 23개 (정식 정의 위치)
 │   │                             #   기존 12개 + User(로그인 계정) + ChatMessage(채팅 메시지)
 │   │                             #   + ApprovalWorkflow(결재 워크플로우) + ApprovalStep(결재 단계)
-│   │                             #   + Notification(알림)
+│   │                             #   + Notification(알림) + InvigilationAssignment 등 시험 5개
 │   ├── schemas.py                # Pydantic v2 요청/응답 스키마 (API 계약 정의)
 │   └── api_client.py             # 동기 HTTP + WebSocket 클라이언트 (ApiClient 클래스)
 │                                 #   ※ 블로킹 호출 — PyQt6에서는 반드시 QThread 안에서 사용
@@ -700,6 +807,8 @@ school_timetable/
 │       ├── auth.py               # /auth/* 엔드포인트: 로그인, 현재 사용자 조회, 계정 CRUD (admin 전용)
 │       ├── setup.py              # /setup/* 엔드포인트: 학년·반·교사·교과목·교실 CRUD (admin 전용)
 │       ├── timetable.py          # /timetable/* 엔드포인트: 학기·시간표 조회·생성, 변경 신청·승인·이력, 제안, 동의
+│       │                         #   감독 스왑 신청(request_type="invigilation")도 이 라우터에서 처리
+│       ├── exams.py              # /exams/* 엔드포인트: 시험 CRUD·과목 배치·감독 배정·불가 신청·게시
 │       ├── chat.py               # /chat/* 엔드포인트: REST 메시지 조회 + WebSocket 실시간 채팅
 │       │                         #   ConnectionManager 싱글턴이 접속 목록을 관리하며 브로드캐스트 처리
 │       ├── notifications.py    # /notifications/* 엔드포인트: 알림 조회·읽음·삭제
@@ -710,17 +819,22 @@ school_timetable/
 │   ├── main.py                   # 앱 진입점: Qt 초기화 → 로그인 창
 │   └── ui/
 │       ├── login_window.py       # 로그인 창 (role=admin 계정만 허용)
-│       ├── admin_main_window.py  # 메인 창: 역할별 사이드바 (일과계 9페이지 / 교감 3페이지) + 우측 채팅 패널(280px)
-│       └── chat_panel.py         # 채팅 패널. _WsThread(QThread)로 WebSocket 수신, 공지 체크박스 포함
+│       ├── admin_main_window.py  # 메인 창: 역할별 사이드바 (일과계 12페이지 / 교감 4페이지) + 우측 채팅 패널(280px)
+│       ├── chat_panel.py         # 채팅 패널. _WsThread(QThread)로 WebSocket 수신, 공지 체크박스 포함
+│       └── exam/                 # 시험 관리 페이지 (2026-09-19 신규)
+│           ├── exam_setup_page.py        # 시험 관리: 시험 CRUD + 감독 불가 신청 승인
+│           ├── exam_grid_page.py         # 시험 시간표: 날짜×교시×학년 그리드, 자동 배치 + 수동 편집
+│           └── invigilation_grid_page.py # 감독 시간표: 교시×반 그리드, 자동 배정 + 횟수 요약 + PDF/CSV 내보내기
 │
 ├── teacher_app/                  # 일반 교사 전용 데스크톱 앱
 │   ├── main.py                   # 앱 진입점: Qt 초기화 → 로그인 창
 │   └── ui/
 │       ├── login_window.py       # 로그인 창 (role 무관 허용; admin 계정도 로그인 가능하나 교사 기능만 제공)
-│       ├── teacher_main_window.py# 메인 창: 3-페이지 네비게이션 + 우측 채팅 패널 + 알림 벨 아이콘
+│       ├── teacher_main_window.py# 메인 창: 4-페이지 네비게이션 + 우측 채팅 패널 + 알림 벨 아이콘
 │       ├── my_timetable.py       # 내 시간표: 로그인한 교사의 주간 시간표 그리드
 │       ├── class_timetable.py    # 학반별 시간표: 학반 선택 → 주간 그리드 조회
 │       ├── request_widget.py     # 교체 신청: 내 시간표 슬롯 선택 + 사유 입력 → 신청 제출·목록 조회
+│       ├── my_invigilation_page.py # 내 감독: 내 감독 시간표 조회 + 감독 스왑/불가 신청 (2026-09-19 신규)
 │       ├── suggest_dialog.py     # 제안 다이얼로그: 교체/교환 대안 제시 및 변경 신청 제출
 │       └── notification_panel.py # 알림 패널: 알림 목록, 동의/거절 버튼, 읽음 처리
 │
@@ -730,8 +844,14 @@ school_timetable/
 │
 ├── core/
 │   ├── generator.py              # Greedy + Random Restart 시간표 생성 알고리즘 (최대 30회 재시도)
+│   ├── exam_scheduler.py         # 시험 과목 자동 배치 + 감독 자동 배정 알고리즘 (하드 제약 + 소프트 점수)
 │   ├── change_logger.py          # TimetableChangeLog 기록 헬퍼 함수
 │   └── project_manager.py        # 프로젝트 저장(JSON export) / 불러오기(import + ID 재매핑, 14개 테이블)
+│
+├── migrations/                   # Alembic 마이그레이션
+│   └── versions/
+│       ├── 2026_06_20_0000_baseline.py    # baseline 마커 (실제 테이블 생성은 create_all 담당)
+│       └── 2026_09_19_0001_exam_feature.py # 시험 5개 테이블 + 감독 스왑 확장 컬럼 + student_count
 │
 ├── ui/                           # 관리자 앱이 재사용하는 공통 PyQt6 위젯
 │   ├── setup/
@@ -752,6 +872,7 @@ school_timetable/
 │   │   └── history_view.py       # 변경 이력 조회 (필터링, 상세 보기)
 │   └── export/
 │       ├── pdf_export.py         # ReportLab 기반 PDF 출력
+│       ├── exam_export.py       # 시험 시간표/감독 시간표 PDF·CSV 내보내기 (_find_korean_font 재사용)
 │       └── neis_export.py        # openpyxl 기반 NEIS Excel 출력
 │
 ├── installer/
@@ -766,14 +887,19 @@ school_timetable/
     ├── test_project_manager.py   # 프로젝트 저장/불러오기 단위 테스트 (16개)
     ├── test_generator.py         # 시간표 생성기 단위 테스트
     ├── test_chat.py              # 채팅 API 단위 테스트
-    └── test_change_request.py    # 변경 신청·동의·제안 단위 테스트
+    ├── test_change_request.py    # 변경 신청·동의·제안 단위 테스트
+    ├── test_exam_models.py      # 시험 모델 단위 테스트 (교시 자동 생성, 조 구성 규칙 등)
+    ├── test_exam_api.py         # 시험 API 단위 테스트 (CRUD·배치·배정·게시 권한)
+    ├── test_exam_scheduler.py   # 시험 알고리즘 단위 테스트 (하드 제약 5종, 횟수 균등 분배)
+    ├── test_invigilation_swap.py # 감독 스왑 E2E 테스트 (제출→동의→1차→최종 승인)
+    └── test_exam_ui.py          # 시험 관리·감독 UI 테스트 (pytest-qt offscreen)
 ```
 
 ---
 
 ## 7. 데이터베이스 구조 (ERD)
 
-이 프로그램은 18개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
+이 프로그램은 23개의 ORM 모델을 사용합니다(`shared/models.py` 기준). 각 모델의 관계와 역할을 이해하면 데이터가 어떻게 연결되는지 파악하기 쉽습니다.
 
 ```
 AcademicTerm (학기)
@@ -786,6 +912,23 @@ Grade (학년)
                   ├── subject_id         → Subject (교과목)
                   ├── teacher_id         → Teacher (담당 교사)
                   └── preferred_room_id  → Room (선호 교실, nullable)
+
+Exam (시험)
+  ├── term_id              → AcademicTerm
+  ├── target_grade_ids     → Grade 목록 (JSON 배열)
+  ├──< ExamPeriod (시험 교시, cascade)
+  │        └── unique(exam_id, exam_date, period)
+  ├──< ExamEntry (시험 시간표 칸, unique(exam_id, period_id, grade_id))
+  │        ├── period_id  → ExamPeriod
+  │        ├── grade_id    → Grade
+  │        └── subject_id → Subject
+  ├──< InvigilationAssignment (감독 배정, unique(period_id, school_class_id, pair_index))
+  │        ├── period_id        → ExamPeriod
+  │        ├── school_class_id  → SchoolClass
+  │        └── teacher_id       → Teacher (nullable — 미배정 슬롯)
+  └──< InvigilationConstraint (감독 불가 신청)
+           ├── teacher_id → Teacher
+           └── period = None → 하루 전체
 
 Teacher (교사)
   ├── homeroom_class_id → SchoolClass (담임 학반, nullable)
@@ -825,7 +968,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 |------|-----------|
 | `AcademicTerm` | year, semester, start_date, end_date, is_current |
 | `Grade` | grade_number |
-| `SchoolClass` | grade_id, class_number, display_name |
+| `SchoolClass` | grade_id, class_number, display_name, student_count |
 | `Subject` | name, short_name, color |
 | `Teacher` | name, max_daily_classes, homeroom_class_id |
 | `SubjectClassAssignment` | term_id, school_class_id, subject_id, teacher_id, weekly_hours, preferred_room_id |
@@ -833,7 +976,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 | `TeacherConstraint` | teacher_id, day_of_week, period, constraint_type (unavailable/preferred/avoid) |
 | `SchoolEvent` | term_id, title, start_date, end_date, event_type, description |
 | `TimetableChangeLog` | timetable_entry_id, school_class_id, change_type, details(JSON), changed_at |
-| `TimetableChangeRequest` | timetable_entry_id, requester_id, reason, status, approved_by, new_subject_id, new_teacher_id, new_room_id, swap_partner_entry_id, affected_teacher_id, consent_status, consent_by_user_id, consent_at |
+| `TimetableChangeRequest` | timetable_entry_id, request_type(timetable/invigilation), invigilation_assignment_id, swap_partner_invigilation_id, requester_id, reason, status, approved_by, new_subject_id, new_teacher_id, new_room_id, swap_partner_entry_id, affected_teacher_id, consent_status, consent_by_user_id, consent_at, change_snapshot |
 | `ChangeRequestStep` | request_id, step_order, step_type(swap/change), source_entry_id, target_entry_id, new_subject_id, new_teacher_id, new_room_id, affected_teacher_id, consent_status, consent_by_user_id, consent_at, change_snapshot |
 | `Room` | name, room_type |
 | `User` | username, password_hash, role (admin/teacher), teacher_id, is_active |
@@ -841,6 +984,11 @@ ApprovalWorkflow (결재 워크플로우 정의)
 | `Notification` | user_id, type, change_request_id, message, is_read, created_at |
 | `ApprovalWorkflow` | name, description, is_active, created_at |
 | `ApprovalStep` | workflow_id, step_order, role_required, step_name |
+| `Exam` | term_id, name, exam_type(midterm/final/mock), school_level(high/middle), target_grade_ids(JSON), start_date, end_date, first_period_start, periods_per_day, break_minutes, prep_minutes, exam_minutes, max_subjects_per_day, ban_homeroom_invigilation, ban_own_subject, status(draft/published) |
+| `ExamPeriod` | exam_id, exam_date, period, start_time, end_time |
+| `ExamEntry` | exam_id, period_id, grade_id, subject_id, is_manual |
+| `InvigilationAssignment` | exam_id, period_id, school_class_id, teacher_id, pair_index |
+| `InvigilationConstraint` | exam_id, teacher_id, exam_date, period(nullable=하루 전체), reason, status, reviewed_by, reviewed_at |
 
 ### FK 의존성 계층 (Tier)
 
@@ -866,6 +1014,13 @@ ApprovalWorkflow (결재 워크플로우 정의)
 | 5 | 하위 | `change_request_steps` | timetable_change_requests, timetable_entries, subjects, teachers, users |
 | 5 | 독립 | `approval_workflows` | 없음 |
 | 5 | 하위 | `approval_steps` | approval_workflows |
+| 5 | 하위 | `exams` | academic_terms |
+| 6 | 시험 | `exam_periods` | exams |
+| 6 | 시험 | `invigilation_constraints` | exams, teachers |
+| 7 | 시험 최하위 | `exam_entries` | exams, exam_periods, grades, subjects |
+| 7 | 시험 최하위 | `invigilation_assignments` | exams, exam_periods, school_classes, teachers |
+
+> 시험 테이블(exams~)은 프로젝트 저장/불러오기 대상에서 제외되어 있으며 Tier 표는 참고용입니다.
 
 - **INSERT(Import)**: Tier 0 → 4 순서로 처리 (상위 데이터가 먼저 존재해야 FK 생성 가능)
 - **DELETE(초기화)**: Tier 4 → 0 순서로 처리 (하위 데이터를 먼저 삭제해야 FK 위반 방지)
@@ -929,7 +1084,7 @@ ApprovalWorkflow (결재 워크플로우 정의)
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -v
 ```
 
-### 테스트 파일 구성 (총 37개 테스트)
+### 테스트 파일 구성 (총 94개 테스트)
 
 **`tests/test_feedback.py`** — 피드백 다이얼로그 테스트 (8개)
 - 다이얼로그 제목, 카테고리 옵션, 빈 메시지 경고, 저장 동작, 파일 누적, 손상된 파일 처리, 공백 메시지 경고
@@ -937,21 +1092,41 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests/ -v
 **`tests/test_project_manager.py`** — 프로젝트 저장/불러오기 테스트 (16개)
 - 빈 DB export, 전체 테이블 export, 날짜/NULL 직렬화, 왕복 복원, 관계 유지, 멱등성, 비연속 ID 재매핑, 기존 데이터 대체, 롤백, 검증, Unicode 보존
 
-**`tests/test_generator.py`** — 시간표 생성기 테스트 (4개)
-- 학기별 필터링, 교사 불가 시간 준수, `max_daily_classes=1` 준수, 과배정 시 실패
+**`tests/test_generator.py`** — 시간표 생성기 테스트 (7개)
+- 학기별 필터링, 교사 불가 시간 준수, `max_daily_classes=1` 준수, 과배정 시 실패, preferred/avoid 소프트 제약 반영
 
 **`tests/test_chat.py`** — 채팅 API 테스트 (3개)
 - 메시지 작성/조회, `joinedload`에 의한 N+1 쿼리 방지, 공지 작성 권한 검증
 
-**`tests/test_change_request.py`** — 변경 신청·동의·제안 테스트 (6개)
+**`tests/test_change_request.py`** — 변경 신청·동의·제안 테스트 (8개)
 - 교실 변경은 동의 불필요
 - 교사 변경은 동의 필요
 - 동의 완료 전 관리자 승인 불가
 - 피교사 동의 → 일과계 승인 → 교감 최종 승인
 - 피교사 거절 시 최종 거절
 - 교환 제안 및 교환 신청 동의
+- 단일 변경·교환 각각 결재 기간 중 동시 수정 시 409 Conflict 감지
 
-모든 `test_project_manager.py` 테스트는 인메모리 SQLite(`sqlite:///:memory:`)에서 실행되며 파일 입출력은 `tempfile`을 사용하여 실제 디스크 파일 동작을 검증합니다. API 테스트(`test_chat.py`, `test_change_request.py`)는 임시 파일 SQLite를 사용하며, FastAPI `TestClient`의 lifespan과 fixture가 동일한 DB를 공유하도록 구성되어 있습니다.
+**`tests/test_exam_models.py`** — 시험 모델 테스트 (11개)
+- Exam 생성 시 ExamPeriod 자동 생성 (날짜 범위×교시 수)
+- 교시 시간 계산 (쉬는 시간·준비령·시험 시간), 게시 상태 전환, 대상 학년 JSON, 유니크 제약
+
+**`tests/test_exam_api.py`** — 시험 API 테스트 (12개)
+- 시험 CRUD 권한, 과목 자동 배치·수동 편집, 감독 자동 배정·수동 교체, 감독 불가 신청 승인, 게시 후 편집 차단, 교사 초안 시험 조회 (include_draft)
+
+**`tests/test_exam_scheduler.py`** — 시험 알고리즘 테스트 (10개)
+- 하드 제약 5종 (수업 병행, 담임 반, 담당 과목, 감독 불가, 동시간 중복)
+- 감독 횟수 균등 분배, 학생 19/20명 경계값 조 구성, 과목 배치 상한
+
+**`tests/test_invigilation_swap.py`** — 감독 스왑 E2E 테스트 (7개)
+- 스왑 신청 제출 → 상대 교사 동의 → 일과계 1차 승인 → 교감 최종 승인 → 감독표 반영 전 과정
+- 스냅샷 충돌 감지, 알림 생성
+
+**`tests/test_exam_ui.py`** — 시험 UI 테스트 (12개, pytest-qt offscreen)
+- 관리자 앱: 시험 관리 폼·시험 시간표 그리드·감독 시간표 그리드 동작, 메인 창 12페이지 스택, 교감 읽기 전용
+- 교사 앱: 내 감독 조회·스왑/불가 신청 제출 본문, 알림 유형 라벨·동의 버튼, 관리자 신청 목록 "감독 교체" 표시·적용
+
+모든 `test_project_manager.py` 테스트는 인메모리 SQLite(`sqlite:///:memory:`)에서 실행되며 파일 입출력은 `tempfile`을 사용하여 실제 디스크 파일 동작을 검증합니다. API 테스트는 임시 파일 SQLite를 사용하며, FastAPI `TestClient`의 lifespan과 fixture가 동일한 DB를 공유하도록 구성되어 있습니다.
 
 ---
 
@@ -1250,3 +1425,26 @@ alembic stamp head   # 현재 DB를 head 로 마킹 (재적용 없이)
   - `test_generate_uses_avoid_slot_when_only_option`
   - `test_single_change_detects_concurrent_modification`
   - `test_swap_detects_partner_concurrent_modification`
+
+---
+
+## 15. 시험 기능 추가 (2026-09-19)
+
+시험기간 수작업 문서(시험 시간표·감독 시간표)를 시스템으로 대체하는 기능을 추가했습니다. 상세 내용은 2.12절을 참고하세요.
+
+### 15.1 변경 요약
+
+| 영역 | 변경 |
+|------|------|
+| 데이터 모델 | `Exam`, `ExamPeriod`, `ExamEntry`, `InvigilationAssignment`, `InvigilationConstraint` 5개 신규 + `TimetableChangeRequest`에 감독 스왑 필드(`request_type`, `invigilation_assignment_id`, `swap_partner_invigilation_id`) 확장 + `SchoolClass.student_count` 추가 |
+| 마이그레이션 | `migrations/versions/2026_09_19_0001_exam_feature.py` (batch_alter_table로 `timetable_change_requests.timetable_entry_id` NOT NULL 완화 포함) |
+| 서버 | `server/api/exams.py` 신규 라우터 (CRUD·배치·배정·불가 신청·게시), `server/api/timetable.py`에 감독 스왑 분기 추가 |
+| 알고리즘 | `core/exam_scheduler.py` — 과목 자동 배치 + 감독 자동 배정 (하드 제약 5종 + 소프트 점수 기반 횟수 균등 분배) |
+| 관리자 앱 | `admin_app/ui/exam/` 3페이지 (시험 관리·시험 시간표·감독 시간표), 메인 창 12페이지, 교감용 감독 시간표(열람), `ui/export/exam_export.py` |
+| 교사 앱 | "내 감독" 페이지 (내 감독 조회·스왑/불가 신청), 감독 관련 알림 유형 |
+| 알림 | `exam_published`, `invigilation_assigned`, `invigilation_swap_request` 등 시험 알림 유형 추가 |
+
+### 15.2 테스트 결과
+
+- 기존 42개 테스트 + 신규 52개 테스트 = 총 94개, 모두 통과
+- 신규 테스트 파일: `test_exam_models.py`(11), `test_exam_api.py`(12), `test_exam_scheduler.py`(10), `test_invigilation_swap.py`(7), `test_exam_ui.py`(12)

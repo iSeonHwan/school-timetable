@@ -30,6 +30,7 @@ from server.api.timetable import router as timetable_router
 from server.api.chat import router as chat_router, start_cleanup_task
 from server.api.workflow import router as workflow_router
 from server.api.notifications import router as notifications_router
+from server.api.exams import router as exams_router
 
 
 @asynccontextmanager
@@ -268,6 +269,37 @@ def _migrate_columns():
             "ALTER TABLE timetable_entries ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
             "timetable_entries.version",
         ),
+        # ── school_classes — 시험 감독 조 구성용 학생 수 (2026-09-19) ─────────
+        # 20명 이상 반은 감독 2인 1조로 배정하는 기준 데이터.
+        (
+            "ALTER TABLE school_classes ADD COLUMN student_count INTEGER",
+            "school_classes.student_count",
+        ),
+        # ── timetable_change_requests — 감독 스왑 신청 지원 (2026-09-19) ──────
+        # 기존 수업 시간표 변경 신청 파이프라인을 감독 스왑에 재사용하기 위한
+        # 신청 유형/감독 배정 FK 컬럼. timetable_entry_id 의 NOT NULL 완화는
+        # ALTER 로 불가능하므로 Alembic(0002_exam_feature) 가 담당합니다.
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN request_type VARCHAR(20) NOT NULL DEFAULT 'timetable'",
+            "timetable_change_requests.request_type",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN invigilation_assignment_id INTEGER REFERENCES invigilation_assignments(id)",
+            "timetable_change_requests.invigilation_assignment_id",
+        ),
+        (
+            "ALTER TABLE timetable_change_requests ADD COLUMN swap_partner_invigilation_id INTEGER REFERENCES invigilation_assignments(id)",
+            "timetable_change_requests.swap_partner_invigilation_id",
+        ),
+        # ── change_request_steps — 연쇄 감독 스왑 확장 (2026-09-19) ────────────
+        (
+            "ALTER TABLE change_request_steps ADD COLUMN source_invigilation_id INTEGER REFERENCES invigilation_assignments(id)",
+            "change_request_steps.source_invigilation_id",
+        ),
+        (
+            "ALTER TABLE change_request_steps ADD COLUMN target_invigilation_id INTEGER REFERENCES invigilation_assignments(id)",
+            "change_request_steps.target_invigilation_id",
+        ),
     ]
 
     db = get_session()
@@ -294,17 +326,29 @@ def _ensure_alembic_state():
 
     동작:
       1. alembic_version 테이블이 없으면 — 아직 Alembic 관리를 시작하지 않은 DB.
-         create_all() + _migrate_columns() 가 이미 스키마를 최신 상태로 맞췄으므로
-         `alembic stamp head` 로 현재를 baseline 으로 마킹합니다.
-         (마이그레이션 파일을 재실행하지 않음 — 안전)
+         - 스키마가 이미 최신이면(신규 DB: create_all() 로 생성됨)
+           `alembic stamp head` 로 현재를 head 로 마킹합니다.
+         - 스키마가 구버전이면(레거시 DB) `alembic upgrade head` 로
+           마이그레이션을 실행한 뒤 head 로 전환합니다.
       2. alembic_version 테이블이 있으면 — 이미 Alembic 관리 중인 DB.
          `alembic upgrade head` 로 미적용 revision 이 있으면 적용.
+
+    2026-09-19 보강 — "stamp head 가 마이그레이션을 건너뛰는" 문제 방지:
+      기존 구현은 alembic_version 이 없으면 무조건 stamp head 였습니다.
+      이 방식은 스키마 변경이 "ADD COLUMN" 뿐이던 시기에는 안전했습니다
+      (_migrate_columns() 가 컬럼을 보충하므로). 그러나 0002_exam_feature
+      부터는 "NOT NULL 완화"처럼 ALTER 로 불가능한 변경이 포함되어,
+      레거시 DB 가 stamp head 로 넘어가면 완화가 영원히 누락됩니다.
+      이를 방지하기 위해 stamp 전에 스키마 신선도를 검사합니다:
+      timetable_change_requests.timetable_entry_id 가 아직 NOT NULL 이면
+      마이그레이션이 필요한 구버전 스키마로 판단하여 upgrade head 를
+      실행합니다 (0002 는 존재 검사로 멱등하므로 안전).
 
     이중 보호 설계:
       - _migrate_columns() 는 레거시 DB 의 누락 컬럼을 보충 (하위 호환).
       - Alembic 은 그 이후의 스키마 변경을 버전 관리.
       - 신규 DB: create_all() 이 테이블 생성 → stamp head 로 초기화.
-      - 레거시 DB: _migrate_columns() 가 컬럼 보충 → stamp head 로 전환.
+      - 레거시 DB: 필요 시 upgrade head 로 마이그레이션 → 전환.
       - 이미 Alembic 관리 중인 DB: upgrade head 로 최신 revision 적용.
 
     실패 시 영향 최소화:
@@ -333,9 +377,26 @@ def _ensure_alembic_state():
         # DB URL 을 env.py 가 환경 변수에서 읽도록 그대로 둠
 
         if not alembic_initialized:
-            # 신규/레거시 DB — 현재를 baseline 으로 마킹
-            command.stamp(cfg, "head")
-            print("[마이그레이션] Alembic baseline 으로 마킹했습니다 (stamp head).")
+            # ── 스키마 신선도 검사 (2026-09-19 보강) ────────────────────────
+            # timetable_entry_id 가 NOT NULL 이면 0002 마이그레이션이 필요한
+            # 구버전 스키마입니다. stamp 대신 upgrade 를 실행해야
+            # NOT NULL 완화가 적용됩니다.
+            schema_is_stale = False
+            if insp.has_table("timetable_change_requests"):
+                for col in insp.get_columns("timetable_change_requests"):
+                    if col["name"] == "timetable_entry_id" and not col.get("nullable", True):
+                        schema_is_stale = True
+                        break
+
+            if schema_is_stale:
+                # 레거시 DB — 마이그레이션 실행 (각 revision 은 존재 검사로 멱등).
+                # upgrade 가 alembic_version 테이블까지 자동 생성합니다.
+                command.upgrade(cfg, "head")
+                print("[마이그레이션] 구버전 스키마 감지 — Alembic upgrade 를 실행했습니다.")
+            else:
+                # 신규 DB (create_all() 로 이미 최신) — 현재를 head 로 마킹
+                command.stamp(cfg, "head")
+                print("[마이그레이션] Alembic baseline 으로 마킹했습니다 (stamp head).")
         else:
             # 이미 Alembic 관리 중 — 미적용 revision 이 있으면 적용
             command.upgrade(cfg, "head")
@@ -458,6 +519,7 @@ app.include_router(timetable_router)
 app.include_router(chat_router)
 app.include_router(workflow_router)
 app.include_router(notifications_router)
+app.include_router(exams_router)
 
 
 @app.get("/", tags=["상태"])
