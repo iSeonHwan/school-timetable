@@ -5,7 +5,11 @@ GET    /chat/messages              — 최근 메시지 목록 (REST, 접속 시
 POST   /chat/messages              — 메시지 전송 (REST fallback)
 DELETE /chat/messages/{message_id} — 단일 메시지 삭제 (일과계·교감만 가능)
 DELETE /chat/messages/cleanup      — 보관 기간 지난 메시지 일괄 삭제 (일과계만 가능)
-WS     /chat/ws?token=...          — 실시간 WebSocket 채팅
+WS     /chat/ws (Authorization: Bearer <token> 헤더로 인증) — 실시간 WebSocket 채팅
+       # 문서 수정: 예전에는 "?token=" 쿼리 파라미터로 표기되어 있었으나,
+       # 실제 구현(아래 websocket_chat)과 shared/api_client.py 클라이언트는
+       # 토큰을 URL 이 아닌 Authorization 헤더로 전송합니다(서버·프록시 로그에
+       # 토큰이 남지 않도록 하기 위한 보안 설계 — websocket_chat() 문서 참조).
 
 WebSocket 프로토콜:
   클라이언트 → 서버:
@@ -279,11 +283,12 @@ def cleanup_old_messages(
 # WebSocket 접속을 허용할 Origin 목록 (환경 변수 WS_ALLOWED_ORIGINS 로 설정, 쉼표 구분)
 # Cross-Site WebSocket Hijacking (CSWSH) 공격을 방지합니다.
 # 빈 문자열로 설정하면 Origin 검증을 건너뜁니다 (개발 환경용).
+# set 으로 저장해 아래에서 "완전 일치" 비교(정확히 이 값과 같은가)를 하기 위함입니다.
 _ALLOWED_WS_ORIGINS = os.getenv(
     "WS_ALLOWED_ORIGINS",
     "http://localhost:8000,http://127.0.0.1:8000",
 ).split(",")
-_ALLOWED_WS_ORIGINS = [o.strip() for o in _ALLOWED_WS_ORIGINS if o.strip()]
+_ALLOWED_WS_ORIGINS = {o.strip() for o in _ALLOWED_WS_ORIGINS if o.strip()}
 
 
 # ── WebSocket 엔드포인트 ───────────────────────────────────────────────────
@@ -309,9 +314,14 @@ async def websocket_chat(ws: WebSocket):
     # 웹 브라우저는 WebSocket 연결 시 Origin 헤더를 자동으로 전송하므로,
     # 승인된 출처 목록과 비교하여 허용되지 않은 출처의 접속을 차단합니다.
     # 데스크톱 앱(PyQt)은 Origin 헤더를 보내지 않으므로 origin 이 없으면 검증을 건너뜁니다.
+    # 버그 수정(보안): 예전 코드는 origin.startswith(a) 로 비교했습니다. "시작 문자열이
+    # 같은가"는 "같은 출처인가"와 다릅니다 — 예를 들어 허용 목록에 "http://school.com"이
+    # 있으면 공격자가 등록한 "http://school.com.attacker.com" 도 startswith 를 통과해
+    # CSWSH 방어가 무력화됩니다. Origin 헤더 값은 항상 "scheme://host[:port]" 형태이며
+    # 경로가 없으므로, 완전 일치(집합 멤버십 검사)만으로 충분하고 더 안전합니다.
     origin = ws.headers.get("origin")
     if origin:
-        allowed = any(origin.startswith(a) for a in _ALLOWED_WS_ORIGINS)
+        allowed = origin in _ALLOWED_WS_ORIGINS
         if not allowed:
             await ws.close(code=4003)
             return
@@ -373,6 +383,17 @@ async def websocket_chat(ws: WebSocket):
 
             elif etype == "delete":
                 # ── 메시지 삭제 요청 (WebSocket 경로, 일과계·교감만 가능) ──
+                # 버그 수정(보안): user 는 접속 시점에 한 번만 로드되어 연결이 끊기기
+                # 전까지 이 파이썬 객체를 계속 재사용합니다. SQLAlchemy Session 은
+                # 같은 PK 를 다시 조회해도 identity map 캐시를 반환하므로, 관리자가
+                # 연결 유지 중인 이 사용자를 강등/비활성화해도 이 변수는 자동으로
+                # 갱신되지 않습니다 — 즉 예전 코드는 강등/비활성화된 사용자가 연결을
+                # 끊기 전까지 계속 관리자 권한으로 메시지를 삭제할 수 있었습니다.
+                # 권한이 필요한 액션 직전에 DB 최신 상태로 명시적으로 새로고침합니다.
+                db.refresh(user)
+                if not user.is_active:
+                    await ws.close(code=4001)
+                    return
                 if user.role not in ("admin", "vice_principal"):
                     await ws.send_text(json.dumps({
                         "type": "error",
@@ -409,9 +430,16 @@ async def websocket_chat(ws: WebSocket):
                 if not content:
                     await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "빈 메시지"}}))
                     continue
-                if is_ann and user.role not in ("admin", "vice_principal"):
-                    await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "공지는 관리자(일과계·교감)만 가능합니다."}}))
-                    continue
+                if is_ann:
+                    # 버그 수정(보안): 위 "delete" 분기와 동일한 이유로, 공지 발송 권한도
+                    # 접속 시점의 캐시된 role 이 아니라 최신 DB 상태로 재검증합니다.
+                    db.refresh(user)
+                    if not user.is_active:
+                        await ws.close(code=4001)
+                        return
+                    if user.role not in ("admin", "vice_principal"):
+                        await ws.send_text(json.dumps({"type": "error", "payload": {"detail": "공지는 관리자(일과계·교감)만 가능합니다."}}))
+                        continue
 
                 msg = _save_message(db, user, content, is_ann)
                 out = _to_out(msg, db).model_dump()

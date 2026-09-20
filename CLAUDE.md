@@ -65,8 +65,8 @@ Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 - `deps.py` — FastAPI dependencies: DB session injection, auth/role guards
 - `api/auth.py` — Login, user management (일과계 only)
 - `api/setup.py` — Grade/class/subject/room/teacher CRUD (쓰기: 일과계 only, 읽기: 일과계·교감)
-- `api/timetable.py` — Timetable query/generation, 2-step change request approval (일과계 1차 → 교감 최종)
-- `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감, 삭제: 일과계 only, 자동 정리: CHAT_RETENTION_DAYS 기준)
+- `api/timetable.py` — Timetable query/generation, change request approval via a configurable multi-step `ApprovalWorkflow` (기본값: 일과계 1차 → 교감 최종, `api/workflow.py` 로 단계 수·역할 재구성 가능)
+- `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감, 개별 메시지 삭제: 일과계·교감, 일괄 정리: 일과계 only, 자동 정리 주기: CHAT_RETENTION_DAYS 기준)
 
 ### Admin App (`admin_app/`)
 - Reuses existing `ui/` widgets (setup pages, timetable views, history)
@@ -108,9 +108,9 @@ Reads/writes `db_config.json`. Supports SQLite (default) and PostgreSQL.
 | GET | `/timetable/entries` | any | Timetable entries |
 | POST | `/timetable/generate` | scheduler | Auto-generate (일과계 only) |
 | GET | `/timetable/logs` | admin+vp | Change history |
-| GET/POST | `/timetable/requests` | any | Change requests |
-| PATCH | `/timetable/requests/{id}` | admin+vp | 2-step approve/reject (일과계 1차 → 교감 최종) |
+| GET/POST | `/timetable/requests` | any (teacher role sees only requests involving them) | Change requests |
+| PATCH | `/timetable/requests/{id}` | any, enforced dynamically per active `ApprovalWorkflow` step's `role_required` | 신청 시점에 정해진 결재 라인(기본값: 일과계 1차 → 교감 최종, 관리자가 자유롭게 재구성 가능) |
 | GET | `/chat/messages` | any | Chat history |
 | DELETE | `/chat/messages/{id}` | admin+vp | Delete single message |
 | DELETE | `/chat/messages` | scheduler | Cleanup old messages (일과계 only) |
-| WS | `/chat/ws?token=` | any | Real-time chat (chat, delete, cleanup events) |
+| WS | `/chat/ws` (Authorization: Bearer 헤더로 인증) | any | Real-time chat (chat, delete, cleanup events) |

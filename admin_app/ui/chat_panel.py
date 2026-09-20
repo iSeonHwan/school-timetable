@@ -92,7 +92,9 @@ class _MessageBubble(QFrame):
     일반 메시지: 파란색 사용자명 + 시간 + 내용
     공지 메시지: 노란 배경 + 왼쪽 주황 테두리 + 🔔 아이콘
 
-    일과계(admin) 로그인 시 우측 상단에 삭제 버튼(✕)이 표시됩니다.
+    일과계(admin)·교감(vice_principal) 로그인 시 우측 상단에 삭제 버튼(✕)이
+    표시됩니다 (버그 수정 — 예전에는 일과계에게만 표시되어 서버가 실제로
+    허용하는 교감의 삭제 권한이 UI 에서 쓸 수 없었습니다).
     """
 
     # 상위 ChatPanel 에서 연결할 시그널
@@ -102,7 +104,7 @@ class _MessageBubble(QFrame):
         """
         Args:
             msg: ChatMessageOut 형식의 딕셔너리 (id, username, content, is_announcement, created_at)
-            can_delete: True 이면 삭제 버튼(✕) 을 표시합니다 (일과계 전용).
+            can_delete: True 이면 삭제 버튼(✕) 을 표시합니다 (일과계·교감).
         """
         super().__init__(parent)
         self._msg_id = msg.get("id", 0)
@@ -140,7 +142,7 @@ class _MessageBubble(QFrame):
 
         header.addStretch()
 
-        # 일과계(admin) 에게만 삭제 버튼 표시
+        # 일과계(admin)·교감(vice_principal) 에게 삭제 버튼 표시
         if can_delete:
             btn_del = QPushButton("✕")
             btn_del.setFixedSize(18, 18)
@@ -188,10 +190,10 @@ class ChatPanel(QWidget):
     """
     공동 채팅 패널 — 관리자·교사 모두 사용.
 
-    사용자 역할에 따른 기능 차이:
+    사용자 역할에 따른 기능 차이 (server/api/chat.py 의 서버 권한과 동일하게 맞춤):
       - teacher              : 메시지 열람·전송만 가능
-      - vice_principal (교감): 메시지 열람·전송 + 공지 발송 가능
-      - admin (일과계)      : 메시지 열람·전송 + 공지 발송 + 메시지 삭제 + 일괄 정리 가능
+      - vice_principal (교감): 메시지 열람·전송 + 공지 발송 + 개별 메시지 삭제 가능
+      - admin (일과계)      : 위 전부 + 오래된 메시지 일괄 정리 가능
 
     Signals:
         notification_received(dict): 서버에서 "notification" WebSocket 이벤트 수신 시 발송.
@@ -211,8 +213,16 @@ class ChatPanel(QWidget):
         self._client = client
         self._is_admin = is_admin  # 공지 전송 가능 여부 (일과계·교감)
 
-        # 일과계(admin role)만 메시지 삭제 가능
-        self._can_delete = (client.role == "admin")
+        # 버그 수정: 서버(server/api/chat.py)는 개별 메시지 삭제(DELETE
+        # /chat/messages/{id}, WebSocket "delete" 이벤트)를 일과계(admin)와
+        # 교감(vice_principal) 모두에게 허용합니다. 하지만 예전 코드는 이
+        # 단일 플래그 하나를 "admin role 인가"로만 계산해 삭제 버튼 표시와
+        # 일괄 정리 버튼 표시 둘 다에 재사용했습니다. 그 결과 서버는 허용하는데
+        # 교감 계정에서는 개별 메시지 삭제 버튼(✕)이 아예 보이지 않는
+        # 권한 표시 불일치가 있었습니다. 두 기능의 서버 권한 범위가 다르므로
+        # (일괄 정리는 일과계 전용, 개별 삭제는 일과계+교감) 플래그도 분리합니다.
+        self._can_delete_single = client.role in ("admin", "vice_principal")
+        self._can_cleanup = (client.role == "admin")
 
         self._ws_thread: _WsThread | None = None
         self._bubbles: list[_MessageBubble] = []  # 현재 표시 중인 버블 목록
@@ -246,7 +256,7 @@ class ChatPanel(QWidget):
         h_layout.addStretch()
 
         # 일과계 전용: 오래된 메시지 일괄 정리 버튼
-        if self._can_delete:
+        if self._can_cleanup:
             btn_cleanup = QPushButton("🗑 정리")
             btn_cleanup.setFixedHeight(24)
             btn_cleanup.setToolTip(
@@ -388,7 +398,7 @@ class ChatPanel(QWidget):
         """
         bubble = _MessageBubble(
             msg,
-            can_delete=self._can_delete,
+            can_delete=self._can_delete_single,
             parent=self._msg_container,
         )
         bubble.delete_requested.connect(self._delete_message)

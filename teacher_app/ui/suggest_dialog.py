@@ -377,6 +377,14 @@ class SuggestDialog(QDialog):
             self._all_entries = self._client.get(
                 "/timetable/entries", term_id=current["id"]
             )
+            # 버그 수정: TimetableEntryOut 스키마(shared/schemas.py)에는애초에
+            # "school_class_name" 필드가 없습니다(subject_name/teacher_name/room_name만
+            # 존재). 그래서 e.get('school_class_name', ...) 은 항상 빈 문자열을
+            # 반환해 콤보박스 라벨의 반 이름 칸이 늘 "[]"로 비어 보였습니다.
+            # teacher_app/ui/class_timetable.py, admin_app/ui/exam/invigilation_grid_page.py
+            # 와 동일하게 /setup/classes 를 별도로 조회해 id → display_name 맵을 만듭니다.
+            classes = self._client.get("/setup/classes")
+            class_map = {c["id"]: c.get("display_name") for c in classes}
             day_names = {1: "월", 2: "화", 3: "수", 4: "목", 5: "금"}
             self.cb_target.clear()
             self.cb_manual_source.clear()
@@ -386,11 +394,12 @@ class SuggestDialog(QDialog):
                 if e["id"] == self._entry_id:
                     continue
                 day = day_names.get(e["day_of_week"], "?")
+                class_name = class_map.get(e["school_class_id"]) or f"반#{e['school_class_id']}"
                 label = (
                     f"{day}요일 {e['period']}교시 — "
                     f"{e.get('subject_name', '?')} "
                     f"({e.get('teacher_name', '')}) "
-                    f"[{e.get('school_class_name', '') or ''}]"
+                    f"[{class_name}]"
                 )
                 self.cb_target.addItem(label, e["id"])
                 self.cb_manual_target.addItem(label, e["id"])

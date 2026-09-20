@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from shared.models import (
     User, Teacher, Grade, SchoolClass, Subject, Exam, ExamPeriod, ExamEntry,
-    InvigilationAssignment, InvigilationConstraint,
+    InvigilationAssignment, InvigilationConstraint, TimetableEntry,
 )
 from shared.schemas import (
     ExamCreate, ExamOut, ExamUpdate, ExamPeriodOut,
@@ -401,7 +401,17 @@ def list_invigilations(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """감독표 전체 조회(관리자용) — 교시 날짜순 정렬 + 조인 정보 주입."""
+    """
+    감독표 전체 조회 — 교시순 정렬 + 조인 정보 주입.
+
+    주석 수정: 예전 주석은 "관리자용"이라 적혀 있었지만 실제로는 게시된
+    시험에 한해 일반 교사도 호출합니다(teacher_app 의 감독 스왑 화면에서
+    상대 슬롯을 고르려면 전체 감독표가 필요하기 때문 — my_invigilation_page.py
+    의 _load_all_invigilations 참고). GET /timetable/entries 도 동일하게
+    전체 교직원 시간표를 인증된 모든 사용자에게 공개하는 것이 이 시스템의
+    기존 설계이므로, 이 엔드포인트도 그 원칙을 따릅니다. 접근 제어는
+    _check_teacher_visibility() 로 "게시 전 시험은 교사에게 숨김"만 담당합니다.
+    """
     exam = _get_exam_or_404(db, exam_id)
     _check_teacher_visibility(user, exam)
     rows = (
@@ -445,9 +455,28 @@ def update_invigilation(
 
     게시 후에도 허용하는 이유: 시험 당일 질병·출장 등으로 감독 교체는
     게시 이후에 발생하는 정상 업무이기 때문입니다. (시험표 과목 수정과 다름)
-    같은 교시에 이미 다른 반을 감독 중인 교사는 배정 거부(409).
+    같은 교시에 이미 다른 반을 감독 중인 교사, 또는 그 시간에 정규 수업이
+    있는 교사는 배정 거부(409).
+
+    2026-09-20 버그 수정:
+      1. FOR UPDATE 로 배정 행을 잠급니다. 예전에는 db.get() 으로 잠금 없이
+         읽고 그대로 갱신해, 두 관리자가 거의 동시에 같은 슬롯을 서로 다른
+         교사로 바꾸면 나중에 커밋한 쪽이 먼저 것을 조용히 덮어썼습니다
+         (lost update). 아래에서 두 번째 요청이 첫 번째 커밋을 기다리도록
+         직렬화합니다.
+      2. 정규 수업(TimetableEntry) 충돌도 검사합니다. 예전에는 다른
+         InvigilationAssignment 끼리만 비교해서, 이 교사가 그 시간에 이미
+         정규 수업이 있는지는 확인하지 않았습니다. 자동 배정
+         (core.exam_scheduler._collect_hard_constraints 의 "busy" 제약)은
+         이를 이미 검사하는데, 수동 배정 API 만 이 하드 제약을 우회할 수
+         있었던 불일치를 여기서 맞춥니다.
     """
-    a = db.get(InvigilationAssignment, assignment_id)
+    from sqlalchemy import select
+    a = db.execute(
+        select(InvigilationAssignment)
+        .where(InvigilationAssignment.id == assignment_id)
+        .with_for_update()
+    ).scalars().first()
     if a is None:
         raise HTTPException(404, "감독 배정을 찾을 수 없습니다.")
 
@@ -467,6 +496,29 @@ def update_invigilation(
         )
         if conflict is not None:
             raise HTTPException(409, "이 교사는 같은 교시에 이미 다른 반 감독이 배정되어 있습니다.")
+
+        # 정규 수업 충돌 검사 (버그 수정) — core.exam_scheduler 의 "수업 병행"
+        # 하드 제약과 동일한 규칙: 시험 교시(exam_date, period)를 일반
+        # 시간표의 (day_of_week, period) 로 매핑해 그 시간에 이미 정규 수업이
+        # 있는지 확인합니다. dow 계산은 exam_scheduler._slot_is_allowed 와
+        # 동일하게 파이썬 weekday()(월=0) + 1 = TimetableEntry.day_of_week(월=1).
+        period = db.get(ExamPeriod, a.period_id)
+        if period is not None:
+            dow = period.exam_date.weekday() + 1
+            busy_entry = (
+                db.query(TimetableEntry)
+                .filter(
+                    TimetableEntry.teacher_id == new_teacher_id,
+                    TimetableEntry.day_of_week == dow,
+                    TimetableEntry.period == period.period,
+                )
+                .first()
+            )
+            if busy_entry is not None:
+                raise HTTPException(
+                    409,
+                    "이 교사는 해당 시간에 정규 수업이 있어 감독을 배정할 수 없습니다.",
+                )
     a.teacher_id = new_teacher_id
     db.commit()
     db.refresh(a)

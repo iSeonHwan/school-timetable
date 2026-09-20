@@ -9,6 +9,8 @@ GET/POST/DELETE /setup/teachers
 GET/POST/DELETE /setup/teachers/{id}/constraints
 GET/POST/DELETE /setup/assignments
 """
+from typing import Optional  # list_assignments() 의 term_id: Optional[int] 파라미터에 필요 (누락 시 FastAPI가
+                              # OpenAPI 스키마/요청 파싱을 위해 타입을 평가할 때 NameError 로 크래시)
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from shared.models import (

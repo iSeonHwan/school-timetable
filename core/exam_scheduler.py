@@ -16,6 +16,7 @@
 두 함수 모두 (bool, message) 튜플을 반환합니다 (generator.py 와 동일한 규약).
 """
 import json
+import logging
 import random
 from datetime import datetime, timedelta
 
@@ -55,6 +56,8 @@ DEFAULT_STUDENT_COUNT = 30
 # 2인 1조 판단 기준 학생 수 (요구사항 5: 20명 이상 → 2인 1조)
 PAIR_THRESHOLD = 20
 
+_logger = logging.getLogger(__name__)
+
 
 def rebuild_exam_periods(session: Session, exam: Exam) -> int:
     """
@@ -88,14 +91,24 @@ def rebuild_exam_periods(session: Session, exam: Exam) -> int:
     created = 0
     d = exam.start_date
     while d <= exam.end_date:
-        for p in range(1, exam.periods_per_day + 1):
-            start_dt = base + timedelta(minutes=(p - 1) * slot_minutes)
-            end_dt = start_dt + timedelta(minutes=exam.exam_minutes)
-            session.add(ExamPeriod(
-                exam_id=exam.id, exam_date=d, period=p,
-                start_time=start_dt.time(), end_time=end_dt.time(),
-            ))
-            created += 1
+        # 버그 수정: 예전 코드는 start_date~end_date 사이의 모든 달력일에
+        # 교시를 생성해, 시험 기간이 주말을 걸치면(예: 금요일 시작 ~ 다음 주
+        # 월요일 종료) 토·일요일에도 ExamPeriod 가 만들어졌습니다. 정규
+        # 시간표(TimetableEntry)는 평일(day_of_week 1~5)만 존재하므로, 주말
+        # 교시는 (1) 실제로 시험을 치르지 않는 날에 감독/시험표가 생성되고,
+        # (2) _collect_hard_constraints 의 busy/weekly_unavailable 매핑이
+        # 주말 dow(6, 7)에 대해서는 아무 데이터도 없어 제약이 사실상 전부
+        # 무력화된 상태로 배정이 진행되는 이중의 문제가 있었습니다.
+        # weekday() 는 월=0 ~ 금=4, 토=5, 일=6 이므로 5 미만(평일)만 생성합니다.
+        if d.weekday() < 5:
+            for p in range(1, exam.periods_per_day + 1):
+                start_dt = base + timedelta(minutes=(p - 1) * slot_minutes)
+                end_dt = start_dt + timedelta(minutes=exam.exam_minutes)
+                session.add(ExamPeriod(
+                    exam_id=exam.id, exam_date=d, period=p,
+                    start_time=start_dt.time(), end_time=end_dt.time(),
+                ))
+                created += 1
         d += timedelta(days=1)
     return created
 
@@ -107,11 +120,25 @@ def _parse_target_grade_ids(exam: Exam) -> list[int]:
     빈 리스트의 의미: "해당 학기의 전체 학년이 시험 대상".
     JSON 파싱 실패 시 안전하게 빈 리스트(전체 학년)로 처리합니다 —
     잘못 저장된 데이터 때문에 시험 기능 전체가 막히지 않도록 하기 위함.
+
+    버그 수정: 이 폴백은 "파싱 실패 → 전체 학년 대상"으로 범위를 오히려
+    넓히는 쪽으로 조용히 동작합니다. 예를 들어 특정 학년(예: 3학년)만
+    대상인 시험인데 target_grade_ids 데이터가 손상되면, 아무 로그도 없이
+    전체 학년이 그 시험의 대상이 되어 관계없는 학년까지 시험 시간표·감독
+    배정이 생성될 수 있습니다. 동작(빈 리스트 반환)은 기존과 동일하게
+    유지하되(하위 호환·가용성 우선이라는 원래 설계 의도 존중), 이 상황이
+    더 이상 "조용히" 지나가지 않도록 경고 로그를 남겨 원인 추적이 가능하게
+    합니다.
     """
     try:
         ids = json.loads(exam.target_grade_ids or "[]")
         return [int(i) for i in ids if isinstance(i, (int, str))]
     except (ValueError, TypeError):
+        _logger.warning(
+            "Exam(id=%s).target_grade_ids 파싱 실패 — 원본값=%r. "
+            "전체 학년을 대상으로 폴백합니다. 데이터 손상 여부를 확인하세요.",
+            getattr(exam, "id", None), exam.target_grade_ids,
+        )
         return []
 
 
@@ -271,15 +298,30 @@ def _build_slots(session: Session, exam: Exam, periods: list[ExamPeriod],
     return slots
 
 
-def _collect_hard_constraints(session: Session, exam: Exam, periods: list[ExamPeriod]):
+def _collect_hard_constraints(
+    session: Session, exam: Exam, periods: list[ExamPeriod], target_grades: list[int],
+):
     """
     감독 배정의 하드 제약 데이터를 사전 수집합니다.
+
+    Args:
+        target_grades: 이번 시험을 치르는 학년 ID 목록 (assign_invigilations 가
+            _parse_target_grade_ids() 로 계산한 값을 그대로 전달). 1번 제약
+            계산에서 "시험 보는 반"의 정규 수업을 제외하기 위해 필요합니다.
 
     제약 5종 (위반 시 해당 교사는 그 슬롯의 후보에서 완전 배제):
       1. 수업 병행(요구사항 6): 시험 치르지 않는 학년은 그 교시에도 수업이
          있으므로, 일반 시간표(TimetableEntry)에서 그 시간대에 수업 중인
          교사를 모두 배제합니다. 시험 교시 → 일반 교시는 1:1 매핑으로
          가정합니다 (시험 1교시 = 월~금 기준 같은 요일의 일반 1교시).
+         버그 수정: "시험 치르지 않는 학년은" 이라는 설계 의도와 달리, 예전
+         구현은 학년 구분 없이 (요일,교시) 가 일치하는 TimetableEntry 를 전부
+         "수업 중"으로 계산했습니다. 그런데 시험 보는 학년의 반은 시험 기간
+         동안 정규 수업이 열리지 않으므로(학생이 시험 응시 중), 그 반만
+         가르치는 교사는 실제로는 그 시간에 비어 있는데도 "수업 중"으로 잘못
+         집계되어 감독 후보에서 제외되었습니다(over-restriction → 감독 인력
+         부족, 미배정 슬롯 증가). target_grades 에 속한 반의 수업은 busy 계산에서
+         제외해 바로잡습니다.
       2. 담임 반 감독 금지(요구사항 2, ban_homeroom_invigilation):
          부정 행위 감독의 공정성을 위해 담임은 자기 반을 감독하지 않습니다.
       3. 담당 과목 시험 감독 금지(요구사항 2, ban_own_subject):
@@ -303,6 +345,15 @@ def _collect_hard_constraints(session: Session, exam: Exam, periods: list[ExamPe
     # 이므로 +1 보정이 필요합니다.
     dow_period_pairs = {(p.exam_date.weekday() + 1, p.period) for p in periods}
 
+    # 시험을 치르는 학년의 반 ID 집합 — 이 반들의 정규 수업은 시험 기간 동안
+    # 열리지 않으므로 busy 계산에서 제외해야 합니다 (위 1번 제약 버그 수정 참조).
+    exam_class_ids: set[int] = set()
+    if target_grades:
+        exam_class_ids = {
+            row[0] for row in
+            session.query(SchoolClass.id).filter(SchoolClass.grade_id.in_(target_grades)).all()
+        }
+
     busy: dict[tuple, set] = {}
     if dow_period_pairs:
         # 기간이 여러 주에 걸쳐도 (요일,교시) 조합 수는 적으므로
@@ -310,14 +361,16 @@ def _collect_hard_constraints(session: Session, exam: Exam, periods: list[ExamPe
         from sqlalchemy import or_, tuple_
         conds = [tuple_(TimetableEntry.day_of_week, TimetableEntry.period) == pair
                  for pair in dow_period_pairs]
-        rows = (
+        query = (
             session.query(
                 TimetableEntry.day_of_week, TimetableEntry.period, TimetableEntry.teacher_id
             )
             .filter(TimetableEntry.term_id == exam.term_id, or_(*conds))
-            .all()
         )
-        for dow, period, teacher_id in rows:
+        if exam_class_ids:
+            # 시험 보는 반의 정규 수업은 "수업 중"이 아니므로 제외 (버그 수정).
+            query = query.filter(TimetableEntry.school_class_id.notin_(exam_class_ids))
+        for dow, period, teacher_id in query.all():
             busy.setdefault((dow, period), set()).add(teacher_id)
 
     # ── 2. 담임 반 매핑 ────────────────────────────────────────────────────
@@ -558,7 +611,30 @@ def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
     if not slots:
         return False, "감독 슬롯이 없습니다."
 
-    hard = _collect_hard_constraints(session, exam, periods)
+    hard = _collect_hard_constraints(session, exam, periods, target_grades)
+
+    # ── 버그 수정: 담당 과목 감독 금지 제약의 전제 데이터 부재를 눈에 띄게 함 ──
+    # _slot_is_allowed() 의 3번 검사(담당 과목 시험 감독 금지)는
+    # hard["exam_subject_of"].get((period_id, grade_id)) 가 None 이면(=해당
+    # 시험 시간표(ExamEntry)가 아직 생성되지 않음) 조용히 검사를 건너뛰고
+    # 통과시킵니다. generate_exam_entries() 를 먼저 호출하지 않고
+    # assign_invigilations() 를 실행하면, "자기 과목 자기 반 감독 금지"라는
+    # 부정행위 방지 하드 제약을 검증할 데이터가 없어 사실상 적용되지 않습니다.
+    #
+    # 시험 시간표(ExamEntry) 생성과 감독 배정은 이 코드베이스에서 서로 독립된
+    # 선택 기능으로 설계되어 있어(시험 시간표 없이 감독만 배정하는 것도 정상
+    # 사용 흐름 — test_invigilation_grid_assign_and_summary 등에서 검증),
+    # "시험 시간표 없음"을 무조건 에러로 막으면 이 정상 흐름이 깨집니다.
+    # 그래서 동작은 바꾸지 않고(하위 호환 유지), 관리자가 이 상황을 알아챌 수
+    # 있도록 경고 로그만 남깁니다 — "조용히" 무력화되는 문제만 해소합니다.
+    if exam.ban_own_subject and not hard["exam_subject_of"]:
+        _logger.warning(
+            "Exam(id=%s) 의 ban_own_subject=True 이지만 ExamEntry(시험 시간표)가 "
+            "아직 생성되지 않아 '담당 과목 감독 금지' 제약을 검증할 수 없습니다. "
+            "이번 배정에서는 이 제약이 적용되지 않습니다. 이 제약을 실제로 "
+            "적용하려면 generate_exam_entries() 를 먼저 실행하세요.",
+            exam.id,
+        )
 
     # 랜덤 재시작 — 각 시도는 동점 후보/슬롯 순서를 다르게 하여
     # 다른 배정 결과를 만들고, 그중 품질이 가장 좋은 것을 채택합니다.

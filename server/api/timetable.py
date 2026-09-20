@@ -434,22 +434,80 @@ def list_logs(
 
 # ── 변경 신청 ──────────────────────────────────────────────────────────────
 
+def _request_involves_teacher(req: TimetableChangeRequest, teacher_id: Optional[int]) -> bool:
+    """
+    이 변경 신청이 지정한 교사와 관련이 있는지 판단합니다 (버그 수정, 정보 노출 방지).
+
+    "관련 있음"의 기준 — 아래 중 하나라도 해당되면 True:
+      - 본인이 대상 시간표 슬롯(또는 감독 배정)의 담당 교사인 경우
+      - 본인이 교환/연쇄 교체의 상대 슬롯(또는 감독 배정) 담당 교사인 경우
+      - 본인이 새로 배정될 교사(new_teacher_id)로 지정된 경우
+      - 본인이 동의 요청 대상(affected_teacher_id)인 경우 (부모 또는 자식 단계)
+      - 연쇄 교체의 각 단계(step)에서 위 조건 중 하나에 해당하는 경우
+
+    teacher_id 가 None(교사 계정에 연결된 교사 레코드가 없는 특수 계정)이면
+    어떤 신청과도 관련이 없다고 간주합니다.
+    """
+    if teacher_id is None:
+        return False
+
+    if req.affected_teacher_id == teacher_id or req.new_teacher_id == teacher_id:
+        return True
+    if req.timetable_entry is not None and req.timetable_entry.teacher_id == teacher_id:
+        return True
+    if req.swap_partner_entry is not None and req.swap_partner_entry.teacher_id == teacher_id:
+        return True
+    if req.invigilation_assignment is not None and req.invigilation_assignment.teacher_id == teacher_id:
+        return True
+    if req.swap_partner_invigilation is not None and req.swap_partner_invigilation.teacher_id == teacher_id:
+        return True
+
+    for step in (req.steps or []):
+        if step.affected_teacher_id == teacher_id or step.new_teacher_id == teacher_id:
+            return True
+        if step.source_entry is not None and step.source_entry.teacher_id == teacher_id:
+            return True
+        if step.target_entry is not None and step.target_entry.teacher_id == teacher_id:
+            return True
+        if step.source_invigilation is not None and step.source_invigilation.teacher_id == teacher_id:
+            return True
+        if step.target_invigilation is not None and step.target_invigilation.teacher_id == teacher_id:
+            return True
+
+    return False
+
+
 @router.get("/requests")
 def list_requests(
     status: Optional[str] = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """
     변경 신청 목록을 반환합니다.
 
     각 응답에 활성 워크플로우의 total_steps 를 주입하여
     클라이언트가 진행 상황(현재 단계/총 단계)을 표시할 수 있게 합니다.
+
+    보안(버그 수정): 예전 코드는 role 구분 없이 전체 학교의 모든 변경 신청을
+    반환했습니다. reason 필드는 자유 텍스트라 병가·공결 등 개인 사정이 담길 수
+    있고, 어떤 교사의 수업이 누구와 왜 바뀌는지도 모두 드러납니다. 시험 관련
+    /setup/teachers/{id}/constraints, exams.list_constraints 는 이미 teacher
+    역할에 본인 것만 필터링하는 동일한 원칙을 적용하고 있는데 이 엔드포인트만
+    빠져 있었습니다. teacher 역할은 본인과 관련된 신청만 보이도록 제한하고,
+    admin/vice_principal/department_head 등 관리 역할은 기존처럼 전체를 봅니다.
     """
     q = db.query(TimetableChangeRequest)
     if status:
         q = q.filter(TimetableChangeRequest.status == status)
     requests = q.order_by(TimetableChangeRequest.requested_at.desc()).all()
+
+    if current_user.role == "teacher":
+        requests = [
+            r for r in requests
+            if r.requested_by == current_user.username
+            or _request_involves_teacher(r, current_user.teacher_id)
+        ]
 
     wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
     total_steps = len(wf.steps) if wf else 0
@@ -498,6 +556,17 @@ def submit_request(
     entry = db.get(TimetableEntry, body.timetable_entry_id)
     if entry is None:
         raise HTTPException(404, "시간표 항목을 찾을 수 없습니다.")
+
+    # ── 보안: 신청 대상 슬롯의 소유권 검증 ──────────────────────────────
+    # /suggestions, /swap-paths 와 동일한 규칙(교사 역할은 본인 슬롯만 가능,
+    # 관리자/교감/교무부장은 제한 없음)을 여기에도 적용합니다.
+    # 이 검증이 없으면 교사 A 가 자신과 무관한 교사 B 의 슬롯(entry)을 대상으로
+    # 신청을 접수한 뒤, new_teacher_id 를 자기 자신(A)으로 지정해 동의자
+    # (affected_teacher_id)도 자기 자신이 되게 만들 수 있었습니다. 그러면
+    # B 는 알림조차 받지 못한 채 A 가 스스로 "동의"하고 일과계 승인만 거치면
+    # B 의 수업이 A 에게 넘어가는 권한 상승이 가능했습니다 — 아래 검증으로 차단.
+    if current_user.role == "teacher" and current_user.teacher_id != entry.teacher_id:
+        raise HTTPException(403, "본인의 수업 슬롯에 대해서만 변경을 신청할 수 있습니다.")
 
     # ── 연쇄 교체 신청 처리 (신규 분기) ──────────────────────────────────
     # body.steps 가 비어 있지 않은 경우 연쇄 교체로 분기합니다.
@@ -849,8 +918,15 @@ def _submit_chain_swap_request(
                     400, f"{idx}단계: target 슬롯(id={target.id})이 이미 다른 단계의 target 로 참여합니다."
                 )
             seen_as_target.add(target.id)
-            # 동의는 target 슬롯의 현재 교사에게 요청 (신청자 본인이 아닌 경우만)
-            if target.teacher_id != current_user.teacher_id:
+            # 동의 대상 결정 — 보안: source 슬롯도 신청자 본인 소유가 아닐 수 있으므로
+            # (예: 이전 단계에서 target 으로 등장해 이 단계의 source 가 된 경우가 아니라
+            # 처음부터 제3자의 슬롯을 마음대로 연쇄 교체에 끼워 넣는 경우), source 의
+            # 실제 담당 교사가 신청자 본인이 아니면 그 교사의 동의를 최우선으로 요구합니다.
+            # source 가 본인 소유일 때만 기존 로직대로 target 교사의 동의를 요구합니다.
+            if source.teacher_id != current_user.teacher_id:
+                affected_teacher_id = source.teacher_id
+                consent_status = "pending"
+            elif target.teacher_id != current_user.teacher_id:
                 affected_teacher_id = target.teacher_id
                 consent_status = "pending"
             snap["target"] = {
@@ -865,8 +941,17 @@ def _submit_chain_swap_request(
                 new_teacher = db.get(Teacher, s.new_teacher_id)
                 if new_teacher is None:
                     raise HTTPException(404, f"{idx}단계: 지정한 교사를 찾을 수 없습니다.")
-                # 신청자 본인이 아닌 교사로 변경 시 동의 필요
-                if s.new_teacher_id != current_user.teacher_id:
+                # 보안: 이 슬롯을 "잃는" 기존 담당 교사(source.teacher_id)가 신청자
+                # 본인이 아니라면 반드시 그 교사의 동의를 먼저 받아야 합니다.
+                # 예전 코드는 new_teacher_id 만 확인해서, 공격자가 자기 자신을
+                # new_teacher_id 로 지정하면(=자기 자신은 동의가 필요 없다고 판단)
+                # 기존 담당 교사에게 알리지도 않고 그 교사의 수업을 가로챌 수
+                # 있었습니다. source 소유자가 본인일 때만 "새 교사"의 동의로 충분합니다
+                # (자기 수업을 남에게 넘기는 정상적인 신청 흐름).
+                if source.teacher_id != current_user.teacher_id:
+                    affected_teacher_id = source.teacher_id
+                    consent_status = "pending"
+                elif s.new_teacher_id != current_user.teacher_id:
                     affected_teacher_id = s.new_teacher_id
                     consent_status = "pending"
         else:
@@ -1007,6 +1092,22 @@ def review_request(
     if body.action not in ("approve", "reject"):
         raise HTTPException(400, "action 은 'approve' 또는 'reject' 여야 합니다.")
 
+    # ── 동시성 보호: 행 잠금 (버그 수정) ────────────────────────────────────
+    # 기존 코드는 db.get() 으로만 읽고 잠금 없이 status/current_step 을 갱신했습니다.
+    # 두 관리자가 거의 동시에 같은 신청을 승인/거절하거나(또는 버튼 더블클릭) 하면
+    # 둘 다 "현재 상태" 검증을 통과한 뒤 각자 커밋해 승인 이력·알림이 중복되고
+    # 워크플로우 단계(current_step)가 두 번 진행되는 lost-update 가 발생했습니다.
+    # _review_consent_step() 이 이미 쓰고 있는 것과 동일하게 FOR UPDATE 로 행을
+    # 잠가 두 번째 트랜잭션이 첫 번째 커밋을 기다리도록(직렬화) 만듭니다.
+    # (SQLite 에서는 FOR UPDATE 가 no-op 이지만, 운영 환경인 PostgreSQL 에서는
+    #  실제로 행을 잠급니다.)
+    from sqlalchemy import select
+    db.execute(
+        select(TimetableChangeRequest)
+        .where(TimetableChangeRequest.id == req.id)
+        .with_for_update()
+    )
+
     # ── 활성 워크플로우 로드 ──────────────────────────────────────────────
     wf = db.query(ApprovalWorkflow).filter_by(is_active=True).first()
     if wf is None:
@@ -1051,8 +1152,15 @@ def review_request(
             raise HTTPException(400, "이미 최종 처리 완료된 신청입니다.")
 
         # 현재 단계의 역할 검증
+        # 버그 수정: 기존 코드는 step_def 가 None 이면(예: 신청이 진행 중인 동안
+        # 워크플로우 단계 수가 줄어들어 현재 step 번호가 더 이상 정의되지 않게 된
+        # 경우) 역할 검증을 통째로 건너뛰어, 원래 필요했던 역할(예: 교감)보다
+        # 낮은 권한의 사용자가 거절할 수 있었습니다. 승인(approve) 분기는 이미
+        # 이 경우를 500 에러로 명시 처리하므로 거절 분기도 동일하게 맞춥니다.
         step_def = _get_step_at(wf, cur)
-        if step_def is not None and user_role != step_def.role_required:
+        if step_def is None:
+            raise HTTPException(500, f"워크플로우에 {cur}단계가 정의되어 있지 않습니다.")
+        if user_role != step_def.role_required:
             raise HTTPException(400, f"현재 결재 단계는 '{step_def.role_required}' 역할만 처리할 수 있습니다.")
 
         req.status = "rejected"
@@ -1702,6 +1810,67 @@ def _enrich_response(req: TimetableChangeRequest, total_steps: int) -> ChangeReq
 
 # ── 변경 적용 및 알림 헬퍼 ───────────────────────────────────────────────────
 
+def _assert_no_teacher_conflict(
+    db: Session,
+    term_id: int,
+    teacher_id: Optional[int],
+    day: int,
+    period: int,
+    exclude_entry_ids: set,
+) -> None:
+    """
+    승인 확정 직전, 지정한 교사가 해당 (요일, 교시)에 이미 다른 수업을
+    담당하고 있지 않은지 최종 검증합니다 (버그 수정).
+
+    배경:
+      GET /suggestions, GET /swap-paths 는 제안을 만들 때 _can_place_teacher() 로
+      "새로 배치될 교사가 그 시간에 이미 다른 반 수업이 없는지"를 검증합니다.
+      하지만 실제로 승인을 반영하는 _apply_request_changes / _apply_chain_swap_changes 는
+      그동안 change_snapshot(신청이 다루는 슬롯 자체가 신청 이후 바뀌었는지)만
+      검증했을 뿐, "새로 배치되는 교사가 그 시간에 이미 다른(이번 신청과 무관한)
+      수업을 맡고 있는지"는 전혀 검사하지 않았습니다.
+
+      예: A 선생님 수업(월요일 3교시)을 B 선생님으로 바꾸는 신청이 결재 대기
+      중인 동안, B 선생님을 월요일 3교시에 배정하는 *다른* 변경 신청이 먼저
+      승인되면 — 스냅샷 비교로는 아무 충돌도 감지하지 못한 채 이 신청도 그대로
+      승인되어 B 선생님이 같은 시간에 두 반 수업을 겹쳐 맡게 됩니다.
+
+    Args:
+        db: SQLAlchemy 세션
+        term_id: 검사 대상 학기 (다른 학기 데이터는 무시)
+        teacher_id: 새로 배치될 교사 ID (None 이면 검사 생략)
+        day, period: 배치될 요일/교시
+        exclude_entry_ids: 검사에서 제외할 슬롯 ID 들 — 이번 신청이 직접 다루는
+            슬롯 자신(및 교환/연쇄의 상대 슬롯)은 "제3자 충돌"이 아니라 이번
+            변경의 대상 그 자체이므로 제외합니다.
+
+    Raises:
+        HTTPException(409): 이미 그 시간에 해당 교사의 다른 수업이 있는 경우.
+    """
+    if teacher_id is None:
+        return
+    conflict = (
+        db.query(TimetableEntry)
+        .filter(
+            TimetableEntry.term_id == term_id,
+            TimetableEntry.teacher_id == teacher_id,
+            TimetableEntry.day_of_week == day,
+            TimetableEntry.period == period,
+            TimetableEntry.id.notin_(exclude_entry_ids),
+        )
+        .first()
+    )
+    if conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"교사(id={teacher_id})가 해당 시간(요일={day}, 교시={period})에 "
+                f"이미 다른 수업(entry_id={conflict.id})을 담당하고 있어 이 변경을 "
+                "승인할 수 없습니다. 신청을 취소하고 다시 조율해 주세요."
+            ),
+        )
+
+
 def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
     """
     최종 승인된 변경 신청을 실제 TimetableEntry 에 반영합니다.
@@ -1867,6 +2036,28 @@ def _apply_request_changes(db: Session, req: TimetableChangeRequest) -> None:
                             "변경 신청을 취소하고 최신 상태로 다시 신청해 주세요."
                         ),
                     )
+
+    # ── 3.5. 승인 시점 제3자 충돌 검증 (버그 수정) ───────────────────────
+    # 위의 스냅샷 검사는 "이 신청이 다루는 슬롯 자체가 바뀌었는지"만 봅니다.
+    # 하지만 "새로 배치될 교사가 그 시간에 이미 다른(이 신청과 무관한) 수업을
+    # 맡고 있는지"는 지금까지 전혀 검사하지 않아, 결재 대기 중 다른 신청이 먼저
+    # 승인되면 교사가 같은 시간에 이중 배정될 수 있었습니다. 실제로 값을
+    # 바꾸기 직전, 최종적으로 배치될 상태를 기준으로 다시 검증합니다.
+    if partner is not None:
+        # 교환: entry 에는 partner 의 교사가, partner 에는 entry 의 교사가 들어갈 예정.
+        _assert_no_teacher_conflict(
+            db, entry.term_id, partner.teacher_id, entry.day_of_week, entry.period,
+            exclude_entry_ids={entry.id, partner.id},
+        )
+        _assert_no_teacher_conflict(
+            db, partner.term_id, entry.teacher_id, partner.day_of_week, partner.period,
+            exclude_entry_ids={entry.id, partner.id},
+        )
+    elif req.new_teacher_id is not None and req.new_teacher_id != entry.teacher_id:
+        _assert_no_teacher_conflict(
+            db, entry.term_id, req.new_teacher_id, entry.day_of_week, entry.period,
+            exclude_entry_ids={entry.id},
+        )
 
     # ── 4. 단순 변경(과목/교사/교실) 적용 ─────────────────────────────────
     # 변경 전 상태를 before 에 기록합니다. 이후 log_entry_update() 가
@@ -2149,6 +2340,17 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
                 "teacher_id": target.teacher_id,
                 "room_id":    target.room_id,
             }
+            # 승인 시점 제3자 충돌 검증 (버그 수정) — _apply_request_changes 와 동일 이유.
+            # 이 단계에서 이미 잠근(locked_in_this_tx) 슬롯들은 이번 트랜잭션에서 함께
+            # 비워지고 채워지는 대상이므로 제외 대상에 포함합니다.
+            _assert_no_teacher_conflict(
+                db, source.term_id, target.teacher_id, source.day_of_week, source.period,
+                exclude_entry_ids={source.id, target.id},
+            )
+            _assert_no_teacher_conflict(
+                db, target.term_id, source.teacher_id, target.day_of_week, target.period,
+                exclude_entry_ids={source.id, target.id},
+            )
             _apply_swap_step(db, source, target, source_before, target_before)
 
             # 두 슬롯 모두 이번 트랜잭션에서 수정됨 — 후속 단계 snapshot 검증 건너뜀
@@ -2156,6 +2358,13 @@ def _apply_chain_swap_changes(db: Session, req: TimetableChangeRequest) -> None:
             modified_in_this_tx.add(target.id)
 
         elif step.step_type == "change":
+            # 승인 시점 제3자 충돌 검증 (버그 수정) — _apply_request_changes 와 동일 이유.
+            if step.new_teacher_id is not None and step.new_teacher_id != source.teacher_id:
+                _assert_no_teacher_conflict(
+                    db, source.term_id, step.new_teacher_id,
+                    source.day_of_week, source.period,
+                    exclude_entry_ids={source.id},
+                )
             # 단일 슬롯 변경 — _apply_change_step 헬퍼 재사용
             _apply_change_step(
                 db, source,

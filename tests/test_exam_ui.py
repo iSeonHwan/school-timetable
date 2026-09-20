@@ -100,6 +100,14 @@ def test_exam_setup_lists_and_creates(qtbot, exam_env, db):
 
     # 생성 폼 채우기 → 추가
     widget.edit_name.setText("기말고사")
+    # 버그 수정(테스트): 시작일이 위젯 기본값(오늘 날짜)에 그대로 의존하면,
+    # core.exam_scheduler.rebuild_exam_periods() 가 주말에는 교시를 생성하지
+    # 않도록 수정된 이후로 테스트 실행일이 토·일요일이면 이 테스트가 깨집니다
+    # (실행 환경의 "오늘"과 무관하게 항상 같은 결과가 나와야 하는 테스트이므로,
+    # 확실한 평일 날짜를 명시적으로 지정합니다 — exam_env 픽스처와 동일한
+    # 2026-10-05(월요일) 사용).
+    from PyQt6.QtCore import QDate
+    widget.date_start.setDate(QDate(2026, 10, 5))
     # 폼 기본 종료일은 시작일+1일(2일×3교시=6교시)이므로
     # "1일 × 3교시" 검증을 위해 종료일을 시작일과 같은 날로 맞춥니다.
     widget.date_end.setDate(widget.date_start.date())

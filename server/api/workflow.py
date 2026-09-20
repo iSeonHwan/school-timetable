@@ -23,6 +23,7 @@ ApprovalWorkflow + ApprovalStep 테이블의 CRUD 를 제공합니다.
   - /workflows/active 는 교사도 접근 가능 (변경 신청 상태 표시에 필요)
 """
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from shared.models import ApprovalWorkflow, ApprovalStep, User
 from shared.schemas import (
@@ -70,8 +71,27 @@ def create_workflow(
 
     is_active=True 로 생성 시 기존 활성 워크플로우는 자동 비활성화됩니다.
     steps 는 step_order 순서대로 저장되며, 1부터 연속되어야 합니다.
+
+    동시성 버그 수정 (2026-09-20):
+      예전 코드는 "UPDATE ... WHERE is_active=True" 로 기존 활성 워크플로우를
+      끄고 새 워크플로우를 켰지만, 아무 잠금도 없었습니다. 두 관리자가 거의
+      동시에 각각 다른 워크플로우를 활성화(생성 또는 activate_workflow 호출)
+      하면 다음과 같이 활성 워크플로우가 2개가 될 수 있었습니다:
+        T1: UPDATE ... SET is_active=False WHERE is_active=True  (wf_A 를 끔)
+        T2: 위 UPDATE 가 wf_A 행 잠금 때문에 대기
+        T1: wf_B.is_active = True 후 COMMIT  → 이제 wf_B 만 활성
+        T2: 잠금이 풀려 진행되지만, T2 의 UPDATE 는 "자기 스냅샷에서 이미
+            찾은 행(wf_A)"만 재검증하고 그 사이 새로 활성화된 wf_B 는 애초에
+            스캔 대상이 아니었으므로 건드리지 않음 → T2 도 wf_C 를 활성화
+        결과: wf_B 와 wf_C 둘 다 is_active=True (결재 라인이 2개로 갈라짐)
+      해결: 활성화 작업 시작 시 테이블 전체 행을 FOR UPDATE 로 잠가 두 번째
+      트랜잭션이 첫 번째가 끝날 때까지 통째로 대기하도록 직렬화합니다. 이
+      테이블은 매우 작고(워크플로우 정의 수 개) 활성화는 드문 관리자 작업이라
+      전체 잠금의 성능 비용은 무시할 수 있습니다.
+      (SQLite 에서는 FOR UPDATE 가 no-op — 운영 환경인 PostgreSQL에서만 실제 잠금.)
     """
     if body.is_active:
+        db.execute(select(ApprovalWorkflow.id).with_for_update())
         db.query(ApprovalWorkflow).filter_by(is_active=True).update(
             {"is_active": False}, synchronize_session="evaluate"
         )
@@ -124,10 +144,16 @@ def activate_workflow(
 
     기존에 활성화된 워크플로우는 자동으로 비활성화됩니다.
     활성화된 워크플로우가 변경 신청 승인/거절 시 사용됩니다.
+
+    동시성 버그 수정: create_workflow() 의 docstring 에 적은 것과 동일한
+    이유로, 활성화 작업 전체를 테이블 잠금으로 직렬화합니다 — 두 관리자가
+    동시에 서로 다른 워크플로우를 활성화해도 활성 워크플로우가 2개로
+    갈라지지 않도록 보장합니다.
     """
     wf = db.get(ApprovalWorkflow, workflow_id)
     if wf is None:
         raise HTTPException(404, "워크플로우를 찾을 수 없습니다.")
+    db.execute(select(ApprovalWorkflow.id).with_for_update())
     # 기존 활성 워크플로우 모두 비활성화 후 대상만 활성화
     db.query(ApprovalWorkflow).filter_by(is_active=True).update(
         {"is_active": False}, synchronize_session="evaluate"
