@@ -20,7 +20,23 @@ from datetime import date
 from database.connection import get_session
 from database.models import (
     Exam, ExamPeriod, InvigilationAssignment, SchoolClass, Teacher, User,
+    ExamRoom,
 )
+
+
+def _slot_key(a: InvigilationAssignment) -> tuple:
+    """
+    InvigilationAssignment → (period_id, kind, ref_id) 슬롯 식별자.
+
+    2026-10-04 변경: school_class_id 가 nullable 이 되고 exam_room_id 가
+    추가되면서(혼합 시험실 지원), 과거처럼 (period_id, school_class_id) 만
+    키로 쓰면 같은 교시의 혼합 시험실들이 전부 school_class_id=None 으로
+    겹쳐 한 슬롯인 것처럼 섞여버립니다. kind 로 네임스페이스를 분리합니다
+    (core.exam_scheduler 의 슬롯 키 규칙과 동일).
+    """
+    if a.exam_room_id is not None:
+        return (a.period_id, "room", a.exam_room_id)
+    return (a.period_id, "class", a.school_class_id)
 
 # pdf_export 의 폰트 탐색 함수를 재사용 — 중복 구현 금지 (규칙 일관성).
 from ui.export.pdf_export import _find_korean_font
@@ -58,6 +74,7 @@ def export_invigilation_pdf(session, exam: Exam, filepath: str) -> None:
         .all()
     )
     classes = {c.id: c for c in session.query(SchoolClass)}
+    rooms = {r.id: r for r in session.query(ExamRoom).filter_by(exam_id=exam.id)}
     teachers = {t.id: t for t in session.query(Teacher)}
     assignments = (
         session.query(InvigilationAssignment)
@@ -73,12 +90,12 @@ def export_invigilation_pdf(session, exam: Exam, filepath: str) -> None:
     subjects = {s.id: s for s in session.query(Subject)}
     entry_map = {(e.period_id, e.grade_id): subjects.get(e.subject_id) for e in entries}
 
-    # ── 감독 교사 이름 매핑: (period_id, class_id) → {pair_index: 교사명} ──
-    # 2인 1조(학생 20명 이상) 반은 pair 1·2 두 칸에 교사 이름이 들어갑니다.
+    # ── 감독 교사 이름 매핑: (period_id, kind, ref_id) → {pair_index: 교사명} ──
+    # 2인 1조(학생 수 >= pair_threshold) 반/시험실은 pair 1·2 두 칸에 이름이 들어갑니다.
     slot_map: dict = {}
     duty_count: dict = {}   # 교사별 감독 횟수 (총평 표기용)
     for a in assignments:
-        key = (a.period_id, a.school_class_id)
+        key = _slot_key(a)
         slot_map.setdefault(key, {})
         name = teachers[a.teacher_id].name if a.teacher_id in teachers else "(미배정)"
         slot_map[key][a.pair_index] = name
@@ -122,22 +139,37 @@ def export_invigilation_pdf(session, exam: Exam, filepath: str) -> None:
     elements.append(Spacer(1, 8))
 
     # ── 감독표 테이블 ────────────────────────────────────────────────────
-    header = ["날짜", "교시(시간)", "반", "시험 과목", "1조", "2조"]
+    header = ["날짜", "교시(시간)", "반/시험실", "시험 과목", "1조", "2조"]
     table_data = [header]
     for p in periods:
-        # 이 교시에 감독이 필요한 반들 (slot_map 에 등록된 반 순회)
-        cls_ids = sorted({cid for (pid, cid) in slot_map if pid == p.id})
-        for cid in cls_ids:
-            cls = classes.get(cid)
-            if cls is None:
-                continue
-            subj = entry_map.get((p.id, cls.grade_id))
-            slots = slot_map[(p.id, cid)]
+        # 이 교시에 감독이 필요한 반/시험실들 (slot_map 에 등록된 키 순회)
+        # 일반 반(class) 먼저, 혼합 시험실(room)은 뒤에 — 둘 다 ref_id 순.
+        period_keys = sorted(
+            (k for k in slot_map if k[0] == p.id),
+            key=lambda k: (0 if k[1] == "class" else 1, k[2]),
+        )
+        for key in period_keys:
+            _, kind, ref_id = key
+            slots = slot_map[key]
+            if kind == "class":
+                cls = classes.get(ref_id)
+                if cls is None:
+                    continue
+                label = cls.display_name
+                subj = entry_map.get((p.id, cls.grade_id))
+                subj_name = subj.name if subj else "-"
+            else:
+                room = rooms.get(ref_id)
+                label = f"[혼합] {room.label}" if room and room.label else f"시험실#{ref_id}"
+                subj_name = "-"
+                if room is not None and room.subject_id is not None:
+                    subj = subjects.get(room.subject_id)
+                    subj_name = subj.name if subj else "-"
             table_data.append([
                 f"{p.exam_date:%m/%d}",
                 f"{p.period}교시 ({p.start_time:%H:%M}~{p.end_time:%H:%M})",
-                cls.display_name,
-                subj.name if subj else "-",
+                label,
+                subj_name,
                 slots.get(1, "-"),
                 slots.get(2, "-"),
             ])
@@ -173,25 +205,35 @@ def export_invigilation_csv(session, exam: Exam, filepath: str) -> None:
         .all()
     )
     classes = {c.id: c for c in session.query(SchoolClass)}
+    rooms = {r.id: r for r in session.query(ExamRoom).filter_by(exam_id=exam.id)}
     teachers = {t.id: t for t in session.query(Teacher)}
 
     slot_map: dict = {}
     for a in session.query(InvigilationAssignment).filter_by(exam_id=exam.id):
-        slot_map.setdefault((a.period_id, a.school_class_id), {})[a.pair_index] = (
+        slot_map.setdefault(_slot_key(a), {})[a.pair_index] = (
             teachers[a.teacher_id].name if a.teacher_id in teachers else "미배정")
 
     # encoding="utf-8-sig" — Excel 이 BOM 없으면 한글을 깨져 읽는 문제 방지
     with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["날짜", "교시", "시작", "종료", "반", "1조", "2조"])
+        w.writerow(["날짜", "교시", "시작", "종료", "반/시험실", "1조", "2조"])
         for p in periods:
-            cls_ids = sorted({cid for (pid, cid) in slot_map if pid == p.id})
-            for cid in cls_ids:
-                cls = classes.get(cid)
-                slots = slot_map[(p.id, cid)]
+            period_keys = sorted(
+                (k for k in slot_map if k[0] == p.id),
+                key=lambda k: (0 if k[1] == "class" else 1, k[2]),
+            )
+            for key in period_keys:
+                _, kind, ref_id = key
+                slots = slot_map[key]
+                if kind == "class":
+                    cls = classes.get(ref_id)
+                    label = cls.display_name if cls else ref_id
+                else:
+                    room = rooms.get(ref_id)
+                    label = f"[혼합] {room.label}" if room and room.label else f"시험실#{ref_id}"
                 w.writerow([
                     f"{p.exam_date:%Y-%m-%d}", p.period,
                     f"{p.start_time:%H:%M}", f"{p.end_time:%H:%M}",
-                    cls.display_name if cls else cid,
+                    label,
                     slots.get(1, "-"), slots.get(2, "-"),
                 ])

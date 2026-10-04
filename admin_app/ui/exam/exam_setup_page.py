@@ -1,12 +1,19 @@
 """
-시험 관리 화면 (2026-09-19 신규)
+시험 관리 화면 (2026-09-19 신규, 2026-10-04 혼합 시험실·미참여 날짜 추가)
 
-세 개의 섹션으로 구성됩니다:
+다섯 개의 섹션으로 구성됩니다:
   1. 시험 생성 폼 — 시험 기본 정보(이름·기간·교시 운영 규칙·감독 금지 규칙) 입력.
      저장 시 기간×교시 수만큼 ExamPeriod 가 자동 생성됩니다.
-  2. 시험 목록 — 생성된 시험 조회·게시·삭제.
+  2. 시험 목록 — 생성된 시험 조회·게시·삭제. 목록에서 선택한 시험이
+     아래 3·4번 섹션의 대상이 됩니다.
      게시(publish)하면 교사 앱에서 시험표·감독표가 조회 가능해집니다.
-  3. 감독 불가 신청 승인 — 교사가 제출한 감독 불가 신청(pending)을
+  3. 학년별 시험 미참여 날짜 — 특정 학년이 시험 기간 중 일부 날짜에
+     정상수업을 하는 경우(예: 3학년이 첫날만 정상수업) 등록합니다.
+     등록된 날짜는 그 학년의 시험 시간표·감독 슬롯 생성에서 제외됩니다.
+  4. 혼합 시험실(선택과목 등) — 여러 반 학생이 섞이는 시험실(2학년
+     선택과목, 3학년 공통 고사/미선택실 등)을 등록합니다. 등록 후
+     감독 자동 배정을 실행하면 이 시험실도 함께 배정됩니다.
+  5. 감독 불가 신청 승인 — 교사가 제출한 감독 불가 신청(pending)을
      승인/거절합니다. 승인된 신청은 다음 감독 자동 배정부터 하드 제약으로
      반영됩니다 (미승인 상태로 감독이 빠지는 사고 방지).
 
@@ -28,7 +35,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QSpinBox, QPushButton, QTableWidget,
     QTableWidgetItem, QFrame, QMessageBox, QHeaderView,
-    QComboBox, QDateEdit, QTimeEdit, QCheckBox,
+    QComboBox, QDateEdit, QTimeEdit, QCheckBox, QListWidget,
+    QListWidgetItem, QAbstractItemView,
 )
 from PyQt6.QtCore import QDate, QTime, Qt
 from PyQt6.QtGui import QFont, QColor
@@ -36,6 +44,7 @@ from PyQt6.QtGui import QFont, QColor
 from database.connection import get_session
 from database.models import (
     AcademicTerm, Exam, ExamPeriod, InvigilationConstraint, Teacher,
+    Grade, SchoolClass, Subject, ExamRoom, ExamGradeDateExclusion,
 )
 from core.exam_scheduler import rebuild_exam_periods
 
@@ -80,6 +89,8 @@ class ExamSetupWidget(QWidget):
 
         layout.addWidget(self._build_exam_form())
         layout.addWidget(self._build_exam_list(), stretch=1)
+        layout.addWidget(self._build_grade_exclusion_panel(), stretch=1)
+        layout.addWidget(self._build_room_panel(), stretch=1)
         layout.addWidget(self._build_constraint_panel(), stretch=1)
 
     def _build_exam_form(self) -> QFrame:
@@ -191,6 +202,17 @@ class ExamSetupWidget(QWidget):
         self.chk_ban_own.setChecked(True)
         row3.addWidget(self.chk_ban_own)
 
+        row3.addSpacing(16)
+        row3.addWidget(QLabel("부감독 기준(명 이상):"))
+        self.spin_pair_threshold = QSpinBox()
+        self.spin_pair_threshold.setRange(1, 100)
+        self.spin_pair_threshold.setValue(20)
+        self.spin_pair_threshold.setToolTip(
+            "한 시험실의 학생 수가 이 값 이상이면 감독교사를 2인 1조로 배정합니다.\n"
+            "학교별 실제 운영 기준이 다를 수 있습니다(예: 1학기 실 사례 기준 24명)."
+        )
+        row3.addWidget(self.spin_pair_threshold)
+
         btn_add = QPushButton("시험 추가")
         btn_add.setStyleSheet(BTN_PRIMARY)
         btn_add.clicked.connect(self._add_exam)
@@ -219,6 +241,9 @@ class ExamSetupWidget(QWidget):
         self.tbl_exams.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl_exams.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.tbl_exams.setStyleSheet("border:none;")
+        # 선택 시험이 바뀌면 아래 "학년별 미참여 날짜"·"혼합 시험실" 패널의
+        # 대상도 함께 갱신 — 두 패널 모두 "지금 선택된 시험"을 기준으로 동작.
+        self.tbl_exams.itemSelectionChanged.connect(self._on_exam_selection_changed)
         f.addWidget(self.tbl_exams)
 
         btn_row = QHBoxLayout()
@@ -236,6 +261,135 @@ class ExamSetupWidget(QWidget):
             "게시하면 교사 앱에서 시험표·감독표가 보입니다. 게시 후에는 수정할 수 없습니다."))
         btn_row.addStretch()
         f.addLayout(btn_row)
+        return frame
+
+    def _build_grade_exclusion_panel(self) -> QFrame:
+        """
+        섹션 3: 학년별 시험 미참여 날짜 (2026-10-04 추가).
+
+        실제 사례: 시험 기간 첫날은 특정 학년만 정상수업이고 둘째 날부터
+        그 학년도 시험(자습·고사)에 들어가는 경우. 여기 등록한 (학년,날짜)
+        조합은 core.exam_scheduler 가 그 학년의 시험 시간표 배치·감독
+        슬롯 생성에서 제외합니다.
+        """
+        frame = QFrame()
+        frame.setStyleSheet("border:1px solid #CCCCCC; border-radius:6px; background:white;")
+        f = QVBoxLayout(frame)
+        f.setContentsMargins(12, 10, 12, 10)
+
+        lbl = QLabel("학년별 시험 미참여 날짜 (정상수업 등) — 위 목록에서 선택한 시험 대상")
+        lbl.setFont(QFont("", 11, QFont.Weight.Bold))
+        lbl.setStyleSheet("color:#1B4F8A; border:none;")
+        f.addWidget(lbl)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("학년:"))
+        self.cmb_exclusion_grade = QComboBox()
+        row.addWidget(self.cmb_exclusion_grade)
+        row.addSpacing(8)
+        row.addWidget(QLabel("미참여 날짜:"))
+        self.date_exclusion = QDateEdit(QDate.currentDate())
+        self.date_exclusion.setCalendarPopup(True)
+        self.date_exclusion.setDisplayFormat("yyyy-MM-dd")
+        row.addWidget(self.date_exclusion)
+        btn_add = QPushButton("추가")
+        btn_add.setStyleSheet(BTN_PRIMARY)
+        btn_add.clicked.connect(self._add_grade_exclusion)
+        row.addWidget(btn_add)
+        row.addStretch()
+        f.addLayout(row)
+
+        self.tbl_exclusions = QTableWidget(0, 3)
+        self.tbl_exclusions.setHorizontalHeaderLabels(["ID", "학년", "미참여 날짜"])
+        self.tbl_exclusions.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl_exclusions.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl_exclusions.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl_exclusions.setStyleSheet("border:none;")
+        self.tbl_exclusions.setMaximumHeight(120)
+        f.addWidget(self.tbl_exclusions)
+
+        btn_del = QPushButton("선택 항목 삭제")
+        btn_del.setStyleSheet(BTN_DANGER)
+        btn_del.clicked.connect(self._delete_grade_exclusion)
+        f.addWidget(btn_del)
+        return frame
+
+    def _build_room_panel(self) -> QFrame:
+        """
+        섹션 4: 혼합 시험실(선택과목 등) — 2026-10-04 추가.
+
+        실제 사례: 2학년 선택과목(세계사 등)처럼 여러 반 학생이 섞여
+        한 시험실에서 시험을 보거나, 3학년 공통 고사/미선택실처럼 반
+        경계를 넘는 시험실을 등록합니다. 담임·담당과목 감독 금지는
+        "포함 반" 목록을 기준으로 판정됩니다.
+        """
+        frame = QFrame()
+        frame.setStyleSheet("border:1px solid #CCCCCC; border-radius:6px; background:white;")
+        f = QVBoxLayout(frame)
+        f.setContentsMargins(12, 10, 12, 10)
+
+        lbl = QLabel("혼합 시험실 (선택과목·공통 고사 등 — 여러 반이 섞이는 시험실) — "
+                     "위 목록에서 선택한 시험 대상")
+        lbl.setFont(QFont("", 11, QFont.Weight.Bold))
+        lbl.setStyleSheet("color:#1B4F8A; border:none;")
+        f.addWidget(lbl)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("교시:"))
+        self.cmb_room_period = QComboBox()
+        self.cmb_room_period.setMinimumWidth(160)
+        row1.addWidget(self.cmb_room_period)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("학년:"))
+        self.cmb_room_grade = QComboBox()
+        self.cmb_room_grade.currentIndexChanged.connect(self._refresh_room_class_list)
+        row1.addWidget(self.cmb_room_grade)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("과목(선택, 비우면 자습):"))
+        self.cmb_room_subject = QComboBox()
+        self.cmb_room_subject.addItem("(자습/미선택)", None)
+        row1.addWidget(self.cmb_room_subject)
+        row1.addSpacing(8)
+        row1.addWidget(QLabel("인원:"))
+        self.spin_room_count = QSpinBox()
+        self.spin_room_count.setRange(1, 100)
+        self.spin_room_count.setValue(24)
+        row1.addWidget(self.spin_room_count)
+        row1.addStretch()
+        f.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("포함 반(복수 선택):"))
+        self.list_room_classes = QListWidget()
+        self.list_room_classes.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list_room_classes.setMaximumHeight(70)
+        row2.addWidget(self.list_room_classes, stretch=1)
+        f.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("설명:"))
+        self.edit_room_label = QLineEdit()
+        self.edit_room_label.setPlaceholderText("예: 세계사(3반 교실)")
+        row3.addWidget(self.edit_room_label, stretch=1)
+        btn_add = QPushButton("시험실 추가")
+        btn_add.setStyleSheet(BTN_PRIMARY)
+        btn_add.clicked.connect(self._add_exam_room)
+        row3.addWidget(btn_add)
+        f.addLayout(row3)
+
+        self.tbl_rooms = QTableWidget(0, 5)
+        self.tbl_rooms.setHorizontalHeaderLabels(["ID", "교시", "학년", "설명", "인원"])
+        self.tbl_rooms.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl_rooms.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl_rooms.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl_rooms.setStyleSheet("border:none;")
+        self.tbl_rooms.setMaximumHeight(120)
+        f.addWidget(self.tbl_rooms)
+
+        btn_del = QPushButton("선택 시험실 삭제")
+        btn_del.setStyleSheet(BTN_DANGER)
+        btn_del.clicked.connect(self._delete_exam_room)
+        f.addWidget(btn_del)
         return frame
 
     def _build_constraint_panel(self) -> QFrame:
@@ -276,9 +430,59 @@ class ExamSetupWidget(QWidget):
     # ── 데이터 로딩 ─────────────────────────────────────────────────────
 
     def _load_data(self):
-        """시험 목록과 감독 불가 신청 목록을 DB 에서 읽어 갱신합니다."""
+        """시험 목록·학년/과목 조회 목록·감독 불가 신청 목록을 갱신합니다."""
+        self._load_grade_and_subject_lookups()
         self._load_exams()
         self._load_constraints()
+        self._on_exam_selection_changed()   # 선택 시험 기준 패널(미참여 날짜·혼합 시험실) 갱신
+
+    def _load_grade_and_subject_lookups(self):
+        """
+        학년·과목 조회 콤보박스를 DB 기준으로 채웁니다(혼합 시험실·미참여
+        날짜 폼용). _load_data() 가 화면 전환·새로고침마다 호출하므로,
+        학년/과목이 설정 화면에서 추가·삭제된 뒤에도 이 폼이 항상 최신
+        목록을 보여줍니다.
+
+        clear() 후 다시 addItem() 하는 매 호출마다 두 가지를 조심합니다:
+          1. blockSignals(True/False) — clear()/addItem() 자체도
+             currentIndexChanged 시그널을 발생시킵니다. cmb_room_grade 는
+             그 시그널에 _refresh_room_class_list() 가 연결돼 있어, 신호를
+             막지 않으면 콤보가 다시 채워지는 중간 과정(항목이 0개인
+             순간 등)마다 반 목록이 불필요하게 깜빡이며 다시 그려집니다.
+          2. currentData() 로 갱신 전 선택값을 저장했다가 findData() 로
+             같은 항목을 다시 찾아 복원 — 그냥 clear() 만 하면 사용자가
+             골라둔 학년이 매번 "첫 항목"으로 리셋되어, 예를 들어 혼합
+             시험실 폼을 작성하다가 다른 화면에 갔다 오면 선택이
+             날아가는 불편이 생깁니다.
+        """
+        session = get_session()
+        try:
+            grades = session.query(Grade).order_by(Grade.grade_number).all()
+            for cmb in (self.cmb_exclusion_grade, self.cmb_room_grade):
+                current = cmb.currentData()
+                cmb.blockSignals(True)
+                cmb.clear()
+                for g in grades:
+                    cmb.addItem(g.name, g.id)
+                idx = cmb.findData(current)
+                if idx >= 0:
+                    cmb.setCurrentIndex(idx)
+                cmb.blockSignals(False)
+
+            subjects = session.query(Subject).order_by(Subject.name).all()
+            current_subj = self.cmb_room_subject.currentData()
+            self.cmb_room_subject.blockSignals(True)
+            self.cmb_room_subject.clear()
+            self.cmb_room_subject.addItem("(자습/미선택)", None)
+            for s in subjects:
+                self.cmb_room_subject.addItem(s.name, s.id)
+            idx = self.cmb_room_subject.findData(current_subj)
+            if idx >= 0:
+                self.cmb_room_subject.setCurrentIndex(idx)
+            self.cmb_room_subject.blockSignals(False)
+        finally:
+            session.close()
+        self._refresh_room_class_list()
 
     def refresh(self):
         """페이지 전환 시 main_window 에서 호출되는 갱신 진입점."""
@@ -316,6 +520,7 @@ class ExamSetupWidget(QWidget):
                     rules.append("담임금지")
                 if ex.ban_own_subject:
                     rules.append("담당과목금지")
+                rules.append(f"부감독{ex.pair_threshold}명↑")
                 self.tbl_exams.setItem(row, 6, QTableWidgetItem(
                     " / ".join(rules) if rules else "없음"))
         finally:
@@ -415,6 +620,7 @@ class ExamSetupWidget(QWidget):
                 max_subjects_per_day=self.spin_max_subjects.value(),
                 ban_homeroom_invigilation=self.chk_ban_homeroom.isChecked(),
                 ban_own_subject=self.chk_ban_own.isChecked(),
+                pair_threshold=self.spin_pair_threshold.value(),
                 status="draft",
             )
             session.add(exam)
@@ -429,11 +635,20 @@ class ExamSetupWidget(QWidget):
         finally:
             session.close()
 
-    def _selected_exam_id(self) -> int | None:
-        """시험 목록에서 선택된 행의 시험 ID 반환."""
+    def _selected_exam_id(self, show_warning: bool = True) -> int | None:
+        """
+        시험 목록에서 선택된 행의 시험 ID 반환.
+
+        show_warning=False (조용히 조회만 하는 자동 갱신 경로 — 예:
+        _on_exam_selection_changed, _load_rooms) 에서는 "시험을 선택해
+        주세요" 안내창을 띄우지 않습니다. 사용자가 아무 시험도 선택하지
+        않은 "정상 상태"일 뿐이라, 매 데이터 갱신마다 경고창이 뜨면
+        방해가 됩니다.
+        """
         row = self.tbl_exams.currentRow()
         if row < 0:
-            QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
+            if show_warning:
+                QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
             return None
         return int(self.tbl_exams.item(row, 0).text())
 
@@ -538,5 +753,277 @@ class ExamSetupWidget(QWidget):
             c.reviewed_at = datetime.now()
             session.commit()
             self._load_constraints()
+        finally:
+            session.close()
+
+    # ── 학년별 시험 미참여 날짜 ───────────────────────────────────────────
+
+    def _on_exam_selection_changed(self):
+        """
+        시험 목록 선택이 바뀔 때마다 "학년별 미참여 날짜"·"혼합 시험실"
+        패널을 그 시험 기준으로 다시 그립니다. 교시 콤보(cmb_room_period)도
+        선택된 시험의 ExamPeriod 로 다시 채웁니다.
+        """
+        exam_id = self._selected_exam_id(show_warning=False)
+
+        self.cmb_room_period.blockSignals(True)
+        self.cmb_room_period.clear()
+        if exam_id is not None:
+            session = get_session()
+            try:
+                periods = (
+                    session.query(ExamPeriod).filter_by(exam_id=exam_id)
+                    .order_by(ExamPeriod.exam_date, ExamPeriod.period).all()
+                )
+                for p in periods:
+                    self.cmb_room_period.addItem(
+                        f"{p.exam_date:%m/%d} {p.period}교시", p.id)
+            finally:
+                session.close()
+        self.cmb_room_period.blockSignals(False)
+
+        self._load_grade_exclusions()
+        self._load_rooms()
+
+    def _add_grade_exclusion(self):
+        """
+        선택된 시험·학년·날짜로 "시험 미참여 날짜"(ExamGradeDateExclusion)를
+        등록합니다.
+
+        날짜 유효성 검사(시험 기간 안인지)를 여기서도 수행하는 이유: 서버
+        API(POST /exams/{id}/grade-exclusions)는 같은 검증을 하지만, 관리자
+        앱은 DB 에 직접 접근하는 구조라 API 를 거치지 않습니다. 검증을
+        생략하면 시험 기간 밖의 날짜가 등록돼도 아무 효과가 없는데(해당
+        날짜엔 애초에 ExamPeriod 자체가 없어 조회되지 않음) 사용자가
+        "등록했는데 왜 반영이 안 되냐"고 혼란스러워할 수 있어, 입력 시점에
+        바로 알려줍니다.
+
+        중복 등록 방지: (exam_id, grade_id, exam_date) 가 이미 있으면 다시
+        추가하지 않습니다 — DB 의 UniqueConstraint(uq_grade_date_exclusion)
+        가 있긴 하지만, 그 위반으로 예외가 터지는 대신 조용히 무시해 같은
+        학년·날짜를 두 번 눌러도 사용자에게 에러창이 뜨지 않게 합니다.
+        """
+        exam_id = self._selected_exam_id()
+        if exam_id is None:
+            return
+        grade_id = self.cmb_exclusion_grade.currentData()
+        if grade_id is None:
+            QMessageBox.information(self, "안내", "학년 정보가 없습니다. 학년을 먼저 등록하세요.")
+            return
+        exam_date = self.date_exclusion.date().toPyDate()
+
+        session = get_session()
+        try:
+            exam = session.get(Exam, exam_id)
+            if exam is None:
+                return
+            if not (exam.start_date <= exam_date <= exam.end_date):
+                QMessageBox.warning(self, "입력 오류", "시험 기간 밖의 날짜입니다.")
+                return
+            existing = session.query(ExamGradeDateExclusion).filter_by(
+                exam_id=exam_id, grade_id=grade_id, exam_date=exam_date,
+            ).first()
+            if existing is None:
+                session.add(ExamGradeDateExclusion(
+                    exam_id=exam_id, grade_id=grade_id, exam_date=exam_date,
+                ))
+                session.commit()
+            self._load_grade_exclusions()
+        finally:
+            session.close()
+
+    def _load_grade_exclusions(self):
+        """
+        선택된 시험의 "시험 미참여 날짜" 목록을 테이블에 다시 그립니다.
+
+        exam_id=None(아무 시험도 선택 안 됨)인 상태는 정상적인 초기 화면
+        상태이므로 _selected_exam_id(show_warning=False) 로 호출해 경고창을
+        띄우지 않습니다 — _on_exam_selection_changed() 가 시험 목록이
+        로드될 때마다(처음 화면이 뜰 때 포함) 이 함수를 호출하기 때문에,
+        경고를 띄우면 화면을 열 때마다 불필요한 알림이 뜹니다.
+        """
+        exam_id = self._selected_exam_id(show_warning=False)
+        session = get_session()
+        try:
+            rows = []
+            if exam_id is not None:
+                rows = (
+                    session.query(ExamGradeDateExclusion).filter_by(exam_id=exam_id)
+                    .order_by(ExamGradeDateExclusion.exam_date).all()
+                )
+            self.tbl_exclusions.setRowCount(len(rows))
+            for row, ex in enumerate(rows):
+                grade = session.get(Grade, ex.grade_id)
+                self.tbl_exclusions.setItem(row, 0, QTableWidgetItem(str(ex.id)))
+                self.tbl_exclusions.setItem(row, 1, QTableWidgetItem(
+                    grade.name if grade else f"#{ex.grade_id}"))
+                self.tbl_exclusions.setItem(row, 2, QTableWidgetItem(f"{ex.exam_date:%Y-%m-%d}"))
+        finally:
+            session.close()
+
+    def _delete_grade_exclusion(self):
+        """
+        선택한 "시험 미참여 날짜" 행을 삭제합니다.
+
+        삭제의 효과: 그 학년은 다음 자동 배치/배정부터 그 날짜에도 다시
+        시험 대상이 됩니다(원래의 target_grade_ids 기준으로 복귀) — 별도
+        되돌림 로직이 필요 없는 이유는 ExamGradeDateExclusion 이 "예외
+        블랙리스트"라 행을 지우면 곧바로 예외가 사라지기 때문입니다.
+        """
+        row = self.tbl_exclusions.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "안내", "삭제할 항목을 선택해 주세요.")
+            return
+        exclusion_id = int(self.tbl_exclusions.item(row, 0).text())
+        session = get_session()
+        try:
+            session.query(ExamGradeDateExclusion).filter_by(id=exclusion_id).delete()
+            session.commit()
+            self._load_grade_exclusions()
+        finally:
+            session.close()
+
+    # ── 혼합 시험실(선택과목 등) ──────────────────────────────────────────
+
+    def _refresh_room_class_list(self):
+        """
+        선택된 학년의 반 목록으로 "포함 반" 다중 선택 목록을 다시 그립니다.
+
+        학년 콤보(cmb_room_grade) 변경 시그널에 연결돼 있습니다 — 학년을
+        바꾸면 반 목록도 당연히 바뀌어야 하는데, 이전 학년의 반이 그대로
+        남아 있으면 관리자가 잘못된 반을 혼합 시험실에 포함시키는 실수를
+        할 수 있습니다(예: 2학년 선택과목인데 목록에 1학년 반이 남아 있어
+        실수로 체크). 그래서 선택이 바뀔 때마다 완전히 새로 그립니다.
+
+        QListWidgetItem.setData(UserRole, sc.id) 로 각 항목에 반 id 를
+        숨겨 담아둡니다 — 표시 텍스트(반 이름)는 바뀔 수 있어도 id 는
+        안정적이므로, _add_exam_room() 이 선택된 항목에서 id 를 그대로
+        꺼내 쓸 수 있게 합니다.
+        """
+        self.list_room_classes.clear()
+        grade_id = self.cmb_room_grade.currentData()
+        if grade_id is None:
+            return
+        session = get_session()
+        try:
+            classes = (
+                session.query(SchoolClass).filter_by(grade_id=grade_id)
+                .order_by(SchoolClass.class_number).all()
+            )
+            for sc in classes:
+                item = QListWidgetItem(sc.display_name)
+                item.setData(Qt.ItemDataRole.UserRole, sc.id)
+                self.list_room_classes.addItem(item)
+        finally:
+            session.close()
+
+    def _add_exam_room(self):
+        """
+        입력된 정보로 혼합 시험실(ExamRoom)을 생성합니다.
+
+        포함 반을 1개 이상 선택해야 하는 이유: source_class_ids 가 비어
+        있으면 core.exam_scheduler._collect_hard_constraints() 가 담임·
+        담당과목 금지 교사 집합을 계산할 근거(어느 반 학생이 섞였는지)가
+        없어, 사실상 아무도 감독 금지되지 않는 "구멍"이 생깁니다. 그런
+        상태로 저장되는 것을 막기 위해 생성 시점에 검증합니다.
+
+        설명(label)을 필수로 받는 이유: 관리자 화면·감독표 그리드·PDF/CSV
+        출력 어디서나 이 시험실은 "반 이름" 대신 label 로만 표시됩니다
+        (단일 반이 아니므로 표시할 반 이름 자체가 없음) — 비워두면 모든
+        화면에 빈 칸이 뜨게 됩니다.
+        """
+        exam_id = self._selected_exam_id()
+        if exam_id is None:
+            return
+        period_id = self.cmb_room_period.currentData()
+        if period_id is None:
+            QMessageBox.information(self, "안내", "교시를 선택해 주세요(교시가 없으면 먼저 시험 기간을 등록하세요).")
+            return
+        grade_id = self.cmb_room_grade.currentData()
+        if grade_id is None:
+            QMessageBox.information(self, "안내", "학년 정보가 없습니다.")
+            return
+        source_ids = [
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self.list_room_classes.selectedItems()
+        ]
+        if not source_ids:
+            QMessageBox.warning(self, "입력 오류", "포함 반을 1개 이상 선택해 주세요.")
+            return
+        label = self.edit_room_label.text().strip()
+        if not label:
+            QMessageBox.warning(self, "입력 오류", "설명을 입력해 주세요.")
+            return
+
+        session = get_session()
+        try:
+            room = ExamRoom(
+                exam_id=exam_id, period_id=period_id, grade_id=grade_id,
+                subject_id=self.cmb_room_subject.currentData(),
+                source_class_ids=json.dumps(source_ids),
+                student_count=self.spin_room_count.value(),
+                label=label,
+            )
+            session.add(room)
+            session.commit()
+            self.edit_room_label.clear()
+            self._load_rooms()
+        finally:
+            session.close()
+
+    def _load_rooms(self):
+        """
+        선택된 시험의 혼합 시험실 목록을 테이블에 다시 그립니다.
+
+        _load_grade_exclusions() 와 같은 이유로 show_warning=False —
+        "아직 아무 시험도 선택 안 함"은 정상 상태입니다.
+        """
+        exam_id = self._selected_exam_id(show_warning=False)
+        session = get_session()
+        try:
+            rows = []
+            if exam_id is not None:
+                rows = session.query(ExamRoom).filter_by(exam_id=exam_id).all()
+            self.tbl_rooms.setRowCount(len(rows))
+            for row, r in enumerate(rows):
+                period = session.get(ExamPeriod, r.period_id)
+                grade = session.get(Grade, r.grade_id)
+                self.tbl_rooms.setItem(row, 0, QTableWidgetItem(str(r.id)))
+                self.tbl_rooms.setItem(row, 1, QTableWidgetItem(
+                    f"{period.exam_date:%m/%d} {period.period}교시" if period else "-"))
+                self.tbl_rooms.setItem(row, 2, QTableWidgetItem(
+                    grade.name if grade else f"#{r.grade_id}"))
+                self.tbl_rooms.setItem(row, 3, QTableWidgetItem(r.label))
+                self.tbl_rooms.setItem(row, 4, QTableWidgetItem(
+                    str(r.student_count) if r.student_count is not None else "-"))
+        finally:
+            session.close()
+
+    def _delete_exam_room(self):
+        """
+        선택한 혼합 시험실을 삭제합니다.
+
+        딸린 InvigilationAssignment(그 시험실의 감독 배정)을 먼저 지우는
+        이유: exam_room_id 가 ExamRoom.id 를 참조하는 FK 인데, ExamRoom
+        모델에 cascade 관계가 선언돼 있지 않아(ExamRoom 쪽은 "독립적으로
+        관리되는 보조 테이블"이라 Exam 의 cascade 체계에만 걸려 있음—
+        shared/models.py 의 Exam.rooms 참조) SQLAlchemy 가 자동으로
+        함께 지워주지 않습니다. 먼저 지우지 않으면 FK 제약 위반으로
+        ExamRoom 삭제 자체가 실패하거나(DB 엔진에 따라), 참조가 끊긴
+        "갈 곳 없는" 배정 행이 남을 수 있습니다. 서버 API 의
+        delete_exam_room() 과 동일한 순서를 따릅니다.
+        """
+        row = self.tbl_rooms.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "안내", "삭제할 시험실을 선택해 주세요.")
+            return
+        room_id = int(self.tbl_rooms.item(row, 0).text())
+        session = get_session()
+        try:
+            from database.models import InvigilationAssignment
+            session.query(InvigilationAssignment).filter_by(exam_room_id=room_id).delete()
+            session.query(ExamRoom).filter_by(id=room_id).delete()
+            session.commit()
+            self._load_rooms()
         finally:
             session.close()

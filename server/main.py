@@ -300,6 +300,21 @@ def _migrate_columns():
             "ALTER TABLE change_request_steps ADD COLUMN target_invigilation_id INTEGER REFERENCES invigilation_assignments(id)",
             "change_request_steps.target_invigilation_id",
         ),
+        # ── exams — 부감독(2인 1조) 배정 기준 학생 수 (2026-10-04) ────────────
+        # 실제 학교 운영 기준은 학교/학기마다 다를 수 있어(검증: 2학기
+        # 1회고사 시험감독표는 24명 기준) 모듈 상수가 아닌 시험별 컬럼으로 뽑음.
+        (
+            "ALTER TABLE exams ADD COLUMN pair_threshold INTEGER NOT NULL DEFAULT 20",
+            "exams.pair_threshold",
+        ),
+        # ── invigilation_assignments — 혼합 시험실 지원 (2026-10-04) ──────────
+        # exam_room_id 추가는 단순 ALTER 로 가능하지만, school_class_id 의
+        # NOT NULL 완화는 SQLite 에서 ALTER 로 불가능해 Alembic
+        # (0004_exam_rooms_corridor) 이 batch_alter_table 로 처리합니다.
+        (
+            "ALTER TABLE invigilation_assignments ADD COLUMN exam_room_id INTEGER REFERENCES exam_rooms(id)",
+            "invigilation_assignments.exam_room_id",
+        ),
     ]
 
     db = get_session()
@@ -377,14 +392,23 @@ def _ensure_alembic_state():
         # DB URL 을 env.py 가 환경 변수에서 읽도록 그대로 둠
 
         if not alembic_initialized:
-            # ── 스키마 신선도 검사 (2026-09-19 보강) ────────────────────────
+            # ── 스키마 신선도 검사 (2026-09-19 보강, 2026-10-04 확장) ─────────
             # timetable_entry_id 가 NOT NULL 이면 0002 마이그레이션이 필요한
             # 구버전 스키마입니다. stamp 대신 upgrade 를 실행해야
             # NOT NULL 완화가 적용됩니다.
+            # 2026-10-04: invigilation_assignments.school_class_id 의 NOT NULL
+            # 완화(0004_exam_rooms_corridor, 혼합 시험실 지원)도 ALTER 로는
+            # 불가능해 같은 이유로 검사 대상에 추가합니다 — 둘 중 하나만
+            # 구버전이어도 upgrade head 를 실행해야 두 완화가 모두 적용됩니다.
             schema_is_stale = False
             if insp.has_table("timetable_change_requests"):
                 for col in insp.get_columns("timetable_change_requests"):
                     if col["name"] == "timetable_entry_id" and not col.get("nullable", True):
+                        schema_is_stale = True
+                        break
+            if not schema_is_stale and insp.has_table("invigilation_assignments"):
+                for col in insp.get_columns("invigilation_assignments"):
+                    if col["name"] == "school_class_id" and not col.get("nullable", True):
                         schema_is_stale = True
                         break
 

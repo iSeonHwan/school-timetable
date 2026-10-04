@@ -9,11 +9,19 @@
 
 제공 함수:
   generate_exam_entries(session, exam_id)
-      — 시험 시간표(과목 배치) 자동 생성
-  assign_invigilations(session, exam_id)
-      — 시험 감독 배정 자동 생성
+      — 시험 시간표(과목 배치) 자동 생성. 학년별로 ExamGradeDateExclusion
+        (시험 미참여 날짜)을 제외하고 배치합니다.
+  assign_invigilations(session, exam_id, preserve_existing=True)
+      — 시험 감독(교실감독) 배정 자동 생성. 일반 반(SchoolClass) 단위
+        슬롯뿐 아니라 여러 반이 섞인 혼합 시험실(ExamRoom)도 함께
+        배정합니다. preserve_existing=True(기본값)면 지금도 하드 제약을
+        통과하는 기존 배정은 그대로 두고 나머지만 다시 배정합니다
+        ("변경 최소화" — 실제 학교 운영 사례 반영).
+  assign_corridor_duty(session, exam_id, preserve_existing=True)
+      — 복도감독(학년×교시 단위, 시험 과목 담당 교사 중 1명) 자동 배정.
+        assign_invigilations() 이후에 호출해야 교실감독과 겹치지 않습니다.
 
-두 함수 모두 (bool, message) 튜플을 반환합니다 (generator.py 와 동일한 규약).
+세 함수 모두 (bool, message) 튜플을 반환합니다 (generator.py 와 동일한 규약).
 """
 import json
 import logging
@@ -26,6 +34,7 @@ from shared.models import (
     Exam, ExamPeriod, ExamEntry, InvigilationAssignment, InvigilationConstraint,
     SchoolClass, SubjectClassAssignment, TimetableEntry, TeacherConstraint,
     Grade, Subject, Teacher,
+    ExamRoom, CorridorDutyAssignment, ExamGradeDateExclusion,
 )
 
 # ── 소프트 제약 점수 가중치 ──────────────────────────────────────────────────
@@ -53,7 +62,10 @@ MAX_ATTEMPTS = 10
 # 훨씬 위험하기 때문입니다. 20 = 2인 1조 판단 기준(요구사항 5).
 DEFAULT_STUDENT_COUNT = 30
 
-# 2인 1조 판단 기준 학생 수 (요구사항 5: 20명 이상 → 2인 1조)
+# 2인 1조 판단 기준 학생 수의 기본값 (요구사항 5: 20명 이상 → 2인 1조).
+# Exam.pair_threshold 컬럼이 시험별 실제 값을 가지며, 이 상수는 그
+# 컬럼의 기본값(과거 동작과의 하위 호환)으로만 쓰인다 — 실제 2학기
+# 1회고사 시험감독표(엑셀)로 확인한 학교 현장 기준은 24명이었다.
 PAIR_THRESHOLD = 20
 
 _logger = logging.getLogger(__name__)
@@ -142,6 +154,26 @@ def _parse_target_grade_ids(exam: Exam) -> list[int]:
         return []
 
 
+def _excluded_dates_by_grade(session: Session, exam: Exam) -> dict[int, set]:
+    """
+    학년별 시험 미참여 날짜 집합 반환 (2026-10-04 추가, ExamGradeDateExclusion).
+
+    실제 운영 사례: 시험 기간 첫날은 특정 학년만 정상수업이고 둘째 날부터
+    그 학년도 시험에 들어가는 경우가 있었다. Exam.target_grade_ids 는
+    "시험 참여 학년"을 기간 전체에 대해 한 번만 정하므로, 이 함수가 반환하는
+    예외 날짜만큼은 그 학년의 시험 시간표 배치·감독 슬롯 생성에서 제외한다
+    (그 날짜는 정상수업이라 시험·감독 모두 필요 없음).
+
+    Returns:
+        {grade_id: {exam_date, ...}} — 비어 있으면 예외 없음(전원 참여)
+    """
+    result: dict[int, set] = {}
+    rows = session.query(ExamGradeDateExclusion).filter_by(exam_id=exam.id).all()
+    for row in rows:
+        result.setdefault(row.grade_id, set()).add(row.exam_date)
+    return result
+
+
 def generate_exam_entries(session: Session, exam_id: int) -> tuple[bool, str]:
     """
     시험 시간표(과목 배치) 자동 생성.
@@ -209,13 +241,22 @@ def generate_exam_entries(session: Session, exam_id: int) -> tuple[bool, str]:
             return False, f"{grade_id}번 학년에 배정된 과목이 없습니다. 시수 배정을 먼저 하세요."
         grade_subjects[grade_id] = subject_ids
 
+    # 학년별 가용 교시 — 그 학년이 시험 미참여로 등록된 날짜(정상수업 등,
+    # ExamGradeDateExclusion)는 빼고 계산합니다 (요구사항: 학년별로 시험
+    # 참여 날짜가 다를 수 있음).
+    excluded_dates = _excluded_dates_by_grade(session, exam)
+    grade_periods: dict[int, list[ExamPeriod]] = {}
+    for grade_id in grade_subjects:
+        skip = excluded_dates.get(grade_id, set())
+        grade_periods[grade_id] = [p for p in periods if p.exam_date not in skip]
+
     # 칸 수 검증 — 과목 수가 가용 교시보다 많으면 배치 자체가 불가능
-    total_slots = len(periods)
     for grade_id, subject_ids in grade_subjects.items():
-        if len(subject_ids) > total_slots:
+        available = len(grade_periods[grade_id])
+        if len(subject_ids) > available:
             return False, (
                 f"배치 불가: {grade_id}번 학년 과목 수({len(subject_ids)})가 "
-                f"가용 교시 수({total_slots})를 초과합니다."
+                f"가용 교시 수({available})를 초과합니다."
             )
 
     # 수동 편집 칸 존재 여부 확인 — 삭제 후 재배치되므로 안내에 사용
@@ -224,18 +265,13 @@ def generate_exam_entries(session: Session, exam_id: int) -> tuple[bool, str]:
     # 기존 배치 전체 삭제 후 재배치 (자동 배치는 "재생성" 개념)
     session.query(ExamEntry).filter_by(exam_id=exam.id).delete()
 
-    # 학년별 순차 배치
-    # 각 날짜에 배치된 과목 수를 세어 하루 상한을 검사합니다.
-    period_ids_by_date: dict = {}
-    for p in periods:
-        period_ids_by_date.setdefault(p.exam_date, []).append(p)
-
+    # 학년별 순차 배치 — 각 날짜에 배치된 과목 수를 세어 하루 상한을 검사합니다.
     placed = 0
     for grade_id, subject_ids in grade_subjects.items():
         idx = 0                       # 다음에 배치할 과목 인덱스
         per_day_count = 0             # 오늘(현재 순회 중 날짜)에 넣은 과목 수
         current_date = None
-        for p in periods:
+        for p in grade_periods[grade_id]:
             if p.exam_date != current_date:
                 current_date = p.exam_date
                 per_day_count = 0
@@ -268,33 +304,89 @@ def generate_exam_entries(session: Session, exam_id: int) -> tuple[bool, str]:
     return True, msg
 
 
-def _build_slots(session: Session, exam: Exam, periods: list[ExamPeriod],
-                 classes: list[SchoolClass]) -> list[dict]:
+def _build_slots(
+    session: Session, exam: Exam, periods: list[ExamPeriod],
+    classes: list[SchoolClass], excluded_dates: dict[int, set] | None = None,
+) -> list[dict]:
     """
     감독 슬롯 목록 생성.
 
-    각 슬롯은 (교시 × 반 × 조 번호) 하나이며, 반 학생 수에 따라
-    조 슬롯 수가 결정됩니다 (요구사항 5):
-      - 학생 20명 이상(student_count >= 20) → pair_index 1, 2 두 슬롯
-      - 학생 20명 미만                     → pair_index 1 한 슬롯
-      - student_count 미입력               → 기본 30명 가정 → 2인 1조
+    두 가지 슬롯 종류를 만듭니다 (각각 kind="class"/"room"):
+      - "class": 일반적인 경우 — 반 하나가 그대로 한 시험실(기존 동작).
+      - "room": 여러 반 학생이 섞이는 시험실 (ExamRoom, 2026-10-04 추가 —
+        선택과목·학년 공통 고사/미선택실 등). 반 경계를 넘으므로 담임·
+        담당과목 금지 판정은 ExamRoom.source_class_ids 기준으로 따로
+        계산합니다 (_collect_hard_constraints 참조).
+
+    두 종류 모두 조 슬롯 수 결정 규칙은 동일합니다 (요구사항 5):
+      - 학생 수 >= exam.pair_threshold → pair_index 1, 2 두 슬롯 (2인 1조)
+      - 학생 수 <  exam.pair_threshold → pair_index 1 한 슬롯 (1인 감독)
+      - student_count 미입력            → 기본값 가정 → 2인 1조
         (감독 부족 사고가 과잉 배정보다 위험하므로 안전한 쪽을 택함)
 
+    excluded_dates: {grade_id: {exam_date, ...}} — 그 학년이 시험 미참여로
+      등록된 날짜(ExamGradeDateExclusion)는 반/시험실 모두 슬롯을 만들지
+      않습니다(그 날은 정상수업이라 감독이 필요 없음).
+
     반환 슬롯(dict) 구성:
-      period_id / period / exam_date / class_id / grade_id / pair_index
+      kind("class"|"room") / ref_id(school_class_id 또는 exam_room_id) /
+      period_id / period / exam_date / grade_id / pair_index
     """
+    threshold = exam.pair_threshold if exam.pair_threshold is not None else PAIR_THRESHOLD
+    excluded_dates = excluded_dates or {}
     slots = []
+
+    # 혼합 시험실(ExamRoom)에 포함된 반은 그 교시에 "자기 반 교실"에서
+    # 따로 시험을 치르지 않습니다(학생들이 혼합 시험실에 가 있음). 그런데
+    # 아래 class 루프는 반 목록을 기준으로 교시마다 무조건 슬롯을 만들기
+    # 때문에, 이 집합으로 걸러주지 않으면 "학생이 없는 자기 반 교실"에도
+    # 감독을 요구하는 유령 슬롯이 생겨 필요 이상으로 인력을 소모합니다.
+    period_by_id = {p.id: p for p in periods}
+    rooms = session.query(ExamRoom).filter_by(exam_id=exam.id).all()
+    room_covers: set[tuple] = set()   # {(period_id, school_class_id)}
+    for room in rooms:
+        try:
+            source_ids = json.loads(room.source_class_ids or "[]")
+        except (ValueError, TypeError):
+            source_ids = []
+        for cid in source_ids:
+            room_covers.add((room.period_id, cid))
+
     for p in periods:
         for sc in classes:
+            if p.exam_date in excluded_dates.get(sc.grade_id, set()):
+                continue   # 이 학년은 이 날짜 시험 미참여(정상수업 등)
+            if (p.id, sc.id) in room_covers:
+                continue   # 이 교시엔 혼합 시험실이 이 반을 대신 커버함
             count = sc.student_count if sc.student_count is not None else DEFAULT_STUDENT_COUNT
-            pair_total = 2 if count >= PAIR_THRESHOLD else 1
+            pair_total = 2 if count >= threshold else 1
             for pair_index in range(1, pair_total + 1):
                 slots.append({
+                    "kind": "class", "ref_id": sc.id,
                     "period_id": p.id, "period": p.period,
                     "exam_date": p.exam_date,
-                    "class_id": sc.id, "grade_id": sc.grade_id,
+                    "grade_id": sc.grade_id,
                     "pair_index": pair_index,
                 })
+
+    # 혼합 시험실(여러 반이 섞이는 선택과목·공통고사 등) — ExamRoom 은 이미
+    # 특정 period_id 에 묶여 있으므로 periods 목록과 교차할 필요가 없습니다.
+    for room in rooms:
+        p = period_by_id.get(room.period_id)
+        if p is None:
+            continue   # 이 배정 대상 교시 목록에 없는 시험실(다른 시험 등) — 방어적 skip
+        if p.exam_date in excluded_dates.get(room.grade_id, set()):
+            continue
+        count = room.student_count if room.student_count is not None else DEFAULT_STUDENT_COUNT
+        pair_total = 2 if count >= threshold else 1
+        for pair_index in range(1, pair_total + 1):
+            slots.append({
+                "kind": "room", "ref_id": room.id,
+                "period_id": p.id, "period": p.period,
+                "exam_date": p.exam_date,
+                "grade_id": room.grade_id,
+                "pair_index": pair_index,
+            })
     return slots
 
 
@@ -417,39 +509,86 @@ def _collect_hard_constraints(
     for e in session.query(ExamEntry).filter_by(exam_id=exam.id).all():
         exam_subject_of[(e.period_id, e.grade_id)] = e.subject_id
 
+    # ── 6. 혼합 시험실(ExamRoom) 전용 담임·담당과목 금지 집합 (2026-10-04) ────
+    # 반 경계를 넘는 시험실은 "그 반"이 하나가 아니므로, 섞인 반들
+    # (source_class_ids) 전체를 기준으로 담임·담당과목 교사를 모아 금지합니다
+    # (실제 기준: "여러 반 학생이 섞이는 교실은 그 학년 담임 모두 제외").
+    room_banned_homeroom: dict[int, set] = {}
+    room_banned_subject: dict[int, set] = {}
+    rooms = session.query(ExamRoom).filter_by(exam_id=exam.id).all()
+    if rooms:
+        homeroom_by_class: dict[int, set] = {}
+        for tid, cid in homeroom.items():
+            homeroom_by_class.setdefault(cid, set()).add(tid)
+        for room in rooms:
+            try:
+                source_ids = json.loads(room.source_class_ids or "[]")
+            except (ValueError, TypeError):
+                source_ids = []
+            if exam.ban_homeroom_invigilation:
+                banned = set()
+                for cid in source_ids:
+                    banned |= homeroom_by_class.get(cid, set())
+                if banned:
+                    room_banned_homeroom[room.id] = banned
+            if exam.ban_own_subject and room.subject_id is not None:
+                banned = set()
+                for cid in source_ids:
+                    banned |= own_subject.get((cid, room.subject_id), set())
+                if banned:
+                    room_banned_subject[room.id] = banned
+
     return {
         "busy": busy, "homeroom": homeroom, "own_subject": own_subject,
         "unavailable_days": unavailable_days,
         "unavailable_slots": unavailable_slots,
         "weekly_unavailable": weekly_unavailable,
         "exam_subject_of": exam_subject_of,
+        "room_banned_homeroom": room_banned_homeroom,
+        "room_banned_subject": room_banned_subject,
     }
 
 
 def _slot_is_allowed(teacher_id: int, slot: dict, hard: dict) -> bool:
     """
-    하드 제약 5종을 통과하는지 검사.
+    하드 제약을 통과하는지 검사.
 
     감독 슬롯마다 후보 교사 전원에 대해 호출되므로, 모든 검사는
     사전 수집된 set/dict 조회로 O(1)에 끝나야 합니다 (generator.py 방식).
+
+    슬롯 종류(kind)에 따라 담임·담당과목 검사 방식이 다릅니다:
+      - "class": 반 하나 = 시험실 하나 (기존 동작) — homeroom/own_subject
+        딕셔너리를 그 반 id 로 직접 조회.
+      - "room": 여러 반이 섞인 시험실(ExamRoom) — 반 경계가 없으므로
+        _collect_hard_constraints() 가 미리 합쳐둔 room_banned_* 집합을
+        조회 (요구사항: 2학년 선택과목·3학년 공통 고사 등).
     """
     date = slot["exam_date"]
     period = slot["period"]
-    class_id = slot["class_id"]
     grade_id = slot["grade_id"]
     dow = date.weekday() + 1   # TimetableEntry.day_of_week 은 월=1
 
     # 1. 그 시간대에 수업 중인 교사는 감독 불가 (요구사항 6)
     if teacher_id in hard["busy"].get((dow, period), set()):
         return False
-    # 2. 담임은 자기 반 감독 불가 (요구사항 2)
-    if hard["homeroom"].get(teacher_id) == class_id:
-        return False
-    # 3. 시험 과목 담당 교사는 그 시험 시간 감독 불가 (요구사항 2)
-    subject_id = hard["exam_subject_of"].get((slot["period_id"], grade_id))
-    if subject_id is not None:
-        if teacher_id in hard["own_subject"].get((class_id, subject_id), set()):
+
+    if slot["kind"] == "class":
+        class_id = slot["ref_id"]
+        # 2. 담임은 자기 반 감독 불가 (요구사항 2)
+        if hard["homeroom"].get(teacher_id) == class_id:
             return False
+        # 3. 시험 과목 담당 교사는 그 시험 시간 감독 불가 (요구사항 2)
+        subject_id = hard["exam_subject_of"].get((slot["period_id"], grade_id))
+        if subject_id is not None:
+            if teacher_id in hard["own_subject"].get((class_id, subject_id), set()):
+                return False
+    else:   # "room" — 여러 반이 섞인 시험실
+        room_id = slot["ref_id"]
+        if teacher_id in hard["room_banned_homeroom"].get(room_id, set()):
+            return False
+        if teacher_id in hard["room_banned_subject"].get(room_id, set()):
+            return False
+
     # 4. 승인된 감독 불가 신청 (특정 날짜 전체 / 특정 교시)
     if date in hard["unavailable_days"].get(teacher_id, set()):
         return False
@@ -461,7 +600,10 @@ def _slot_is_allowed(teacher_id: int, slot: dict, hard: dict) -> bool:
     return True
 
 
-def _try_assign(slots: list[dict], teacher_ids: list[int], hard: dict) -> dict | None:
+def _try_assign(
+    slots: list[dict], teacher_ids: list[int], hard: dict,
+    pinned: dict | None = None,
+) -> dict | None:
     """
     감독 배정 1회 시도 (랜덤 재시작의 단위).
 
@@ -477,14 +619,44 @@ def _try_assign(slots: list[dict], teacher_ids: list[int], hard: dict) -> dict |
     - 동점 후보가 여럿이면 random.choice 로 선택해 시도마다 다른 결과를
       만듭니다 (랜덤 재시작의 의미).
 
+    Args:
+        pinned: {slot_key: teacher_id} — 이번 시도에서 그대로 유지할
+            기존 배정("변경 최소화", 요구사항 14). assign_invigilations()
+            가 "현재도 하드 제약을 통과하는 이전 배정"만 골라 넘겨줍니다.
+            여기서는 그 값을 그대로 결과에 반영하고, 공평성 점수 계산의
+            기준값(total_count/same_day/last_period_date)에도 포함시켜
+            나머지 빈 슬롯을 채울 때 이미 배정된 몫을 고려하게 합니다.
+            pinned 에 없는 슬롯만 평소처럼 탐욕적으로 배정합니다.
+
     Returns:
         배정 결과 {slot_key: teacher_id or None}. 슬롯 key 는
-        (period_id, class_id, pair_index) 튜플 — DB 유니크 제약과 동일한 단위.
+        (period_id, kind, ref_id, pair_index) 튜플 — kind="class"면 ref_id는
+        school_class_id, kind="room"이면 ExamRoom.id (DB 유니크 제약 2종과
+        각각 대응하는 단위).
     """
+    pinned = pinned or {}
+    slot_by_key = {
+        (s["period_id"], s["kind"], s["ref_id"], s["pair_index"]): s for s in slots
+    }
+
     assignment: dict = {}
     total_count: dict[int, int] = {}       # 교사별 누적 감독 횟수
     same_day: dict[tuple, int] = {}        # (교사, 날짜)별 감독 횟수
     last_period_date: dict[tuple, int] = {}  # (교사, 날짜) → 직전 감독 교시
+    # 고정된 슬롯이 이미 차지한 (날짜,교시) 자리 — 나머지 슬롯 배정 시
+    # 같은 교시에 같은 교사가 중복 배정되지 않도록 선반영합니다.
+    pinned_by_period: dict[tuple, set[int]] = {}
+
+    for key, tid in pinned.items():
+        slot = slot_by_key.get(key)
+        if slot is None:
+            continue   # 이전 배정 슬롯이 이번 배정 대상에서 사라짐(반 변경 등)
+        d, period = slot["exam_date"], slot["period"]
+        assignment[key] = tid
+        total_count[tid] = total_count.get(tid, 0) + 1
+        same_day[(tid, d)] = same_day.get((tid, d), 0) + 1
+        last_period_date[(tid, d)] = period
+        pinned_by_period.setdefault((d, period), set()).add(tid)
 
     # 슬롯 순서: 교시(날짜·교시) 순은 유지하되, 같은 교시 내 반 순서는 섞어
     # 특정 반에 특정 교사가 계속 걸리는 편향을 방지합니다.
@@ -502,9 +674,11 @@ def _try_assign(slots: list[dict], teacher_ids: list[int], hard: dict) -> dict |
     for (date, period) in sorted(by_period.keys()):
         group = by_period[(date, period)]
         random.shuffle(group)
-        assigned_this_period: set[int] = set()
+        assigned_this_period: set[int] = set(pinned_by_period.get((date, period), set()))
         for slot in group:
-            key = (slot["period_id"], slot["class_id"], slot["pair_index"])
+            key = (slot["period_id"], slot["kind"], slot["ref_id"], slot["pair_index"])
+            if key in pinned and key in assignment:
+                continue   # 고정된 슬롯 — 다시 배정하지 않음
             best: tuple[int, list[int]] | None = None
             for tid in shuffled_teachers:
                 if tid in assigned_this_period:
@@ -555,19 +729,34 @@ def _solution_quality(assignment: dict, teacher_ids: list[int]) -> tuple[int, fl
     return (unassigned, float(sq))
 
 
-def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
+def assign_invigilations(
+    session: Session, exam_id: int, preserve_existing: bool = True,
+) -> tuple[bool, str]:
     """
     시험 감독 자동 배정 (요구사항 2·3·5·6 종합).
 
     동작 순서:
       1. 시험 대상 학년의 반들을 대상으로 감독 슬롯을 생성합니다.
-         (학생 20명 이상 반은 2인 1조 — _build_slots 참조)
+         (학생 수 기준 2인 1조 — _build_slots 참조)
       2. 하드 제약 데이터를 사전 수집합니다 (_collect_hard_constraints).
-      3. 랜덤 재시작(MAX_ATTEMPTS회)으로 배정을 시도하고,
-         "미배정 수 → 감독 횟수 분산" 기준으로 최선의 결과를 채택합니다.
-      4. 기존 배정을 삭제하고 최선 결과를 저장합니다.
+      3. preserve_existing=True(기본값)이면, 기존 배정 중 지금도 하드
+         제약을 통과하는 슬롯은 그대로 "고정"하고, 나머지(새 슬롯·제약이
+         바뀌어 더는 유효하지 않은 슬롯·원래 미배정이던 슬롯)만 다시
+         배정합니다 — 요구사항 14 "변경 최소화"(직전 배정을 최대한
+         유지). 실제 학교 사례(2학기 1회고사 시험감독표 "작성 기준" 11번:
+         "배정을 다시 계산할 때는 직전 배정을 최대한 유지")를 반영합니다.
+      4. 랜덤 재시작(MAX_ATTEMPTS회)으로 "고정되지 않은" 나머지 슬롯만
+         배정을 시도하고, "미배정 수 → 감독 횟수 분산" 기준으로 최선의
+         결과를 채택합니다. 고정 슬롯은 모든 시도에서 동일하므로 비교에
+         영향을 주지 않습니다.
+      5. 기존 배정을 삭제하고 최선 결과를 저장합니다.
          미배정 슬롯도 teacher_id=NULL 로 저장해, 어떤 반·교시에 감독이
          비었는지 관리자가 확인하고 수동 배정할 수 있게 합니다.
+
+    Args:
+        preserve_existing: False 로 호출하면 기존 배정을 전부 무시하고
+            완전히 새로 배정합니다(과거 동작). 사람이 보기에 결과가
+            뒤섞이는 대신 완전히 새 분포로 다시 시작하고 싶을 때 사용.
 
     Returns:
         모든 슬롯에 배정 성공 → (True, 요약 메시지)
@@ -607,7 +796,8 @@ def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
         return False, "교사 정보가 없습니다."
     teacher_ids = [t.id for t in teachers]
 
-    slots = _build_slots(session, exam, periods, classes)
+    excluded_dates = _excluded_dates_by_grade(session, exam)
+    slots = _build_slots(session, exam, periods, classes, excluded_dates)
     if not slots:
         return False, "감독 슬롯이 없습니다."
 
@@ -636,11 +826,37 @@ def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
             exam.id,
         )
 
+    # ── 변경 최소화(요구사항 14): 지금도 유효한 기존 배정을 "고정" ───────────
+    # 고정 대상 조건: (1) 그 슬롯(교시×반×조)이 이번에도 존재하고,
+    # (2) 그 교사가 지금 기준으로도 하드 제약을 전부 통과해야 합니다.
+    # 조건 (2)를 확인하는 이유 — 재배정 사이에 새 감독 불가 신청이
+    # 승인되거나 담임이 바뀌는 등 제약이 변할 수 있으므로, 더는 유효하지
+    # 않은 과거 배정을 그대로 고정해버리면 하드 제약 위반이 영구화됩니다.
+    pinned: dict = {}
+    if preserve_existing:
+        slot_by_key = {
+            (s["period_id"], s["kind"], s["ref_id"], s["pair_index"]): s for s in slots
+        }
+        previous = session.query(InvigilationAssignment).filter_by(exam_id=exam.id).all()
+        for a in previous:
+            if a.teacher_id is None:
+                continue
+            if a.exam_room_id is not None:
+                key = (a.period_id, "room", a.exam_room_id, a.pair_index)
+            else:
+                key = (a.period_id, "class", a.school_class_id, a.pair_index)
+            slot = slot_by_key.get(key)
+            if slot is None:
+                continue
+            if _slot_is_allowed(a.teacher_id, slot, hard):
+                pinned[key] = a.teacher_id
+
     # 랜덤 재시작 — 각 시도는 동점 후보/슬롯 순서를 다르게 하여
     # 다른 배정 결과를 만들고, 그중 품질이 가장 좋은 것을 채택합니다.
+    # (고정 슬롯은 모든 시도에서 동일하게 유지됩니다)
     best: tuple | None = None
     for _ in range(MAX_ATTEMPTS):
-        result = _try_assign(slots, teacher_ids, hard)
+        result = _try_assign(slots, teacher_ids, hard, pinned=pinned)
         quality = _solution_quality(result, teacher_ids)
         if best is None or quality < best[0]:
             best = (quality, result)
@@ -653,10 +869,11 @@ def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
     # 기존 배정 전체 삭제 후 최선 결과 저장 ("재생성" 개념)
     session.query(InvigilationAssignment).filter_by(exam_id=exam.id).delete()
     for slot in slots:
-        key = (slot["period_id"], slot["class_id"], slot["pair_index"])
+        key = (slot["period_id"], slot["kind"], slot["ref_id"], slot["pair_index"])
         session.add(InvigilationAssignment(
             exam_id=exam.id, period_id=slot["period_id"],
-            school_class_id=slot["class_id"],
+            school_class_id=slot["ref_id"] if slot["kind"] == "class" else None,
+            exam_room_id=slot["ref_id"] if slot["kind"] == "room" else None,
             teacher_id=result.get(key),          # 미배정이면 None
             pair_index=slot["pair_index"],
         ))
@@ -675,10 +892,242 @@ def assign_invigilations(session: Session, exam_id: int) -> tuple[bool, str]:
     else:
         fairness = f"총 {total}슬롯"
 
+    # 변경 최소화(요구사항 14) 안내 — 이전 배정 중 몇 자리가 그대로 유지됐는지
+    kept = sum(1 for key, tid in pinned.items() if result.get(key) == tid)
+    keep_note = f" (이전 배정 {kept}자리 유지)" if pinned else ""
+
     if unassigned == 0:
-        return True, f"감독 자동 배정 완료 — {fairness}"
+        return True, f"감독 자동 배정 완료 — {fairness}{keep_note}"
     return False, (
         f"감독 자동 배정 완료(부분): {assigned}/{total} 슬롯 배정, "
         f"{unassigned}슬롯 미배정(후보 부족 — 감독 불가 승인 상태나 교사 수 확인). "
-        f"미배정 슬롯은 감독표에서 수동 배정하세요. {fairness}"
+        f"미배정 슬롯은 감독표에서 수동 배정하세요. {fairness}{keep_note}"
+    )
+
+
+def assign_corridor_duty(
+    session: Session, exam_id: int, preserve_existing: bool = True,
+) -> tuple[bool, str]:
+    """
+    복도감독 자동 배정 (2026-10-04 추가).
+
+    실제 운영 기준(2학기 1회고사 시험감독표 "작성 기준" 2번): "복도감독은
+    학년별 1명을 그 교시 시험 과목 담당 교사 중에서 배정한다. 나머지 과목
+    담당 교사는 교시 중 질의 대응 대기(감독 횟수 미산정)." 교실감독
+    (InvigilationAssignment)과 역할·후보군이 완전히 달라(반/시험실이
+    아니라 학년×교시 단위, 후보는 "그 교시 시험 과목 담당 교사"로 한정)
+    별도 테이블(CorridorDutyAssignment)로 관리합니다.
+
+    선행 조건: assign_invigilations() 가 먼저 실행돼 있어야 "이 교시에
+    이미 교실감독 중인 교사"를 겸임 후보에서 제외할 수 있습니다. 순서를
+    지키지 않아도 에러는 아니지만, 교실감독과 겹치는 배정이 나올 수 있어
+    먼저 호출하는 것을 권장합니다.
+
+    동작:
+      1. (교시, 학년)마다 그 교시 그 학년의 시험 과목 담당 교사 후보군을
+         구합니다 — ExamEntry(학년 공통 시험) + ExamRoom(선택과목처럼
+         반 경계를 넘는 시험, subject_id 가 있는 것만) 양쪽에서 과목·
+         담당 교사를 모읍니다. 자습 교시(해당 교시에 시험 과목이 없음)는
+         복도감독 대상이 아니므로 자동으로 제외됩니다.
+      2. 그 교시에 이미 교실감독으로 배정된 교사, 그 시간대에 다른 수업이
+         있는 교사(hard["busy"]), 승인된 감독 불가·주간 제약 위반 교사를
+         후보에서 제외합니다.
+      3. 남은 후보 중 지금까지 업무량(교실감독+복도감독 합산)이 가장 적은
+         교사를 선택합니다(동점이면 무작위) — 전체 부담 공평성.
+      4. preserve_existing=True(기본값)면 지금도 유효한 기존 복도감독
+         배정은 그대로 둡니다("변경 최소화", assign_invigilations 와 동일한
+         원칙).
+
+    후보가 전혀 없는 (학년, 교시)는 teacher_id=NULL 로 남겨 수동 배정
+    여지를 둡니다.
+
+    Returns:
+        모든 배정 성공 → (True, 요약 메시지)
+        일부 미배정     → (False, 안내 메시지)
+    """
+    exam = session.get(Exam, exam_id)
+    if exam is None:
+        return False, "시험을 찾을 수 없습니다."
+
+    periods = (
+        session.query(ExamPeriod)
+        .filter_by(exam_id=exam.id)
+        .order_by(ExamPeriod.exam_date, ExamPeriod.period)
+        .all()
+    )
+    if not periods:
+        return False, "시험 교시(ExamPeriod)가 없습니다."
+
+    target_grades = _parse_target_grade_ids(exam)
+    if not target_grades:
+        target_grades = [g.id for g in session.query(Grade).order_by(Grade.grade_number).all()]
+    if not target_grades:
+        return False, "학년 정보가 없습니다."
+
+    excluded_dates = _excluded_dates_by_grade(session, exam)
+    hard = _collect_hard_constraints(session, exam, periods, target_grades)
+    period_by_id = {p.id: p for p in periods}
+
+    # 학년 → 반 id 목록, 반 → 학년 (시험 과목 담당 교사 조회용)
+    classes_by_grade: dict[int, list[int]] = {}
+    class_to_grade: dict[int, int] = {}
+    for sc in session.query(SchoolClass).filter(SchoolClass.grade_id.in_(target_grades)):
+        classes_by_grade.setdefault(sc.grade_id, []).append(sc.id)
+        class_to_grade[sc.id] = sc.grade_id
+
+    # (period_id, grade_id) → 시험 과목 담당 교사 집합
+    candidates_by_slot: dict[tuple, set] = {}
+
+    # 1) ExamEntry — 학년 전체가 함께 치르는 공통 시험 과목
+    #
+    # entry_subject_of 는 "이 교시·이 학년의 시험 과목이 뭔지"를, rows 는
+    # "어느 반·어느 과목을 누가 가르치는지"를 담고 있어 — 서로 독립적으로
+    # 조회한 두 데이터셋이라 교차 비교(두 번째 for 안의 for)가 필요합니다.
+    # 반대로 (grade_id, subject_id) → teacher_id 역인덱스를 먼저 만들어두면
+    # 안쪽 루프 없이 O(rows) 로 끝낼 수도 있지만, 학교 규모(교시·학년·반
+    # 수가 전부 작은 정수)에서는 이중 루프의 실제 비용이 무시할 만한
+    # 수준이라 가독성을 우선해 그대로 둡니다.
+    entry_subject_of: dict[tuple, int] = {}
+    for e in session.query(ExamEntry).filter_by(exam_id=exam.id).all():
+        entry_subject_of[(e.period_id, e.grade_id)] = e.subject_id
+    if entry_subject_of:
+        class_ids_all = list(class_to_grade.keys())
+        rows = (
+            session.query(
+                SubjectClassAssignment.school_class_id,
+                SubjectClassAssignment.subject_id,
+                SubjectClassAssignment.teacher_id,
+            )
+            .filter(
+                SubjectClassAssignment.term_id == exam.term_id,
+                SubjectClassAssignment.school_class_id.in_(class_ids_all),
+            )
+            .all()
+        ) if class_ids_all else []
+        for class_id, subject_id, teacher_id in rows:
+            grade_id = class_to_grade.get(class_id)
+            if grade_id is None:
+                continue
+            for (period_id, g), subj in entry_subject_of.items():
+                if g == grade_id and subj == subject_id:
+                    candidates_by_slot.setdefault((period_id, grade_id), set()).add(teacher_id)
+
+    # 2) ExamRoom — 선택과목처럼 반 경계를 넘는 시험(자습 방=subject_id None 은 제외)
+    for room in session.query(ExamRoom).filter_by(exam_id=exam.id).all():
+        if room.subject_id is None:
+            continue
+        try:
+            source_ids = json.loads(room.source_class_ids or "[]")
+        except (ValueError, TypeError):
+            source_ids = []
+        if not source_ids:
+            continue
+        rows = (
+            session.query(SubjectClassAssignment.teacher_id)
+            .filter(
+                SubjectClassAssignment.term_id == exam.term_id,
+                SubjectClassAssignment.school_class_id.in_(source_ids),
+                SubjectClassAssignment.subject_id == room.subject_id,
+            )
+            .all()
+        )
+        for (teacher_id,) in rows:
+            candidates_by_slot.setdefault((room.period_id, room.grade_id), set()).add(teacher_id)
+
+    if not candidates_by_slot:
+        return False, (
+            "복도감독 후보(시험 과목 담당 교사)를 찾을 수 없습니다. "
+            "시험 시간표를 먼저 배치하세요(generate_exam_entries)."
+        )
+
+    # 이미 교실감독으로 배정된 교사 — 같은 교시에 복도감독 겸임 불가
+    classroom_busy: dict[int, set] = {}   # period_id -> set(teacher_id)
+    for a in session.query(InvigilationAssignment).filter_by(exam_id=exam.id):
+        if a.teacher_id is not None:
+            classroom_busy.setdefault(a.period_id, set()).add(a.teacher_id)
+
+    # 전체 업무 부담 공평성 — 교실감독 횟수를 복도감독 배정의 출발 기준으로 사용
+    total_count: dict[int, int] = {}
+    for tids in classroom_busy.values():
+        for tid in tids:
+            total_count[tid] = total_count.get(tid, 0) + 1
+
+    # 변경 최소화 — 지금도 유효한 기존 복도감독 배정은 유지
+    previous = {
+        (c.period_id, c.grade_id): c.teacher_id
+        for c in session.query(CorridorDutyAssignment).filter_by(exam_id=exam.id)
+        if c.teacher_id is not None
+    }
+
+    # 슬롯 순회 순서를 (period_id, grade_id) 로 고정해 매 실행마다 동일한
+    # 순서로 처리합니다 — 분류 알고리즘 자체는 아래에서 random.choice 로
+    # 동점 후보 중 하나를 고르지만(그 부분만 무작위), 순회 순서까지
+    # 무작위면 "같은 입력에도 매번 아예 다른 학년·교시 조합이 유불리해지는"
+    # 불필요한 변동성이 추가돼 디버깅이 어려워집니다.
+    result: dict[tuple, int | None] = {}
+    for (period_id, grade_id), candidates in sorted(candidates_by_slot.items()):
+        p = period_by_id.get(period_id)
+        if p is None or p.exam_date in excluded_dates.get(grade_id, set()):
+            continue
+        dow = p.exam_date.weekday() + 1
+        busy_here = classroom_busy.get(period_id, set())
+        valid = set()
+        for tid in candidates:
+            if tid in busy_here:
+                continue
+            if tid in hard["busy"].get((dow, p.period), set()):
+                continue
+            if p.exam_date in hard["unavailable_days"].get(tid, set()):
+                continue
+            if (tid, p.exam_date, p.period) in hard["unavailable_slots"]:
+                continue
+            if (tid, dow, p.period) in hard["weekly_unavailable"]:
+                continue
+            valid.add(tid)
+
+        # 변경 최소화(assign_invigilations 의 preserve_existing 과 동일한
+        # 원칙) — 이전 복도감독이 지금도 유효한 후보(valid)라면 그대로
+        # 유지합니다. 매 실행마다 복도감독이 무작위로 바뀌면 "왜 어제까지
+        # 멀쩩던 배정이 오늘 또 바뀌었냐"는 혼란을 주기 때문입니다.
+        prev_tid = previous.get((period_id, grade_id))
+        if preserve_existing and prev_tid in valid:
+            chosen = prev_tid
+        elif valid:
+            # 동점(총 업무량이 같은) 후보가 여럿이면 무작위로 골라, 특정
+            # 교사에게 매번 쏠리는 편향을 방지합니다(generator.py/
+            # assign_invigilations 의 랜덤 동점 처리와 같은 철학).
+            lo = min(total_count.get(tid, 0) for tid in valid)
+            best = [tid for tid in valid if total_count.get(tid, 0) == lo]
+            chosen = random.choice(best)
+        else:
+            chosen = None
+
+        result[(period_id, grade_id)] = chosen
+        if chosen is not None:
+            total_count[chosen] = total_count.get(chosen, 0) + 1
+            # classroom_busy 를 그대로 재사용해 이 교시에 "선점"시킵니다 —
+            # 별도의 corridor_busy 집합을 따로 두지 않는 이유는, 다음
+            # (period_id, grade_id) 반복에서도 "이 교시에 이미 뭔가로
+            # 바쁜 교사" 판정 기준이 교실감독이든 방금 배정된 다른 학년의
+            # 복도감독이든 완전히 동일(그 교시에 또 쓸 수 없음)하기
+            # 때문입니다 — 같은 교시 여러 학년의 복도감독에 한 교사가
+            # 겹쳐 배정되는 것도 이 한 줄로 함께 막힙니다.
+            classroom_busy.setdefault(period_id, set()).add(chosen)
+
+    session.query(CorridorDutyAssignment).filter_by(exam_id=exam.id).delete()
+    for (period_id, grade_id), tid in result.items():
+        session.add(CorridorDutyAssignment(
+            exam_id=exam.id, period_id=period_id, grade_id=grade_id, teacher_id=tid,
+        ))
+    session.commit()
+
+    total = len(result)
+    assigned = sum(1 for v in result.values() if v is not None)
+    if total == 0:
+        return False, "복도감독이 필요한 (학년, 교시)가 없습니다."
+    if assigned == total:
+        return True, f"복도감독 자동 배정 완료 — {assigned}건"
+    return False, (
+        f"복도감독 자동 배정 완료(부분): {assigned}/{total}건. "
+        f"후보 부족(겸임 불가·불가 신청 등) — 나머지는 수동 배정하세요."
     )

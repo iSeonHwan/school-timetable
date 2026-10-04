@@ -781,6 +781,7 @@ class ExamOut(BaseModel):
     max_subjects_per_day: int
     ban_homeroom_invigilation: bool
     ban_own_subject: bool
+    pair_threshold: int
     status: str
     created_at: datetime
     updated_at: datetime
@@ -816,6 +817,9 @@ class ExamCreate(BaseModel):
     max_subjects_per_day: int = Field(default=3, ge=1, le=10)
     ban_homeroom_invigilation: bool = True
     ban_own_subject: bool = True
+    # 부감독(2인 1조) 배정 기준 학생 수. 기본값 20은 과거 동작과의 하위
+    # 호환이며, 학교 실제 운영 기준(예: 24명)에 맞춰 조정 가능합니다.
+    pair_threshold: int = Field(default=20, ge=1, le=100)
 
 
 class ExamUpdate(BaseModel):
@@ -840,6 +844,7 @@ class ExamUpdate(BaseModel):
     max_subjects_per_day: Optional[int] = Field(None, ge=1, le=10)
     ban_homeroom_invigilation: Optional[bool] = None
     ban_own_subject: Optional[bool] = None
+    pair_threshold: Optional[int] = Field(None, ge=1, le=100)
 
 
 class ExamPeriodOut(BaseModel):
@@ -881,11 +886,20 @@ class ExamEntryUpdate(BaseModel):
 
 
 class InvigilationAssignmentOut(BaseModel):
-    """감독 배정 응답 (교시·반·교사 이름은 서버가 조인해 주입)."""
+    """
+    감독 배정 응답 (교시·반·교사 이름은 서버가 조인해 주입).
+
+    school_class_id 가 Optional 인 이유(2026-10-04 변경): 여러 반이 섞인
+    혼합 시험실(ExamRoom) 슬롯은 단일 반이 없어 school_class_id=None,
+    exam_room_id=<ExamRoom.id> 로 표현됩니다. 둘 중 하나는 항상 값이
+    있습니다 — 일반 슬롯은 school_class_id만, 혼합 시험실 슬롯은
+    exam_room_id만.
+    """
     id: int
     exam_id: int
     period_id: int
-    school_class_id: int
+    school_class_id: Optional[int] = None
+    exam_room_id: Optional[int] = None
     teacher_id: Optional[int]
     pair_index: int
     # 조회 편의용 — 서버가 조인 결과로 채웁니다
@@ -893,12 +907,99 @@ class InvigilationAssignmentOut(BaseModel):
     period_number: Optional[int] = None      # ExamPeriod.period
     start_time: Optional[time] = None
     end_time: Optional[time] = None
-    class_name: Optional[str] = None         # SchoolClass.display_name
-    class_grade_id: Optional[int] = None     # SchoolClass.grade_id
+    class_name: Optional[str] = None         # SchoolClass.display_name (혼합 시험실이면 None)
+    class_grade_id: Optional[int] = None     # SchoolClass.grade_id 또는 ExamRoom.grade_id
+    room_label: Optional[str] = None         # ExamRoom.label (혼합 시험실이 아니면 None)
     teacher_name: Optional[str] = None       # Teacher.name (미배정이면 None)
     subject_name: Optional[str] = None       # 그 교시 시험 과목명 (표시용)
 
     model_config = {"from_attributes": True}
+
+
+class ExamRoomCreate(BaseModel):
+    """
+    혼합 시험실 생성 요청 (2026-10-04 추가 — 여러 반이 섞이는 선택과목·
+    공통 고사·미선택실 등). period_id/grade_id 는 반드시 이 시험 소속이어야
+    합니다(서버가 검증).
+    """
+    period_id: int
+    grade_id: int
+    subject_id: Optional[int] = None   # 자습/미선택이면 None
+    source_class_ids: list[int] = Field(default_factory=list)
+    student_count: Optional[int] = Field(None, ge=1, le=100)
+    label: str = Field(default="", max_length=100)
+
+
+class ExamRoomOut(BaseModel):
+    """
+    혼합 시험실 응답.
+
+    주의 — source_class_ids 는 ExamRoom.source_class_ids 가 DB 에 JSON
+    문자열("[1, 2]")로 저장돼 있는 것과 타입이 다릅니다(여기는 list[int]).
+    그래서 서버 쪽에서 이 스키마를 쓸 때 ExamRoomOut.model_validate(orm객체)
+    를 ORM 인스턴스에 바로 호출하면 Pydantic 이 "문자열은 list가 아니다"로
+    검증 실패를 던집니다 — server/api/exams.py 의 _room_out() 헬퍼가
+    json.loads() 로 미리 파싱한 뒤 이 스키마를 직접 생성하는 이유입니다.
+    (from_attributes=True 는 그 외 필드들을 ORM 속성에서 그대로 읽어오기
+    위한 설정일 뿐, source_class_ids 의 타입 불일치까지 해결해주지 않습니다.)
+    """
+    id: int
+    exam_id: int
+    period_id: int
+    grade_id: int
+    subject_id: Optional[int]
+    source_class_ids: list[int]
+    student_count: Optional[int]
+    label: str
+
+    model_config = {"from_attributes": True}
+
+
+class ExamGradeDateExclusionCreate(BaseModel):
+    """
+    학년별 시험 미참여 날짜 등록 요청 (2026-10-04 추가). 이 날짜는 그
+    학년에게 정상수업 등으로 처리되어 시험 시간표·감독 슬롯이 생성되지
+    않습니다.
+    """
+    grade_id: int
+    exam_date: date
+
+
+class ExamGradeDateExclusionOut(BaseModel):
+    id: int
+    exam_id: int
+    grade_id: int
+    exam_date: date
+
+    model_config = {"from_attributes": True}
+
+
+class CorridorDutyOut(BaseModel):
+    """
+    복도감독 배정 응답 (교시·학년·교사 이름은 서버가 조인해 주입).
+
+    InvigilationAssignmentOut 과 구조가 비슷해 보이지만 섞으면 안 됩니다
+    — 복도감독은 반/시험실 단위가 아니라 "학년×교시"당 1건뿐이고
+    (pair_index·school_class_id·exam_room_id 가 없음), teacher_id 가
+    nullable 인 이유도 교실감독과 동일합니다: 후보(그 교시 시험 과목
+    담당 교사) 부족 시 NULL 로 남겨 관리자가 수동 배정할 수 있게 합니다.
+    """
+    id: int
+    exam_id: int
+    period_id: int
+    grade_id: int
+    teacher_id: Optional[int]
+    exam_date: Optional[date] = None
+    period_number: Optional[int] = None
+    grade_name: Optional[str] = None
+    teacher_name: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class CorridorDutyUpdate(BaseModel):
+    """복도감독 수동 변경 요청."""
+    teacher_id: Optional[int] = None
 
 
 class InvigilationUpdate(BaseModel):

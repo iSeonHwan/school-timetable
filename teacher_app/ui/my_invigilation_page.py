@@ -76,6 +76,24 @@ class _PostWorker(QThread):
             self.error.emit(str(e))
 
 
+def _room_display_name(a: dict) -> str:
+    """
+    감독 배정의 "반/시험실" 표시 문자열.
+
+    일반 슬롯은 class_name(반 이름), 여러 반이 섞인 혼합 시험실
+    (2026-10-04 추가 — exam_room_id 가 있는 슬롯)은 room_label 을
+    사용합니다. 둘 다 없으면(서버 응답 누락 등) id 로 최소한의 표시를
+    남깁니다.
+    """
+    if a.get("class_name"):
+        return a["class_name"]
+    if a.get("room_label"):
+        return f"[혼합] {a['room_label']}"
+    if a.get("exam_room_id") is not None:
+        return f"시험실#{a['exam_room_id']}"
+    return f"반#{a.get('school_class_id')}"
+
+
 def _assignment_label(a: dict) -> str:
     """
     감독 배정 하나를 콤보박스 표기용 문자열로 만듭니다.
@@ -89,7 +107,7 @@ def _assignment_label(a: dict) -> str:
     except ValueError:
         pass
     period = a.get("period_number", "?")
-    cls = a.get("class_name") or f"반#{a.get('school_class_id')}"
+    cls = _room_display_name(a)
     pair = a.get("pair_index", 1)
     teacher = a.get("teacher_name") or "미배정"
     return f"{date_str} {period}교시 {cls} ({pair}조) — {teacher}"
@@ -395,7 +413,7 @@ class MyInvigilationWidget(QWidget):
                 date_str,
                 f"{a.get('period_number', '?')}교시",
                 f"{start}~{end}",
-                a.get("class_name") or f"반#{a.get('school_class_id')}",
+                _room_display_name(a),
                 a.get("subject_name") or "-",
             ]
             for c, text in enumerate(cells):

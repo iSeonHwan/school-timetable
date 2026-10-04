@@ -683,10 +683,19 @@ def _invigilation_label(db: Session, a: InvigilationAssignment) -> str:
         "MM/DD N교시 반표시" 라벨. 정보가 일부 없으면 알 수 있는 부분만 표기.
     """
     p = db.get(ExamPeriod, a.period_id)
-    sc = db.get(SchoolClass, a.school_class_id)
     date_text = p.exam_date.strftime("%m/%d") if p else "?"
     period_text = f"{p.period}교시" if p else "?교시"
-    class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+
+    if a.school_class_id is not None:
+        sc = db.get(SchoolClass, a.school_class_id)
+        class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+    elif a.exam_room_id is not None:
+        # 혼합 시험실(ExamRoom, 2026-10-04 추가) — 단일 반이 없으므로 room.label 사용
+        from shared.models import ExamRoom
+        room = db.get(ExamRoom, a.exam_room_id)
+        class_text = f"[혼합] {room.label}" if room and room.label else f"시험실#{a.exam_room_id}"
+    else:
+        class_text = "?"
     return f"{date_text} {period_text} {class_text}"
 
 

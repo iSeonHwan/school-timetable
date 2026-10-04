@@ -28,3 +28,12 @@ build/
 dist/
 installer_output/
 *.spec
+
+# macOS Finder metadata
+.DS_Store
+
+# 실제 학교의 시험감독표 등 테스트용 원본 자료 — 익명화돼 있어도 공개
+# 저장소에 과목명·학급 인원·실제 날짜 등 기관 데이터가 그대로 노출되는
+# 것을 막기 위해 로컬에만 둡니다 (tests/ 코드는 이 파일을 직접 읽지
+# 않으며, 분석 참고용으로만 사용했습니다).
+tests/data/

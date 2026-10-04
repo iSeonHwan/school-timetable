@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from shared.models import (
     User, Teacher, Grade, SchoolClass, Subject, Exam, ExamPeriod, ExamEntry,
     InvigilationAssignment, InvigilationConstraint, TimetableEntry,
+    ExamRoom, CorridorDutyAssignment, ExamGradeDateExclusion,
 )
 from shared.schemas import (
     ExamCreate, ExamOut, ExamUpdate, ExamPeriodOut,
@@ -32,10 +33,13 @@ from shared.schemas import (
     InvigilationAssignmentOut, InvigilationUpdate,
     InvigilationConstraintCreate, InvigilationConstraintOut,
     InvigilationConstraintReview,
+    ExamRoomCreate, ExamRoomOut,
+    ExamGradeDateExclusionCreate, ExamGradeDateExclusionOut,
+    CorridorDutyOut, CorridorDutyUpdate,
 )
 from server.deps import get_db, get_current_user, require_scheduler, require_admin_or_vice_principal
 from core.exam_scheduler import (
-    generate_exam_entries, assign_invigilations, rebuild_exam_periods,
+    generate_exam_entries, assign_invigilations, assign_corridor_duty, rebuild_exam_periods,
 )
 # 알림 헬퍼는 timetable.py 에 이미 구현된 것을 재사용합니다 (중복 방지).
 # _notify_users_async: {user_id: 메시지} 형태로 여러 사용자에게
@@ -118,17 +122,35 @@ def _invigilation_out(db: Session, a: InvigilationAssignment) -> InvigilationAss
         out.period_number = period.period
         out.start_time = period.start_time
         out.end_time = period.end_time
-    sc = db.get(SchoolClass, a.school_class_id)
-    if sc is not None:
-        out.class_name = sc.display_name
-        out.class_grade_id = sc.grade_id
+
+    grade_id = None
+    if a.school_class_id is not None:
+        sc = db.get(SchoolClass, a.school_class_id)
+        if sc is not None:
+            out.class_name = sc.display_name
+            out.class_grade_id = sc.grade_id
+            grade_id = sc.grade_id
+    elif a.exam_room_id is not None:
+        # 혼합 시험실(ExamRoom) 슬롯 — 단일 반이 없으므로 room 정보로 대체
+        room = db.get(ExamRoom, a.exam_room_id)
+        if room is not None:
+            out.room_label = room.label
+            out.class_grade_id = room.grade_id
+            grade_id = room.grade_id
+            # 혼합 시험실은 subject_id 를 직접 들고 있어 ExamEntry 조회 불필요
+            if room.subject_id is not None:
+                subject = db.get(Subject, room.subject_id)
+                out.subject_name = subject.name if subject else None
+
+    if grade_id is not None and out.subject_name is None:
         # 그 교시·학년의 시험 과목 — 감독표에서 "국어 시험" 문맥 표시용
         entry = db.query(ExamEntry).filter_by(
-            exam_id=a.exam_id, period_id=a.period_id, grade_id=sc.grade_id
+            exam_id=a.exam_id, period_id=a.period_id, grade_id=grade_id
         ).first()
         if entry is not None:
             subject = db.get(Subject, entry.subject_id)
             out.subject_name = subject.name if subject else None
+
     if a.teacher_id is not None:
         t = db.get(Teacher, a.teacher_id)
         out.teacher_name = t.name if t else None
@@ -197,6 +219,7 @@ def create_exam(
         max_subjects_per_day=body.max_subjects_per_day,
         ban_homeroom_invigilation=body.ban_homeroom_invigilation,
         ban_own_subject=body.ban_own_subject,
+        pair_threshold=body.pair_threshold,
         status="draft",
     )
     db.add(exam)
@@ -425,6 +448,7 @@ def list_invigilations(
 @router.post("/{exam_id}/assign-invigilations")
 def auto_assign_invigilations(
     exam_id: int,
+    preserve_existing: bool = True,
     db: Session = Depends(get_db),
     _: User = Depends(require_scheduler),
 ):
@@ -434,9 +458,13 @@ def auto_assign_invigilations(
     하드 제약(수업 중 배제·담임 반 금지·담당 과목 금지·감독 불가·주간 제약)과
     감독 횟수 균등 분배(소프트 점수)를 적용합니다.
     후보 부족 시 미배정 슬롯을 남기고 400 이 아니라 결과 메시지로 안내합니다.
+
+    preserve_existing (기본 True): 지금도 하드 제약을 통과하는 기존
+    배정은 그대로 두고 나머지만 다시 배정합니다("변경 최소화"). False 로
+    호출하면 기존 배정을 전부 무시하고 완전히 새로 배정합니다.
     """
     exam = _get_exam_or_404(db, exam_id)
-    ok, msg = assign_invigilations(db, exam_id)
+    ok, msg = assign_invigilations(db, exam_id, preserve_existing=preserve_existing)
     # 부분 성공(ok=False)이어도 배정 결과는 저장되었으므로 200 + 안내 반환.
     # 400 을 반환하지 않는 이유: 관리자가 미배정 슬롯만 수동으로 채우면 되는데,
     # 오류로 표시하면 "배정이 아예 안 된 것"으로 오해하게 됨.
@@ -523,6 +551,278 @@ def update_invigilation(
     db.commit()
     db.refresh(a)
     return _invigilation_out(db, a)
+
+
+# ── 혼합 시험실 (ExamRoom, 2026-10-04 추가) ──────────────────────────────────
+# 여러 반 학생이 섞이는 시험실(선택과목·학년 공통 고사/미선택실 등)을
+# 등록합니다. 등록 후 assign-invigilations 를 실행하면 이 시험실도 함께
+# 감독 슬롯이 생성됩니다 (core.exam_scheduler._build_slots 참조).
+
+def _room_out(r: ExamRoom) -> ExamRoomOut:
+    """
+    ExamRoom → Out 변환. source_class_ids 는 DB 에 JSON 문자열로 저장돼
+    있어(approval_history 등과 동일한 관례) Pydantic 의 list[int] 타입과
+    맞지 않으므로, model_validate() 로 바로 변환하지 않고 파싱한 값을
+    직접 채워 생성합니다.
+    """
+    try:
+        source_ids = json.loads(r.source_class_ids or "[]")
+    except (ValueError, TypeError):
+        source_ids = []
+    return ExamRoomOut(
+        id=r.id, exam_id=r.exam_id, period_id=r.period_id, grade_id=r.grade_id,
+        subject_id=r.subject_id, source_class_ids=source_ids,
+        student_count=r.student_count, label=r.label,
+    )
+
+
+@router.get("/{exam_id}/rooms", response_model=list[ExamRoomOut])
+def list_exam_rooms(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    혼합 시험실 목록.
+
+    _check_teacher_visibility() 로 draft 상태 시험은 교사에게 숨깁니다 —
+    혼합 시험실 구성(어느 반이 섞였는지)도 시험 시간표·감독표와 마찬가지로
+    확정 전까지는 교사에게 조기 노출하지 않는다는 기존 정책을 그대로
+    따릅니다.
+    """
+    exam = _get_exam_or_404(db, exam_id)
+    _check_teacher_visibility(user, exam)
+    rows = db.query(ExamRoom).filter_by(exam_id=exam.id).order_by(ExamRoom.period_id).all()
+    return [_room_out(r) for r in rows]
+
+
+@router.post("/{exam_id}/rooms", response_model=ExamRoomOut, status_code=201)
+def create_exam_room(
+    exam_id: int,
+    body: ExamRoomCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    혼합 시험실 생성.
+
+    period_id 가 이 시험 소속 교시인지 검증합니다 — 다른 시험의 교시를
+    잘못 연결하면 _build_slots() 가 그 교시를 찾지 못해 조용히 무시되므로
+    (방어적 skip), 생성 시점에 막아 혼란을 예방합니다.
+    """
+    exam = _get_exam_or_404(exam_id=exam_id, db=db)
+    period = db.get(ExamPeriod, body.period_id)
+    if period is None or period.exam_id != exam.id:
+        raise HTTPException(400, "이 시험에 속하지 않은 교시입니다.")
+    if db.get(Grade, body.grade_id) is None:
+        raise HTTPException(404, "학년을 찾을 수 없습니다.")
+    room = ExamRoom(
+        exam_id=exam.id, period_id=body.period_id, grade_id=body.grade_id,
+        subject_id=body.subject_id,
+        source_class_ids=json.dumps(body.source_class_ids),
+        student_count=body.student_count, label=body.label,
+    )
+    db.add(room)
+    db.commit()
+    db.refresh(room)
+    return _room_out(room)
+
+
+@router.delete("/rooms/{room_id}")
+def delete_exam_room(
+    room_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    혼합 시험실 삭제. 이미 생성된 감독 배정(InvigilationAssignment)에서
+    exam_room_id 가 이 시험실을 가리키던 행은 FK 제약상 먼저 지웁니다
+    (재배정 전까지 "갈 곳 없는" 배정이 남지 않도록).
+    """
+    room = db.get(ExamRoom, room_id)
+    if room is None:
+        raise HTTPException(404, "시험실을 찾을 수 없습니다.")
+    db.query(InvigilationAssignment).filter_by(exam_room_id=room.id).delete()
+    db.delete(room)
+    db.commit()
+    return {"ok": True}
+
+
+# ── 학년별 시험 미참여 날짜 (ExamGradeDateExclusion, 2026-10-04 추가) ─────────
+
+@router.get("/{exam_id}/grade-exclusions", response_model=list[ExamGradeDateExclusionOut])
+def list_grade_exclusions(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    학년별 시험 미참여 날짜 목록. ExamGradeDateExclusionOut 은 (exam_id,
+    grade_id, exam_date) 외엔 조인 필드가 없어 그대로 ORM 객체 리스트를
+    반환합니다(InvigilationAssignmentOut 처럼 날짜·이름을 주입할 필요가
+    없는 단순한 모델이기 때문).
+    """
+    exam = _get_exam_or_404(db, exam_id)
+    _check_teacher_visibility(user, exam)
+    return (
+        db.query(ExamGradeDateExclusion).filter_by(exam_id=exam.id)
+        .order_by(ExamGradeDateExclusion.exam_date).all()
+    )
+
+
+@router.post(
+    "/{exam_id}/grade-exclusions", response_model=ExamGradeDateExclusionOut, status_code=201,
+)
+def create_grade_exclusion(
+    exam_id: int,
+    body: ExamGradeDateExclusionCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    학년별 시험 미참여 날짜 등록 — 등록한 날짜는 그 학년에게 정상수업
+    등으로 처리되어 시험 시간표 배치·감독 슬롯 생성에서 제외됩니다.
+    날짜가 시험 기간(start_date~end_date) 밖이면 의미가 없으므로 막습니다.
+    """
+    exam = _get_exam_or_404(db, exam_id)
+    if not (exam.start_date <= body.exam_date <= exam.end_date):
+        raise HTTPException(400, "시험 기간 밖의 날짜입니다.")
+    if db.get(Grade, body.grade_id) is None:
+        raise HTTPException(404, "학년을 찾을 수 없습니다.")
+    existing = db.query(ExamGradeDateExclusion).filter_by(
+        exam_id=exam.id, grade_id=body.grade_id, exam_date=body.exam_date,
+    ).first()
+    if existing is not None:
+        return existing
+    row = ExamGradeDateExclusion(
+        exam_id=exam.id, grade_id=body.grade_id, exam_date=body.exam_date,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.delete("/grade-exclusions/{exclusion_id}")
+def delete_grade_exclusion(
+    exclusion_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    등록된 예외를 지워 그 학년을 해당 날짜의 시험 대상으로 복귀시킵니다.
+
+    주의: 이미 그 날짜로 생성된 시험 시간표(ExamEntry)·감독 배정이 있다면
+    (예외 등록 전에 생성해뒀던 경우) 이 삭제만으로 자동으로 다시 채워지지
+    않습니다 — generate_exam_entries()/assign_invigilations() 를 다시
+    실행해야 그 학년의 슬롯이 실제로 생성됩니다. (ExamRoom 삭제처럼 FK로
+    연결된 자식 레코드가 없어 단순 delete 로 충분합니다.)
+    """
+    row = db.get(ExamGradeDateExclusion, exclusion_id)
+    if row is None:
+        raise HTTPException(404, "등록된 예외를 찾을 수 없습니다.")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
+
+
+# ── 복도감독 (CorridorDutyAssignment, 2026-10-04 추가) ───────────────────────
+
+def _corridor_out(db: Session, c: CorridorDutyAssignment) -> CorridorDutyOut:
+    """
+    CorridorDutyAssignment → Out 변환 + 조인 정보 주입.
+
+    _invigilation_out() 과 같은 패턴(모델 → 날짜/이름 주입)이지만 ExamRoom
+    분기가 없는 이유: 복도감독은 school_class_id/exam_room_id 같은 "어느
+    반/시험실" 연결이 아예 없는 학년×교시 단위 레코드라, 애초에 가지를
+    탈 필요가 없습니다 — ExamRoomOut 처럼 ORM 의 JSON 문자열 필드를
+    변환해야 하는 사정도 없어 model_validate() 를 그대로 써도 안전합니다.
+    """
+    out = CorridorDutyOut.model_validate(c)
+    period = db.get(ExamPeriod, c.period_id)
+    if period is not None:
+        out.exam_date = period.exam_date
+        out.period_number = period.period
+    grade = db.get(Grade, c.grade_id)
+    if grade is not None:
+        out.grade_name = grade.name
+    if c.teacher_id is not None:
+        t = db.get(Teacher, c.teacher_id)
+        out.teacher_name = t.name if t else None
+    return out
+
+
+@router.get("/{exam_id}/corridor-duties", response_model=list[CorridorDutyOut])
+def list_corridor_duties(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    복도감독 배정 목록. list_invigilations() 와 동일한 공개 범위 정책
+    (_check_teacher_visibility — draft 시험은 교사에게 숨김)을 따릅니다.
+    """
+    exam = _get_exam_or_404(db, exam_id)
+    _check_teacher_visibility(user, exam)
+    rows = (
+        db.query(CorridorDutyAssignment).filter_by(exam_id=exam.id)
+        .order_by(CorridorDutyAssignment.period_id).all()
+    )
+    return [_corridor_out(db, c) for c in rows]
+
+
+@router.post("/{exam_id}/assign-corridor-duty")
+def auto_assign_corridor_duty(
+    exam_id: int,
+    preserve_existing: bool = True,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    복도감독 자동 배정 (core.exam_scheduler.assign_corridor_duty).
+
+    교실감독(assign-invigilations)을 먼저 실행해야 그 결과를 바탕으로
+    겸임 배정을 피할 수 있습니다 — 순서를 지키지 않아도 에러는 아니지만
+    교실감독과 겹칠 수 있습니다.
+    """
+    _get_exam_or_404(db, exam_id)
+    ok, msg = assign_corridor_duty(db, exam_id, preserve_existing=preserve_existing)
+    return {"ok": ok, "message": msg}
+
+
+@router.put("/corridor-duties/{duty_id}", response_model=CorridorDutyOut)
+def update_corridor_duty(
+    duty_id: int,
+    body: CorridorDutyUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """복도감독 수동 변경. 같은 교시에 이미 교실감독·다른 복도감독 중인 교사는 거부."""
+    c = db.get(CorridorDutyAssignment, duty_id)
+    if c is None:
+        raise HTTPException(404, "복도감독 배정을 찾을 수 없습니다.")
+
+    new_teacher_id = body.teacher_id
+    if new_teacher_id is not None:
+        if db.get(Teacher, new_teacher_id) is None:
+            raise HTTPException(404, "교사를 찾을 수 없습니다.")
+        classroom_conflict = db.query(InvigilationAssignment).filter_by(
+            period_id=c.period_id, teacher_id=new_teacher_id,
+        ).first()
+        if classroom_conflict is not None:
+            raise HTTPException(409, "이 교사는 같은 교시에 이미 교실감독으로 배정되어 있습니다.")
+        corridor_conflict = db.query(CorridorDutyAssignment).filter(
+            CorridorDutyAssignment.period_id == c.period_id,
+            CorridorDutyAssignment.teacher_id == new_teacher_id,
+            CorridorDutyAssignment.id != c.id,
+        ).first()
+        if corridor_conflict is not None:
+            raise HTTPException(409, "이 교사는 같은 교시에 이미 다른 학년 복도감독으로 배정되어 있습니다.")
+
+    c.teacher_id = new_teacher_id
+    db.commit()
+    db.refresh(c)
+    return _corridor_out(db, c)
 
 
 # ── 감독 불가 신청 ──────────────────────────────────────────────────────────

@@ -746,6 +746,15 @@ class Exam(Base):
     # ── 감독 금지 규칙 (기본 ON, 관리자 설정에서 해제 가능 — 요구사항 2) ─────
     ban_homeroom_invigilation = Column(Boolean, nullable=False, default=True)  # 담임 반 감독 금지
     ban_own_subject           = Column(Boolean, nullable=False, default=True)  # 담당 과목 시험 감독 금지
+    # ── 부감독(2인 1조) 배정 기준 학생 수 (2026-10-04 추가) ─────────────────
+    # core.exam_scheduler.PAIR_THRESHOLD 는 기존에 모듈 상수(20)로
+    # 고정돼 있었는데, 실제 학교 운영 기준(엑셀 산출물로 검증: 2학기 1회고사
+    # 시험감독표 "작성 기준"/"검토 체크리스트" 시트)은 "한 시험실 24명
+    # 이상일 때만 정·부 2명"이었다. 학교마다/학기마다 실제 기준이 다를 수
+    # 있으므로 시험 단위로 설정 가능하게 컬럼으로 뽑았다.
+    # 기본값은 기존 동작과의 하위 호환을 위해 20 유지 — 실제 기준에 맞추려면
+    # 시험 생성 시 24로 설정.
+    pair_threshold = Column(Integer, nullable=False, default=20)
     # ── 게시 상태 ─────────────────────────────────────────────────────────
     status    = Column(String(20), nullable=False, default="draft")
     created_at = Column(DateTime, default=datetime.now)
@@ -771,6 +780,18 @@ class Exam(Base):
     # 감독 불가 신청들 — 시험 삭제 시 함께 삭제 (cascade)
     constraints = relationship(
         "InvigilationConstraint", back_populates="exam", cascade="all, delete-orphan"
+    )
+    # 혼합 시험실들(여러 반이 섞이는 선택과목·공통 시험실) — 시험 삭제 시 함께 삭제
+    rooms = relationship(
+        "ExamRoom", back_populates="exam", cascade="all, delete-orphan"
+    )
+    # 복도감독 배정들 — 시험 삭제 시 함께 삭제
+    corridor_duties = relationship(
+        "CorridorDutyAssignment", back_populates="exam", cascade="all, delete-orphan"
+    )
+    # 학년별 시험 미참여 날짜(정상수업 등) — 시험 삭제 시 함께 삭제
+    grade_date_exclusions = relationship(
+        "ExamGradeDateExclusion", back_populates="exam", cascade="all, delete-orphan"
     )
 
     def __str__(self):
@@ -812,6 +833,11 @@ class ExamPeriod(Base):
     invigilations = relationship(
         "InvigilationAssignment", back_populates="period", cascade="all, delete-orphan"
     )
+    # 이 교시의 혼합 시험실들과 복도감독 배정 — 시험 기간 재생성 시 함께 삭제
+    rooms = relationship("ExamRoom", back_populates="period", cascade="all, delete-orphan")
+    corridor_duties = relationship(
+        "CorridorDutyAssignment", back_populates="period", cascade="all, delete-orphan"
+    )
 
 
 class ExamEntry(Base):
@@ -849,16 +875,65 @@ class ExamEntry(Base):
     subject = relationship("Subject")
 
 
+class ExamRoom(Base):
+    """
+    여러 반 학생이 한 시험실에 섞이는 경우를 표현하는 시험실
+    (2026-10-04 추가 — 2학년 선택과목, 3학년 공통 고사/미선택실 등).
+
+    일반적인 경우(한 반이 그대로 한 시험실)는 InvigilationAssignment.
+    school_class_id 만으로 충분해 ExamRoom 을 만들 필요가 없습니다 —
+    이 테이블은 "반 경계를 넘는" 예외적인 시험실만 담습니다. 실제 사례
+    (2학기 1회고사 시험감독표): 2학년 선택과목(세계사·화학 등 여러 반
+    학생이 섞여 듣는 과목), 3학년 고전읽기 분반, 3학년 미선택(자습) 등.
+
+    source_class_ids 가 필요한 이유:
+      이 시험실에 누구누구가 섞여 있는지 알아야 "담임은 자기 반 학생이
+      있는 시험실 감독 금지" 규칙을 적용할 수 있습니다(실제 기준: "여러
+      반 학생이 섞이는 교실은 그 학년 담임 모두 제외"). JSON 배열 문자열로
+      저장합니다(기존 target_grade_ids 와 동일한 관례).
+
+    subject_id 가 NULL 인 경우: 자습/미선택(시험 과목 없음)을 의미합니다.
+    student_count 가 NULL 이면 _build_slots() 가 기본값(DEFAULT_STUDENT_COUNT)을
+    가정합니다 — 관례는 InvigilationAssignment 와 동일.
+    """
+    __tablename__ = "exam_rooms"
+
+    id                = Column(Integer, primary_key=True)
+    exam_id           = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    period_id         = Column(Integer, ForeignKey("exam_periods.id"), nullable=False)
+    grade_id          = Column(Integer, ForeignKey("grades.id"), nullable=False)
+    subject_id        = Column(Integer, ForeignKey("subjects.id"), nullable=True)
+    source_class_ids  = Column(Text, nullable=False, default="[]")
+    student_count     = Column(Integer, nullable=True)
+    label             = Column(String(100), nullable=False, default="")
+    created_at        = Column(DateTime, default=datetime.now)
+
+    exam    = relationship("Exam", back_populates="rooms")
+    period  = relationship("ExamPeriod", back_populates="rooms")
+    grade   = relationship("Grade")
+    subject = relationship("Subject")
+
+    def __str__(self):
+        return self.label or f"시험실#{self.id}"
+
+
 class InvigilationAssignment(Base):
     """
-    감독 배정: 시험 교시×반×조 슬롯에 배정된 감독교사.
+    감독 배정: 시험 교시×(반 또는 혼합 시험실)×조 슬롯에 배정된 감독교사.
 
     감독 슬롯 생성 규칙 (요구사항 5 — 2인 1조 기준):
-      시험 치르는 각 반의 학생 수(SchoolClass.student_count)를 기준으로
-      해당 반×교시에 감독 슬롯을 몇 개 만들지 결정합니다.
-        - 학생 20명 이상 → pair_index 1, 2 두 슬롯 (2인 1조)
-        - 학생 20명 미만 → pair_index 1 한 슬롯 (1인 감독)
-      student_count 가 미입력이면 기본 30명을 가정해 2인 1조로 처리합니다.
+      시험 치르는 반/시험실의 학생 수(SchoolClass.student_count 또는
+      ExamRoom.student_count)를 Exam.pair_threshold 와 비교해 해당
+      교시에 감독 슬롯을 몇 개 만들지 결정합니다.
+        - 학생 수 >= pair_threshold → pair_index 1, 2 두 슬롯 (2인 1조)
+        - 학생 수 <  pair_threshold → pair_index 1 한 슬롯 (1인 감독)
+      student_count 가 미입력이면 기본값을 가정해 2인 1조로 처리합니다.
+
+    school_class_id 가 nullable 인 이유 (2026-10-04 변경 — 과거엔 NOT NULL):
+      여러 반이 섞이는 시험실(ExamRoom)에는 대응하는 단일 반이 없습니다.
+      그런 슬롯은 school_class_id=NULL, exam_room_id=<ExamRoom.id> 로
+      저장합니다. 반대로 일반적인 단일 반 슬롯은 exam_room_id=NULL 로
+      저장합니다(과거 동작과 완전히 동일) — 두 경로가 공존합니다.
 
     teacher_id 가 nullable 인 이유:
       감독 후보가 부족한 소규모 학교에서 자동 배정이 슬롯을 전부 채우지
@@ -866,18 +941,23 @@ class InvigilationAssignment(Base):
       사실이 사라지므로, teacher_id=NULL 로 슬롯을 남겨두고 관리자가
       수동 배정으로 채울 수 있게 합니다.
 
-    UniqueConstraint: 같은 교시에 같은 반의 같은 조 번호가 중복되는 것을
-    DB 레벨에서 차단합니다.
+    UniqueConstraint 2종: 같은 교시에 같은 반(또는 같은 혼합 시험실)의
+    같은 조 번호가 중복되는 것을 DB 레벨에서 차단합니다. school_class_id/
+    exam_room_id 중 쓰지 않는 쪽은 항상 NULL 이며, SQL 의 NULL 비교 규칙상
+    NULL 끼리는 유니크 제약 위반으로 판정되지 않으므로 두 제약이 서로
+    간섭하지 않습니다.
     """
     __tablename__ = "invigilation_assignments"
     __table_args__ = (
         UniqueConstraint("period_id", "school_class_id", "pair_index", name="uq_invigilation_slot"),
+        UniqueConstraint("period_id", "exam_room_id", "pair_index", name="uq_invigilation_room_slot"),
     )
 
     id              = Column(Integer, primary_key=True)
     exam_id         = Column(Integer, ForeignKey("exams.id"), nullable=False)
     period_id       = Column(Integer, ForeignKey("exam_periods.id"), nullable=False)
-    school_class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=False)
+    school_class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=True)
+    exam_room_id    = Column(Integer, ForeignKey("exam_rooms.id"), nullable=True)
     # 감독교사 — NULL 이면 미배정 상태 (위 설명 참조)
     teacher_id      = Column(Integer, ForeignKey("teachers.id"), nullable=True)
     # 조 번호: 1 = 단독 감독 또는 2인 1조의 첫 번째, 2 = 2인 1조의 두 번째
@@ -886,7 +966,65 @@ class InvigilationAssignment(Base):
     exam         = relationship("Exam", back_populates="invigilations")
     period       = relationship("ExamPeriod", back_populates="invigilations")
     school_class = relationship("SchoolClass")
+    exam_room    = relationship("ExamRoom")
     teacher      = relationship("Teacher")
+
+
+class CorridorDutyAssignment(Base):
+    """
+    복도감독 배정 (2026-10-04 추가).
+
+    실제 운영 기준: "복도감독은 학년별 1명을 해당 시험 과목 담당 교사 중에서
+    배정하고, 나머지 과목 담당 교사는 교시 중 질의 대응 대기(감독 횟수
+    미산정)". 그래서 교실감독(InvigilationAssignment)과 분리된 테이블로
+    둡니다 — 반/시험실 단위가 아니라 학년×교시 단위로 1명뿐이고, 후보군도
+    "그 교시 그 학년 시험 과목 담당 교사"로 완전히 다릅니다.
+
+    UniqueConstraint: 같은 교시·같은 학년에 복도감독이 중복 생성되지 않게.
+    """
+    __tablename__ = "corridor_duty_assignments"
+    __table_args__ = (
+        UniqueConstraint("period_id", "grade_id", name="uq_corridor_duty_slot"),
+    )
+
+    id         = Column(Integer, primary_key=True)
+    exam_id    = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    period_id  = Column(Integer, ForeignKey("exam_periods.id"), nullable=False)
+    grade_id   = Column(Integer, ForeignKey("grades.id"), nullable=False)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), nullable=True)   # NULL=미배정
+
+    exam    = relationship("Exam", back_populates="corridor_duties")
+    period  = relationship("ExamPeriod", back_populates="corridor_duties")
+    grade   = relationship("Grade")
+    teacher = relationship("Teacher")
+
+
+class ExamGradeDateExclusion(Base):
+    """
+    학년별 시험 미참여 날짜 (2026-10-04 추가).
+
+    실제 운영 사례: 시험 기간 첫날은 3학년만 정상수업이고 둘째·셋째 날부터
+    3학년도 시험(자습+고사)에 들어가는 경우가 있었습니다. Exam.
+    target_grade_ids 는 "이 시험에 참여하는 학년"을 기간 전체에 대해
+    한 번만 정하므로 이런 날짜별 예외를 표현할 수 없었습니다.
+
+    이 테이블의 행이 있으면 "그 학년은 target_grade_ids 에 있어도 이
+    날짜만은 시험 대상이 아니다(정상수업 등)"를 의미합니다 — 즉 예외
+    목록(화이트리스트가 아니라 블랙리스트) 방식이라, 대부분의 학년·대부분의
+    날짜는 그대로 참여하고 예외만 등록하면 됩니다.
+    """
+    __tablename__ = "exam_grade_date_exclusions"
+    __table_args__ = (
+        UniqueConstraint("exam_id", "grade_id", "exam_date", name="uq_grade_date_exclusion"),
+    )
+
+    id        = Column(Integer, primary_key=True)
+    exam_id   = Column(Integer, ForeignKey("exams.id"), nullable=False)
+    grade_id  = Column(Integer, ForeignKey("grades.id"), nullable=False)
+    exam_date = Column(Date, nullable=False)
+
+    exam  = relationship("Exam", back_populates="grade_date_exclusions")
+    grade = relationship("Grade")
 
 
 class InvigilationConstraint(Base):

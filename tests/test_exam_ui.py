@@ -137,6 +137,64 @@ def test_exam_setup_publish_via_db_fallback(qtbot, exam_env, db):
     assert exam_env["exam"].status == "published"
 
 
+def test_exam_setup_grade_exclusion_panel(qtbot, exam_env, db):
+    """학년별 시험 미참여 날짜 추가/삭제 (2026-10-04 신규 패널)."""
+    from database.models import ExamGradeDateExclusion
+
+    widget = ExamSetupWidget(api_client=None)
+    qtbot.addWidget(widget)
+    monkeypatch_msgbox(qtbot)
+
+    widget.tbl_exams.selectRow(0)   # exam_env["exam"] 선택 → 패널 대상 지정
+    idx = widget.cmb_exclusion_grade.findData(exam_env["grade"].id)
+    assert idx >= 0
+    widget.cmb_exclusion_grade.setCurrentIndex(idx)
+    from PyQt6.QtCore import QDate
+    widget.date_exclusion.setDate(QDate(2026, 10, 5))   # exam_env 기간 내 날짜
+
+    widget._add_grade_exclusion()
+    assert widget.tbl_exclusions.rowCount() == 1
+    rows = db.query(ExamGradeDateExclusion).filter_by(exam_id=exam_env["exam"].id).all()
+    assert len(rows) == 1
+    assert rows[0].grade_id == exam_env["grade"].id
+
+    widget.tbl_exclusions.selectRow(0)
+    widget._delete_grade_exclusion()
+    assert widget.tbl_exclusions.rowCount() == 0
+    assert db.query(ExamGradeDateExclusion).filter_by(exam_id=exam_env["exam"].id).count() == 0
+
+
+def test_exam_setup_room_panel(qtbot, exam_env, db):
+    """혼합 시험실(ExamRoom) 추가/삭제 (2026-10-04 신규 패널)."""
+    from database.models import ExamRoom
+
+    widget = ExamSetupWidget(api_client=None)
+    qtbot.addWidget(widget)
+    monkeypatch_msgbox(qtbot)
+
+    widget.tbl_exams.selectRow(0)
+    assert widget.cmb_room_period.count() == len(exam_env["periods"])
+
+    idx = widget.cmb_room_grade.findData(exam_env["grade"].id)
+    widget.cmb_room_grade.setCurrentIndex(idx)
+    assert widget.list_room_classes.count() == 1   # exam_env 는 반 1개
+    widget.list_room_classes.item(0).setSelected(True)
+    widget.edit_room_label.setText("세계사(3반 교실)")
+    widget.spin_room_count.setValue(24)
+
+    widget._add_exam_room()
+    assert widget.tbl_rooms.rowCount() == 1
+    rooms = db.query(ExamRoom).filter_by(exam_id=exam_env["exam"].id).all()
+    assert len(rooms) == 1
+    assert rooms[0].label == "세계사(3반 교실)"
+    assert rooms[0].student_count == 24
+
+    widget.tbl_rooms.selectRow(0)
+    widget._delete_exam_room()
+    assert widget.tbl_rooms.rowCount() == 0
+    assert db.query(ExamRoom).filter_by(exam_id=exam_env["exam"].id).count() == 0
+
+
 def monkeypatch_msgbox(qtbot):
     """QMessageBox.question/information/warning 을 자동 Yes/닫기로 대체."""
     from PyQt6.QtWidgets import QMessageBox
@@ -199,6 +257,43 @@ def test_invigilation_grid_assign_and_summary(qtbot, exam_env, db):
     # 요약 라벨에 교사별 횟수가 표기되는지
     summary = widget.lbl_summary.text()
     assert "김교사" in summary and "박교사" in summary
+
+
+def test_invigilation_grid_mixed_room_and_corridor_duty(qtbot, exam_env, db):
+    """
+    혼합 시험실(ExamRoom) 슬롯이 '[혼합] 설명' 행으로 표시되고, 복도감독
+    자동 배정 결과가 별도 표(tbl_corridor)에 렌더링되는지 확인
+    (2026-10-04 신규 — 선택과목·복도감독 UI).
+    """
+    from database.models import ExamRoom, Grade
+
+    db.add(ExamRoom(
+        exam_id=exam_env["exam"].id, period_id=exam_env["periods"][0].id,
+        grade_id=exam_env["grade"].id, subject_id=exam_env["subjects"][0].id,
+        source_class_ids=f"[{exam_env['cls'].id}]",
+        student_count=24, label="세계사(혼합)",
+    ))
+    db.commit()
+
+    widget = InvigilationGridWidget()
+    qtbot.addWidget(widget)
+    monkeypatch_msgbox(qtbot)
+    widget._auto_assign()
+
+    # 혼합 시험실 행이 "반/시험실" 열에 "[혼합] 세계사(혼합)" 로 표시되는지
+    labels = [widget.tbl.item(r, 2).text() for r in range(widget.tbl.rowCount())]
+    assert any("[혼합] 세계사(혼합)" in t for t in labels), labels
+
+    # ExamEntry 를 1교시 과목으로 등록해야 복도감독 후보(과목 담당 교사)가 생김
+    from database.models import ExamEntry
+    db.add(ExamEntry(
+        exam_id=exam_env["exam"].id, period_id=exam_env["periods"][0].id,
+        grade_id=exam_env["grade"].id, subject_id=exam_env["subjects"][0].id,
+    ))
+    db.commit()
+    widget._auto_assign_corridor()
+    assert widget.tbl_corridor.rowCount() == 1
+    assert widget.tbl_corridor.item(0, 2).text() == exam_env["grade"].name
 
 
 def test_invigilation_grid_read_only(qtbot, exam_env, db):

@@ -453,3 +453,82 @@ def test_insufficient_candidates_leaves_unassigned(db, scheduler_data):
     assert len(p1_slots) == 5
     # 미배정 슬롯이 teacher_id=NULL 로 저장되어 있는지
     assert any(a.teacher_id is None for a in p1_slots)
+
+
+# ── 변경 최소화 (요구사항 14) ─────────────────────────────────────────────
+# 실제 학교 사례(2학기 1회고사 시험감독표 "작성 기준" 11번): "배정을 다시
+# 계산할 때는 직전 배정을 최대한 유지하도록 계산". 재배정 시 지금도 유효한
+# 기존 배정은 그대로 두고, 제약 변경으로 더는 유효하지 않은 자리만 다시
+# 배정해야 합니다.
+
+def test_preserve_existing_keeps_unaffected_slots(db, scheduler_data):
+    """
+    한 교사의 특정 교시 배정만 새로 무효화됐을 때, 그 슬롯만 바뀌고
+    나머지 슬롯은 기존 배정이 그대로 유지되는지 검증.
+    """
+    data = scheduler_data
+    p1, p2 = data["periods"]
+    # 여유 교사 둘 추가 — 기본 시나리오는 유효 교사 수(5명)와 교시당
+    # 슬롯 수(5개)가 정확히 맞아떨어져 여유가 전혀 없다. 그 상태에서
+    # 아무나 하나를 막으면 "변경 최소화" 여부와 무관하게 무조건 미배정이
+    # 발생해 이 테스트의 의도(바뀐 자리만 재배정되는지)를 확인할 수 없다.
+    # 하나만 추가해도 무효화된 슬롯이 하필 A반(담임 T1 은 배정 불가)이면
+    # 다시 빠듯해질 수 있어 둘을 추가해 넉넉한 여유를 둔다.
+    _make_teacher(db, "자유4")
+    _make_teacher(db, "자유5")
+    db.commit()
+
+    ok, msg = assign_invigilations(db, data["exam"].id)
+    assert ok, msg
+    before = {
+        (a.period_id, a.school_class_id, a.pair_index): a.teacher_id
+        for a in db.query(InvigilationAssignment).filter_by(exam_id=data["exam"].id)
+    }
+
+    # 2교시에 배정된 교사 하나를 골라, 그 교시만 불가하도록 새 제약 추가
+    # (스케줄러가 교시마다 교사를 한 번만 쓰므로 이 교사는 2교시에 정확히
+    # 한 자리에만 배정돼 있다 — 그 자리만 무효화되는지 확인하기 좋은 조건)
+    p2_assignments = [a for a in db.query(InvigilationAssignment)
+                      .filter_by(exam_id=data["exam"].id, period_id=p2.id)
+                      if a.teacher_id is not None]
+    assert p2_assignments, "2교시 배정이 비어 있어 테스트를 진행할 수 없습니다."
+    target = p2_assignments[0]
+    newly_invalid_teacher = target.teacher_id
+
+    db.add(TeacherConstraint(
+        teacher_id=newly_invalid_teacher, day_of_week=1, period=2,
+        constraint_type="unavailable",
+    ))
+    db.commit()
+
+    ok, msg = assign_invigilations(db, data["exam"].id)   # preserve_existing=True(기본값)
+    assert ok, msg
+    after = {
+        (a.period_id, a.school_class_id, a.pair_index): a.teacher_id
+        for a in db.query(InvigilationAssignment).filter_by(exam_id=data["exam"].id)
+    }
+
+    changed_keys = {k for k in before if before[k] != after.get(k)}
+    # 무효화된 교사가 쓰던 자리만 바뀌어야 함 (변경 최소화)
+    invalidated_key = (target.period_id, target.school_class_id, target.pair_index)
+    assert changed_keys == {invalidated_key}, (
+        f"변경 최소화 실패 — 바뀐 자리가 예상보다 많음: {changed_keys}"
+    )
+    # 새로 배정된 교사는 더는 그 제약을 위반하지 않아야 함
+    assert after[invalidated_key] != newly_invalid_teacher
+
+
+def test_preserve_existing_false_reassigns_everything(db, scheduler_data):
+    """
+    preserve_existing=False 로 호출하면 기존 배정을 고려하지 않고 완전히
+    새로 배정합니다 (과거 동작과 동일) — 최소한 함수가 정상 동작하는지,
+    그리고 모든 슬롯이 여전히 유효하게 채워지는지 확인합니다.
+    """
+    data = scheduler_data
+    ok, msg = assign_invigilations(db, data["exam"].id)
+    assert ok, msg
+
+    ok, msg = assign_invigilations(db, data["exam"].id, preserve_existing=False)
+    assert ok, msg
+    all_slots = db.query(InvigilationAssignment).filter_by(exam_id=data["exam"].id).all()
+    assert all(a.teacher_id is not None for a in all_slots)

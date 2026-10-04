@@ -339,10 +339,19 @@ class ChangeRequestWidget(QWidget):
         로컬 세션으로 재현한 것입니다 (관리자 앱은 DB 직접 접근 구조).
         """
         p = session.get(ExamPeriod, a.period_id)
-        sc = session.get(SchoolClass, a.school_class_id)
         date_text = p.exam_date.strftime("%m/%d") if p else "?"
         period_text = f"{p.period}교시" if p else "?교시"
-        class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+
+        if a.school_class_id is not None:
+            sc = session.get(SchoolClass, a.school_class_id)
+            class_text = sc.display_name if sc else f"반#{a.school_class_id}"
+        elif a.exam_room_id is not None:
+            # 혼합 시험실(ExamRoom, 2026-10-04 추가) — 단일 반이 없으므로 room.label 사용
+            from database.models import ExamRoom
+            room = session.get(ExamRoom, a.exam_room_id)
+            class_text = f"[혼합] {room.label}" if room and room.label else f"시험실#{a.exam_room_id}"
+        else:
+            class_text = "?"
         return f"{date_text} {period_text} {class_text}({a.pair_index}조)"
 
     def _render_invigilation_row(self, row: int, req: TimetableChangeRequest,

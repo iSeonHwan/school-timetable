@@ -56,6 +56,7 @@ Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 ### Shared Layer (`shared/`)
 - `models.py` — All SQLAlchemy ORM models (canonical source). `database/models.py` re-exports from here for backward compatibility.
   - New models: `User` (login accounts), `ChatMessage` (group chat)
+  - Exam feature models: `Exam`, `ExamPeriod`, `ExamEntry`, `InvigilationAssignment` (교실감독 — `school_class_id`/`exam_room_id` 중 하나만 채워짐), `InvigilationConstraint`, `ExamRoom`(여러 반이 섞이는 혼합 시험실), `CorridorDutyAssignment`(복도감독, 학년×교시 단위), `ExamGradeDateExclusion`(학년별 시험 미참여 날짜)
 - `schemas.py` — Pydantic v2 request/response schemas for all API endpoints
 - `api_client.py` — Sync HTTP + WebSocket client used by both desktop apps
 
@@ -66,6 +67,7 @@ Tests use `pytest-qt` and require a display (or `QT_QPA_PLATFORM=offscreen`).
 - `api/auth.py` — Login, user management (일과계 only)
 - `api/setup.py` — Grade/class/subject/room/teacher CRUD (쓰기: 일과계 only, 읽기: 일과계·교감)
 - `api/timetable.py` — Timetable query/generation, change request approval via a configurable multi-step `ApprovalWorkflow` (기본값: 일과계 1차 → 교감 최종, `api/workflow.py` 로 단계 수·역할 재구성 가능)
+- `api/exams.py` — 시험 시간표·감독 시간표 CRUD + 자동 생성(`core/exam_scheduler.py`). 혼합 시험실(`/exams/{id}/rooms`), 복도감독(`/exams/{id}/corridor-duties`, `/exams/{id}/assign-corridor-duty`), 학년별 시험 미참여 날짜(`/exams/{id}/grade-exclusions`) 포함
 - `api/chat.py` — REST + WebSocket real-time group chat (공지: 일과계·교감, 개별 메시지 삭제: 일과계·교감, 일괄 정리: 일과계 only, 자동 정리 주기: CHAT_RETENTION_DAYS 기준)
 
 ### Admin App (`admin_app/`)
