@@ -16,7 +16,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QFrame, QMessageBox,
-    QHeaderView, QComboBox, QInputDialog,
+    QHeaderView, QComboBox, QInputDialog, QFileDialog,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
@@ -26,6 +26,7 @@ from database.models import (
     Exam, ExamPeriod, ExamEntry, Subject, Grade,
 )
 from core.exam_scheduler import generate_exam_entries
+from ui.export.exam_export import export_student_exam_guide_markdown
 
 HEADER_STYLE = "background:#1B4F8A; color:white; font-weight:bold; padding:6px;"
 BTN_PRIMARY  = "background:#1B4F8A; color:white; border-radius:4px; padding:6px 14px; font-weight:bold;"
@@ -78,6 +79,20 @@ class ExamGridWidget(QWidget):
         self.lbl_info.setStyleSheet("color:#666;")
         top.addWidget(self.lbl_info)
         top.addStretch()
+
+        # 학생 안내문(2026-10-04 추가) — 시험 기간·교시 시간(준비령/본령/
+        # 종료령)·시험 시간표·선택과목 응시 장소만 담고, 감독교사 정보는
+        # 절대 포함하지 않습니다(ui/export/exam_export.py 의
+        # export_student_exam_guide_markdown docstring 참조). 감독표는
+        # 따로 "시험 감독 시간표" 화면에서 "교사 공지용"으로만 내보냅니다.
+        self.btn_student_guide = QPushButton("학생 안내문(.md) 내보내기")
+        self.btn_student_guide.setStyleSheet(BTN_PRIMARY)
+        self.btn_student_guide.setToolTip(
+            "시험 기간·교시 시간·시험 시간표·선택과목 응시 장소를 담은 "
+            "학생 배포용 안내문입니다. 감독교사 정보는 포함되지 않습니다."
+        )
+        self.btn_student_guide.clicked.connect(self._export_student_guide)
+        top.addWidget(self.btn_student_guide)
         layout.addLayout(top)
 
         # ── 그리드 ──────────────────────────────────────────────────────
@@ -211,6 +226,34 @@ class ExamGridWidget(QWidget):
                     self.tbl.setItem(row, col, cell)
         finally:
             session.close()
+
+    # ── 학생 안내문 내보내기 ─────────────────────────────────────────────
+
+    def _export_student_guide(self):
+        """
+        학생 안내문(.md)을 저장합니다.
+
+        읽기 전용(교감) 모드에서도 비활성화하지 않는 이유: 이 버튼은
+        화면에 이미 보이는 시험 시간표를 파일로 옮기는 것뿐이고 감독교사
+        정보를 전혀 포함하지 않아(ui/export/exam_export.py 의
+        export_student_exam_guide_markdown 참조), 조회 권한만 있어도
+        내보내기를 막을 이유가 없습니다.
+        """
+        exam_id = self.cmb_exam.currentData()
+        if exam_id is None:
+            QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "학생 안내문 저장", "student_exam_guide.md", "Markdown Files (*.md)")
+        if not path:
+            return
+        session = get_session()
+        try:
+            exam = session.get(Exam, exam_id)
+            export_student_exam_guide_markdown(session, exam, path)
+        finally:
+            session.close()
+        QMessageBox.information(self, "저장 완료", f"학생 안내문이 저장되었습니다:\n{path}")
 
     # ── 자동 배치·수동 편집 ─────────────────────────────────────────────
 

@@ -170,3 +170,81 @@ def test_corridor_duty_auto_assign_and_manual_update(client, admin_h, db):
     resp = client.put(f"/exams/corridor-duties/{duty_id}", json={"teacher_id": None}, headers=admin_h)
     assert resp.status_code == 200
     assert resp.json()["teacher_id"] is None
+
+
+# ── 혼합 시험실 수강 학생 명단 (ExamRoomStudent, 2026-10-04 추가) ───────────
+
+def test_replace_room_students_round_trip(client, admin_h, db):
+    """명단 저장 → 조회 → 교체(replace) 가 정상 동작하는지 확인."""
+    env = _make_env(db)
+    exam = _create_exam(client, admin_h, env["term"].id)
+    period_id = client.get(f"/exams/{exam['id']}/periods", headers=admin_h).json()[0]["id"]
+    room = client.post(f"/exams/{exam['id']}/rooms", json={
+        "period_id": period_id, "grade_id": env["grade"].id,
+        "subject_id": env["subject"].id,
+        "source_class_ids": [c.id for c in env["classes"]],
+        "student_count": 2, "label": "세계사(혼합)",
+    }, headers=admin_h).json()
+
+    resp = client.put(f"/exams/rooms/{room['id']}/students", json={
+        "students": [
+            {"student_number": "10101", "student_name": "김철수",
+             "source_class_id": env["classes"][0].id},
+            {"student_number": "10205", "student_name": "이영희",
+             "source_class_id": env["classes"][1].id},
+        ],
+    }, headers=admin_h)
+    assert resp.status_code == 200
+    saved = resp.json()
+    assert len(saved) == 2
+    assert saved[0]["source_class_name"] == env["classes"][0].display_name
+
+    listed = client.get(f"/exams/rooms/{room['id']}/students", headers=admin_h).json()
+    assert {s["student_number"] for s in listed} == {"10101", "10205"}
+
+    # 교체 — 기존 2명을 1명으로 완전히 덮어씀
+    resp = client.put(f"/exams/rooms/{room['id']}/students", json={
+        "students": [{"student_number": "10301", "student_name": "박민수"}],
+    }, headers=admin_h)
+    assert resp.status_code == 200
+    listed = client.get(f"/exams/rooms/{room['id']}/students", headers=admin_h).json()
+    assert len(listed) == 1
+    assert listed[0]["student_number"] == "10301"
+
+
+def test_replace_room_students_skips_blank_rows(client, admin_h, db):
+    """학번·이름이 둘 다 빈 줄은 조용히 건너뛰고 나머지는 저장됨."""
+    env = _make_env(db)
+    exam = _create_exam(client, admin_h, env["term"].id)
+    period_id = client.get(f"/exams/{exam['id']}/periods", headers=admin_h).json()[0]["id"]
+    room = client.post(f"/exams/{exam['id']}/rooms", json={
+        "period_id": period_id, "grade_id": env["grade"].id,
+    }, headers=admin_h).json()
+
+    resp = client.put(f"/exams/rooms/{room['id']}/students", json={
+        "students": [
+            {"student_number": "10101"},
+            {"student_number": "", "student_name": ""},   # 빈 줄 — 건너뜀
+            {"student_name": "익명학생"},                   # 학번 없이 이름만 — 허용
+        ],
+    }, headers=admin_h)
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+    listed = client.get(f"/exams/rooms/{room['id']}/students", headers=admin_h).json()
+    assert len(listed) == 2
+
+
+def test_room_student_roster_is_optional_for_invigilation(client, admin_h, db):
+    """명단을 전혀 등록하지 않아도 감독 자동 배정은 정상 동작 (완전 선택 입력 확인)."""
+    env = _make_env(db)
+    exam = _create_exam(client, admin_h, env["term"].id)
+    period_id = client.get(f"/exams/{exam['id']}/periods", headers=admin_h).json()[0]["id"]
+    client.post(f"/exams/{exam['id']}/rooms", json={
+        "period_id": period_id, "grade_id": env["grade"].id,
+        "source_class_ids": [c.id for c in env["classes"]], "student_count": 15,
+    }, headers=admin_h)
+
+    resp = client.post(f"/exams/{exam['id']}/assign-invigilations", headers=admin_h)
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True

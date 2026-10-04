@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from shared.models import (
     User, Teacher, Grade, SchoolClass, Subject, Exam, ExamPeriod, ExamEntry,
     InvigilationAssignment, InvigilationConstraint, TimetableEntry,
-    ExamRoom, CorridorDutyAssignment, ExamGradeDateExclusion,
+    ExamRoom, ExamRoomStudent, CorridorDutyAssignment, ExamGradeDateExclusion,
 )
 from shared.schemas import (
     ExamCreate, ExamOut, ExamUpdate, ExamPeriodOut,
@@ -34,6 +34,7 @@ from shared.schemas import (
     InvigilationConstraintCreate, InvigilationConstraintOut,
     InvigilationConstraintReview,
     ExamRoomCreate, ExamRoomOut,
+    ExamRoomStudentOut, ExamRoomStudentReplaceRequest,
     ExamGradeDateExclusionCreate, ExamGradeDateExclusionOut,
     CorridorDutyOut, CorridorDutyUpdate,
 )
@@ -453,10 +454,16 @@ def auto_assign_invigilations(
     _: User = Depends(require_scheduler),
 ):
     """
-    감독 자동 배정 실행 (core.exam_scheduler.assign_invigilations).
+    교실감독 자동 배정 실행 (core.exam_scheduler.assign_invigilations).
 
-    하드 제약(수업 중 배제·담임 반 금지·담당 과목 금지·감독 불가·주간 제약)과
-    감독 횟수 균등 분배(소프트 점수)를 적용합니다.
+    호출 순서(2026-10-04): POST .../assign-corridor-duty 를 먼저 호출하세요.
+    그 결과(과목 담당 교사 중심 복도감독)가 이미 있으면 이 함수가 해당
+    교사들을 교실감독 후보에서 자동 제외합니다. 순서를 지키지 않아도
+    에러는 아니지만, 과목 담당 교사가 적은 교시에서 복도감독이 나중에
+    미배정으로 남을 수 있습니다.
+
+    하드 제약(수업 중 배제·담임 반 금지·담당 과목 금지·감독 불가·주간 제약·
+    복도감독 겸임 금지)과 감독 횟수 균등 분배(소프트 점수)를 적용합니다.
     후보 부족 시 미배정 슬롯을 남기고 400 이 아니라 결과 메시지로 안내합니다.
 
     preserve_existing (기본 True): 지금도 하드 제약을 통과하는 기존
@@ -648,6 +655,86 @@ def delete_exam_room(
     return {"ok": True}
 
 
+# ── 혼합 시험실 수강 학생 명단 (ExamRoomStudent, 2026-10-04 추가) ───────────
+# 전부 선택 입력 — 목적은 오직 "학생 배치 안내문"(export_room_assignment_
+# notice_pdf/csv) 자동 생성이며, 감독 자동 배정 알고리즘은 이 명단을
+# 전혀 참조하지 않습니다(ExamRoom.student_count 만으로 충분).
+
+def _room_student_out(db: Session, s: ExamRoomStudent) -> ExamRoomStudentOut:
+    out = ExamRoomStudentOut.model_validate(s)
+    if s.source_class_id is not None:
+        cls = db.get(SchoolClass, s.source_class_id)
+        out.source_class_name = cls.display_name if cls else None
+    return out
+
+
+@router.get("/rooms/{room_id}/students", response_model=list[ExamRoomStudentOut])
+def list_room_students(
+    room_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    혼합 시험실 수강 학생 명단 조회.
+
+    draft 시험의 명단을 교사에게 숨기는 별도 검사는 하지 않습니다 —
+    ExamRoom 자체가 어느 시험 소속인지는 room.exam_id 로 알 수 있지만,
+    이 엔드포인트는 room_id 만 받으므로 그 시험을 다시 조회해 상태를
+    확인해야 합니다. 학생 개인정보(이름·학번)가 섞여 있을 수 있는
+    민감한 데이터라는 점을 고려하면 이 보호가 특히 중요합니다.
+    """
+    room = db.get(ExamRoom, room_id)
+    if room is None:
+        raise HTTPException(404, "시험실을 찾을 수 없습니다.")
+    exam = db.get(Exam, room.exam_id)
+    if exam is not None:
+        _check_teacher_visibility(user, exam)
+    rows = (
+        db.query(ExamRoomStudent).filter_by(exam_room_id=room_id)
+        .order_by(ExamRoomStudent.student_number).all()
+    )
+    return [_room_student_out(db, s) for s in rows]
+
+
+@router.put("/rooms/{room_id}/students", response_model=list[ExamRoomStudentOut])
+def replace_room_students(
+    room_id: int,
+    body: ExamRoomStudentReplaceRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_scheduler),
+):
+    """
+    혼합 시험실 수강 학생 명단을 통째로 교체합니다 (삭제 후 재생성).
+
+    "통째로 교체"로 설계한 이유는 ExamRoomStudentReplaceRequest 의
+    docstring 참조. 학번·이름이 둘 다 빈 줄은 조용히 건너뜁니다 — UI가
+    빈 입력 행을 그대로 보냈을 가능성이 높은, "누구인지 전혀 알 수 없는"
+    무의미한 데이터라 굳이 400 에러로 요청 전체를 막기보다는 그 줄만
+    버리고 나머지는 정상 저장하는 쪽이 사용자 경험상 낫다고 판단했습니다.
+    """
+    room = db.get(ExamRoom, room_id)
+    if room is None:
+        raise HTTPException(404, "시험실을 찾을 수 없습니다.")
+
+    db.query(ExamRoomStudent).filter_by(exam_room_id=room_id).delete()
+    saved = []
+    for s in body.students:
+        if not (s.student_number or "").strip() and not (s.student_name or "").strip():
+            continue   # 학번·이름 둘 다 없는 빈 줄 — 조용히 건너뜀
+        row = ExamRoomStudent(
+            exam_room_id=room_id,
+            student_number=(s.student_number or "").strip() or None,
+            student_name=(s.student_name or "").strip() or None,
+            source_class_id=s.source_class_id,
+        )
+        db.add(row)
+        saved.append(row)
+    db.commit()
+    for row in saved:
+        db.refresh(row)
+    return [_room_student_out(db, s) for s in saved]
+
+
 # ── 학년별 시험 미참여 날짜 (ExamGradeDateExclusion, 2026-10-04 추가) ─────────
 
 @router.get("/{exam_id}/grade-exclusions", response_model=list[ExamGradeDateExclusionOut])
@@ -781,9 +868,14 @@ def auto_assign_corridor_duty(
     """
     복도감독 자동 배정 (core.exam_scheduler.assign_corridor_duty).
 
-    교실감독(assign-invigilations)을 먼저 실행해야 그 결과를 바탕으로
-    겸임 배정을 피할 수 있습니다 — 순서를 지키지 않아도 에러는 아니지만
-    교실감독과 겹칠 수 있습니다.
+    호출 순서(2026-10-04 변경): assign-invigilations(교실감독) 보다
+    먼저 호출하세요 — "과목 담당 교사 중심으로 복도감독을 먼저 정하고,
+    남는 교사로 교실감독을 배정한다"는 운영 방식을 반영한 순서입니다.
+    후보가 좁은(그 교시 시험 과목 담당 교사로 한정) 이 단계를 먼저
+    확정해야, 후보가 넓은 교실감독이 그 교사들을 먼저 써버려 복도감독이
+    미배정으로 남는 것을 막을 수 있습니다. 거꾸로 호출해도 에러는
+    아니고(이미 있는 교실감독 배정과는 겹치지 않도록 여전히 보호하지만),
+    이 순서상의 보호는 받지 못합니다.
     """
     _get_exam_or_404(db, exam_id)
     ok, msg = assign_corridor_duty(db, exam_id, preserve_existing=preserve_existing)

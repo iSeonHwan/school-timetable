@@ -195,6 +195,72 @@ def test_exam_setup_room_panel(qtbot, exam_env, db):
     assert db.query(ExamRoom).filter_by(exam_id=exam_env["exam"].id).count() == 0
 
 
+def test_exam_room_student_dialog_add_bulk_delete_save(qtbot, exam_env, db):
+    """
+    혼합 시험실 학생 명단 다이얼로그 (2026-10-04 신규 — 완전 선택 입력):
+    행 추가·일괄 붙여넣기·행 삭제·저장이 DB 에 그대로 반영되는지 확인.
+    """
+    from database.models import ExamRoom, ExamRoomStudent
+    from admin_app.ui.exam.exam_setup_page import ExamRoomStudentDialog
+
+    room = ExamRoom(
+        exam_id=exam_env["exam"].id, period_id=exam_env["periods"][0].id,
+        grade_id=exam_env["grade"].id, source_class_ids=f"[{exam_env['cls'].id}]",
+        student_count=3, label="학생명단테스트",
+    )
+    db.add(room)
+    db.commit()
+
+    dialog = ExamRoomStudentDialog(room)
+    qtbot.addWidget(dialog)
+
+    # 행 추가 + 직접 입력
+    dialog._append_row("", "", None)
+    dialog.tbl.item(0, 0).setText("10101")
+    dialog.tbl.item(0, 1).setText("김철수")
+
+    # 일괄 붙여넣기 — 공백/쉼표 구분 모두 허용
+    dialog.txt_bulk.setPlainText("10102 이영희\n10103,박민수\n10104")
+    dialog._apply_bulk_paste()
+    assert dialog.tbl.rowCount() == 4
+
+    # 마지막 줄(10104, 이름 없음) 삭제 — "삭제해도 나머지는 남는지" 확인
+    dialog.tbl.selectRow(3)
+    dialog._delete_selected_rows()
+    assert dialog.tbl.rowCount() == 3
+
+    dialog._save()
+
+    saved = db.query(ExamRoomStudent).filter_by(exam_room_id=room.id).order_by(
+        ExamRoomStudent.student_number).all()
+    assert [s.student_number for s in saved] == ["10101", "10102", "10103"]
+    assert saved[0].student_name == "김철수"
+    assert saved[2].student_name == "박민수"   # 쉼표 구분도 정상 파싱
+
+
+def test_exam_room_student_dialog_skips_blank_rows_on_save(qtbot, exam_env, db):
+    """학번·이름이 둘 다 빈 행은 저장 시 조용히 제외됨."""
+    from database.models import ExamRoom, ExamRoomStudent
+    from admin_app.ui.exam.exam_setup_page import ExamRoomStudentDialog
+
+    room = ExamRoom(
+        exam_id=exam_env["exam"].id, period_id=exam_env["periods"][0].id,
+        grade_id=exam_env["grade"].id, label="빈행테스트",
+    )
+    db.add(room)
+    db.commit()
+
+    dialog = ExamRoomStudentDialog(room)
+    qtbot.addWidget(dialog)
+    dialog._append_row("10201", "", None)
+    dialog._append_row("", "", None)   # 완전히 빈 행
+    dialog._save()
+
+    saved = db.query(ExamRoomStudent).filter_by(exam_room_id=room.id).all()
+    assert len(saved) == 1
+    assert saved[0].student_number == "10201"
+
+
 def monkeypatch_msgbox(qtbot):
     """QMessageBox.question/information/warning 을 자동 Yes/닫기로 대체."""
     from PyQt6.QtWidgets import QMessageBox

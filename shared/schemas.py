@@ -955,6 +955,52 @@ class ExamRoomOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ExamRoomStudentIn(BaseModel):
+    """
+    혼합 시험실 수강 학생 명단의 한 줄 (2026-10-04 추가, 전부 선택 입력).
+
+    student_number(학번)을 권장 식별자로 둡니다 — 이름은 동명이인
+    가능성·개인정보 민감도가 더 높아 보조 표기로만 씁니다.
+
+    cross-field 검증(최소 하나는 있어야 함)은 여기서 하지 않고 서버
+    (PUT /exams/rooms/{room_id}/students)에서 요청 전체를 보고 처리합니다
+    — "학번도 이름도 없는 빈 줄"은 빈 입력 폼을 그대로 저장한 UI 실수일
+    가능성이 높아, 개별 필드 검증보다는 "그런 줄은 조용히 건너뛴다"는
+    요청 단위 정책이 사용자 경험상 더 낫다고 판단했습니다(아래 PUT
+    핸들러의 docstring 참조).
+    """
+    student_number: Optional[str] = Field(None, max_length=20)
+    student_name: Optional[str] = Field(None, max_length=30)
+    source_class_id: Optional[int] = None
+
+
+class ExamRoomStudentOut(BaseModel):
+    """혼합 시험실 수강 학생 명단 응답 (소속 반 이름은 서버가 주입)."""
+    id: int
+    exam_room_id: int
+    student_number: Optional[str]
+    student_name: Optional[str]
+    source_class_id: Optional[int]
+    source_class_name: Optional[str] = None   # 서버가 주입
+
+    model_config = {"from_attributes": True}
+
+
+class ExamRoomStudentReplaceRequest(BaseModel):
+    """
+    PUT /exams/rooms/{room_id}/students 요청 바디.
+
+    "추가/삭제" 개별 엔드포인트 대신 "전체 교체" 하나로 설계한 이유:
+    실제 운영에서 이 명단은 학교 행정 시스템에서 뽑은 수강자 목록을
+    한 번에 붙여넣거나 표로 편집해 "저장"하는 식으로 다뤄질 가능성이
+    높습니다(관리자 앱의 "학생 명단 관리" 다이얼로그도 이 방식으로
+    동작). 한 줄씩 추가/삭제하는 API 를 따로 두면 클라이언트가 "기존
+    줄을 전부 지우고 새로 넣는" 흐름을 여러 번 호출로 흉내내야 해서
+    번거롭고, 중간에 실패하면 일부만 반영되는 상태가 생길 수 있습니다.
+    """
+    students: list[ExamRoomStudentIn] = Field(default_factory=list)
+
+
 class ExamGradeDateExclusionCreate(BaseModel):
     """
     학년별 시험 미참여 날짜 등록 요청 (2026-10-04 추가). 이 날짜는 그

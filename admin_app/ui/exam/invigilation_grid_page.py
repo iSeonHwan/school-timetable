@@ -33,7 +33,11 @@ from database.models import (
     Teacher, ExamEntry, Subject, ExamRoom, CorridorDutyAssignment, Grade,
 )
 from core.exam_scheduler import assign_invigilations, assign_corridor_duty
-from ui.export.exam_export import export_invigilation_pdf, export_invigilation_csv
+from ui.export.exam_export import (
+    export_invigilation_pdf, export_invigilation_csv,
+    export_room_assignment_notice_pdf, export_room_assignment_notice_csv,
+    export_teacher_invigilation_notice_markdown,
+)
 
 BTN_PRIMARY  = "background:#1B4F8A; color:white; border-radius:4px; padding:6px 14px; font-weight:bold;"
 BTN_SECOND   = "background:#5D6D7E; color:white; border-radius:4px; padding:6px 14px;"
@@ -74,6 +78,15 @@ class InvigilationGridWidget(QWidget):
         layout.addWidget(title)
 
         # ── 상단: 시험 선택 + 자동 배정 + 내보내기 ────────────────────────
+        #
+        # 버튼 순서가 곧 권장 작업 순서입니다 (2026-10-04 변경 — "①
+        # 복도감독 → ② 교실감독"). 과목 담당 교사로 후보가 좁은 복도감독을
+        # 먼저 확정해야, 후보가 넓은 교실감독이 그 교사들을 먼저 다른 반에
+        # 써버려 복도감독이 미배정으로 남는 충돌을 막을 수 있습니다
+        # (core.exam_scheduler 모듈 docstring의 "제공 함수와 호출 순서"
+        # 참조 — assign_invigilations() 가 hard["corridor_busy"] 로 이미
+        # 복도감독에 쓰인 교사를 자동 제외합니다). 거꾸로 눌러도 에러는
+        # 아니지만 그 보호를 못 받으므로, 번호 순서대로 누르도록 안내합니다.
         top = QHBoxLayout()
         top.addWidget(QLabel("시험 선택:"))
         self.cmb_exam = QComboBox()
@@ -81,7 +94,12 @@ class InvigilationGridWidget(QWidget):
         self.cmb_exam.currentIndexChanged.connect(self._render_grid)
         top.addWidget(self.cmb_exam)
 
-        self.btn_assign = QPushButton("감독 자동 배정")
+        self.btn_corridor = QPushButton("① 복도감독 자동 배정")
+        self.btn_corridor.setStyleSheet(BTN_PRIMARY)
+        self.btn_corridor.clicked.connect(self._auto_assign_corridor)
+        top.addWidget(self.btn_corridor)
+
+        self.btn_assign = QPushButton("② 교실감독 자동 배정")
         self.btn_assign.setStyleSheet(BTN_PRIMARY)
         self.btn_assign.clicked.connect(self._auto_assign)
         top.addWidget(self.btn_assign)
@@ -106,16 +124,48 @@ class InvigilationGridWidget(QWidget):
         self.btn_csv.setStyleSheet(BTN_SECOND)
         self.btn_csv.clicked.connect(self._export_csv)
         top.addWidget(self.btn_csv)
-        top.addStretch()
 
-        self.btn_corridor = QPushButton("복도감독 자동 배정")
-        self.btn_corridor.setStyleSheet(BTN_SECOND)
-        self.btn_corridor.clicked.connect(self._auto_assign_corridor)
-        top.addWidget(self.btn_corridor)
+        # 학생 배치 안내문 (2026-10-04 추가) — 혼합 시험실(ExamRoom)에 등록된
+        # 수강 학생 명단(ExamRoomStudent, 전부 선택 입력)이 있어야 의미 있는
+        # 내용이 나옵니다. 명단이 하나도 없어도 호출은 실패하지 않고
+        # "(명단 미등록)" 으로 표시되므로, 버튼 자체는 항상 활성화해 둡니다.
+        self.btn_notice_pdf = QPushButton("학생 배치 안내문 PDF")
+        self.btn_notice_pdf.setStyleSheet(BTN_SECOND)
+        self.btn_notice_pdf.setToolTip(
+            "혼합 시험실(선택과목 등)에 등록된 학생 명단을 바탕으로 "
+            "'이 과목은 어디서 보는지' 안내 문서를 만듭니다. "
+            "명단은 시험 관리 화면의 '학생 명단 관리'에서 등록합니다(완전 선택).")
+        self.btn_notice_pdf.clicked.connect(self._export_room_notice_pdf)
+        top.addWidget(self.btn_notice_pdf)
+
+        self.btn_notice_csv = QPushButton("학생 배치 안내문 CSV")
+        self.btn_notice_csv.setStyleSheet(BTN_SECOND)
+        self.btn_notice_csv.clicked.connect(self._export_room_notice_csv)
+        top.addWidget(self.btn_notice_csv)
+
+        # 교사 공지용 감독표(.md, 2026-10-04 추가) — 위 "학생 배치 안내문"과
+        # 이름이 비슷해 보이지만 용도가 정반대입니다: 이 문서는 감독교사
+        # 배정을 그대로 담고 있어 "교사 전용"이며, 학생에게 배포해서는
+        # 안 됩니다(부정행위 방지). 버튼 색을 danger 로 두는 대신 경고
+        # 문구를 툴팁에 명확히 적었습니다 — 삭제처럼 되돌릴 수 없는
+        # 작업이 아니라 "누구에게 공유하느냐"의 문제라, 사용자가 읽을
+        # 안내가 더 적절합니다.
+        self.btn_teacher_notice = QPushButton("교사 공지문(.md)")
+        self.btn_teacher_notice.setStyleSheet(BTN_PRIMARY)
+        self.btn_teacher_notice.setToolTip(
+            "⚠ 교사 전용 — 교실감독·복도감독 배정이 그대로 포함됩니다. "
+            "학생에게 배포하지 마세요. 학생에게 줄 안내문은 '시험 시간표' "
+            "화면의 '학생 안내문(.md)'을 사용하세요(감독 정보 없음)."
+        )
+        self.btn_teacher_notice.clicked.connect(self._export_teacher_notice_markdown)
+        top.addWidget(self.btn_teacher_notice)
+        top.addStretch()
 
         if self._read_only:
             # 교감용 읽기 전용 — 열람만 가능
-            for b in (self.btn_assign, self.btn_pdf, self.btn_csv, self.chk_preserve, self.btn_corridor):
+            for b in (self.btn_assign, self.btn_pdf, self.btn_csv, self.chk_preserve,
+                      self.btn_corridor, self.btn_notice_pdf, self.btn_notice_csv,
+                      self.btn_teacher_notice):
                 b.setEnabled(False)
         layout.addLayout(top)
 
@@ -143,6 +193,8 @@ class InvigilationGridWidget(QWidget):
         layout.addWidget(frame, stretch=1)
 
         hint = QLabel(
+            "① 복도감독 → ② 교실감독 순서로 자동 배정하세요(과목 담당 교사가 "
+            "적을 때 복도감독이 교실감독에 먼저 소모되는 것을 방지). "
             "교사 셀을 더블클릭하면 감독교사를 수동으로 지정·변경할 수 있습니다. "
             "'[혼합]' 행은 여러 반이 섞이는 시험실입니다. "
             "빨간 '(미배정)' 칸은 후보 부족 등으로 자동 배정이 안 된 슬롯입니다.")
@@ -372,11 +424,17 @@ class InvigilationGridWidget(QWidget):
 
     def _auto_assign(self):
         """
-        선택 시험의 감독을 자동 배정합니다.
+        선택 시험의 교실감독을 자동 배정합니다 (버튼 순서상 ②번).
 
         "기존 배정 최대한 유지" 체크 시(기본값) 지금도 유효한 기존
         배정은 그대로 두고 바뀐 자리만 다시 배정합니다(변경 최소화).
         체크 해제 시 기존 배정을 전부 지우고 완전히 새로 배정합니다.
+
+        복도감독을 아직 배정하지 않았다면 확인창에서 안내합니다 — 지금
+        눌러도 실패하지는 않지만(core.exam_scheduler.assign_invigilations
+        는 hard["corridor_busy"] 가 비어 있으면 그 제약을 자연히 건너뜀),
+        나중에 ①번(복도감독 자동 배정)을 누르면 이미 다른 반에 쓰인
+        과목 담당 교사 때문에 복도감독이 미배정으로 남을 수 있습니다.
         """
         exam_id = self.cmb_exam.currentData()
         if exam_id is None:
@@ -388,9 +446,22 @@ class InvigilationGridWidget(QWidget):
             if preserve else
             "기존 감독 배정을 전부 지우고 새로 배정합니다.\n"
         )
+        order_warning = ""
+        session = get_session()
+        try:
+            has_corridor = session.query(CorridorDutyAssignment).filter_by(
+                exam_id=exam_id).first() is not None
+        finally:
+            session.close()
+        if not has_corridor:
+            order_warning = (
+                "⚠ 아직 ①번 복도감독을 배정하지 않았습니다. 지금 교실감독부터 "
+                "채우면, 과목 담당 교사가 적을 때 나중에 복도감독이 미배정으로 "
+                "남을 수 있습니다 — ①번을 먼저 누르는 것을 권장합니다.\n\n"
+            )
         reply = QMessageBox.question(
             self, "자동 배정 확인",
-            confirm_text +
+            order_warning + confirm_text +
             "감독 불가 신청(승인)·수업 시간표가 반영됩니다. 계속하시겠습니까?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
@@ -602,3 +673,71 @@ class InvigilationGridWidget(QWidget):
         finally:
             session.close()
         QMessageBox.information(self, "저장 완료", f"CSV가 저장되었습니다:\n{path}")
+
+    def _export_room_notice_pdf(self):
+        """학생 배치 안내문을 PDF 로 저장합니다 (혼합 시험실 학생 명단 기준)."""
+        exam_id = self.cmb_exam.currentData()
+        if exam_id is None:
+            QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "학생 배치 안내문 PDF 저장", "room_assignment_notice.pdf", "PDF Files (*.pdf)")
+        if not path:
+            return
+        session = get_session()
+        try:
+            exam = session.get(Exam, exam_id)
+            export_room_assignment_notice_pdf(session, exam, path)
+        finally:
+            session.close()
+        QMessageBox.information(self, "저장 완료", f"PDF가 저장되었습니다:\n{path}")
+
+    def _export_room_notice_csv(self):
+        """학생 배치 안내문을 CSV 로 저장합니다 (혼합 시험실 학생 명단 기준)."""
+        exam_id = self.cmb_exam.currentData()
+        if exam_id is None:
+            QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "학생 배치 안내문 CSV 저장", "room_assignment_notice.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        session = get_session()
+        try:
+            exam = session.get(Exam, exam_id)
+            export_room_assignment_notice_csv(session, exam, path)
+        finally:
+            session.close()
+        QMessageBox.information(self, "저장 완료", f"CSV가 저장되었습니다:\n{path}")
+
+    def _export_teacher_notice_markdown(self):
+        """
+        교사 공지용 감독표(.md)를 저장합니다.
+
+        저장 전 확인창으로 "학생에게 배포하지 말라"는 경고를 한 번 더
+        띄웁니다 — 버튼 툴팁은 마우스를 올려야 보이므로, 실제로 누르는
+        순간에도 같은 경고를 보게 해 실수로 공유 채널에 잘못 올리는
+        사고를 줄입니다.
+        """
+        exam_id = self.cmb_exam.currentData()
+        if exam_id is None:
+            QMessageBox.information(self, "안내", "시험을 선택해 주세요.")
+            return
+        reply = QMessageBox.question(
+            self, "교사 공지문 저장",
+            "이 문서는 교실감독·복도감독 배정이 그대로 포함된 교사 전용 "
+            "공지물입니다. 학생에게 배포하지 마세요. 계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "교사 공지문 저장", "teacher_invigilation_notice.md", "Markdown Files (*.md)")
+        if not path:
+            return
+        session = get_session()
+        try:
+            exam = session.get(Exam, exam_id)
+            export_teacher_invigilation_notice_markdown(session, exam, path)
+        finally:
+            session.close()
+        QMessageBox.information(self, "저장 완료", f"교사 공지문이 저장되었습니다:\n{path}")

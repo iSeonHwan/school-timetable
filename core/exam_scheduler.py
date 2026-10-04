@@ -7,19 +7,37 @@
   - 랜덤 재시작(random restart)으로 우연에 의존하는 배치를 여러 번 시도하고
     가장 좋은 결과를 채택
 
-제공 함수:
-  generate_exam_entries(session, exam_id)
+제공 함수과 호출 순서 (2026-10-04 변경 — 중요):
+  1. generate_exam_entries(session, exam_id)
       — 시험 시간표(과목 배치) 자동 생성. 학년별로 ExamGradeDateExclusion
         (시험 미참여 날짜)을 제외하고 배치합니다.
-  assign_invigilations(session, exam_id, preserve_existing=True)
-      — 시험 감독(교실감독) 배정 자동 생성. 일반 반(SchoolClass) 단위
-        슬롯뿐 아니라 여러 반이 섞인 혼합 시험실(ExamRoom)도 함께
-        배정합니다. preserve_existing=True(기본값)면 지금도 하드 제약을
-        통과하는 기존 배정은 그대로 두고 나머지만 다시 배정합니다
-        ("변경 최소화" — 실제 학교 운영 사례 반영).
-  assign_corridor_duty(session, exam_id, preserve_existing=True)
-      — 복도감독(학년×교시 단위, 시험 과목 담당 교사 중 1명) 자동 배정.
-        assign_invigilations() 이후에 호출해야 교실감독과 겹치지 않습니다.
+  2. assign_corridor_duty(session, exam_id, preserve_existing=True)
+      — 복도감독(학년×교시 단위, 시험 과목 담당 교사 중 1명)을 먼저
+        배정합니다. "각 시험 과목 담당 선생님을 중심으로 복도감독을
+        먼저 정하고, 남는 교사로 교실감독을 배정한다"는 실제 운영
+        방식을 그대로 반영한 순서입니다.
+  3. assign_invigilations(session, exam_id, preserve_existing=True)
+      — 시험 감독(교실감독) 배정. 일반 반(SchoolClass) 단위 슬롯뿐
+        아니라 여러 반이 섞인 혼합 시험실(ExamRoom)도 함께 배정합니다.
+        2번에서 이미 복도감독으로 쓰인 교사는 하드 제약으로 자동 제외되므로
+        (_collect_hard_constraints 의 corridor_busy), 남은 교사들로만
+        교실감독을 채웁니다. preserve_existing=True(기본값)면 지금도
+        하드 제약을 통과하는 기존 배정은 그대로 두고 나머지만 다시
+        배정합니다("변경 최소화" — 실제 학교 운영 사례 반영).
+
+  이 순서를 지켜야 하는 이유(2026-10-04 이전의 한계): 거꾸로 교실감독을
+  먼저 배정하면, 그 알고리즘은 "이 교사가 복도감독으로도 필요하다"는
+  사실을 모른 채 순수 공평성 점수만으로 교사를 씁니다. 특정 과목의
+  담당 교사가 적을 때 그 교사가 교실감독에 먼저 소모되면, 복도감독
+  후보가 남지 않아 미배정으로 끝날 수 있습니다. 두 함수를 하나의
+  전역 최적화로 합치는 대신(구현이 훨씬 복잡해짐), "제약이 더 좁은
+  쪽(복도감독 — 후보가 과목 담당 교사로 한정)을 먼저 확정하고 제약이
+  넓은 쪽(교실감독 — 거의 모든 교사가 후보)을 나중에 채운다"는 순서로
+  풀어, 간단한 두 단계 구조를 유지하면서 충돌을 원천적으로 막습니다.
+  (역방향 보호도 유지됩니다 — assign_corridor_duty 는 여전히 기존
+  교실감독 배정과 겹치지 않도록 classroom_busy 를 확인하므로, 혹시
+  순서를 지키지 않고 교실감독을 먼저 돌려도 최소한 이미 있는 배정과
+  겹치는 사고는 나지 않습니다.)
 
 세 함수 모두 (bool, message) 튜플을 반환합니다 (generator.py 와 동일한 규약).
 """
@@ -401,7 +419,7 @@ def _collect_hard_constraints(
             _parse_target_grade_ids() 로 계산한 값을 그대로 전달). 1번 제약
             계산에서 "시험 보는 반"의 정규 수업을 제외하기 위해 필요합니다.
 
-    제약 5종 (위반 시 해당 교사는 그 슬롯의 후보에서 완전 배제):
+    제약 6종 (위반 시 해당 교사는 그 슬롯의 후보에서 완전 배제):
       1. 수업 병행(요구사항 6): 시험 치르지 않는 학년은 그 교시에도 수업이
          있으므로, 일반 시간표(TimetableEntry)에서 그 시간대에 수업 중인
          교사를 모두 배제합니다. 시험 교시 → 일반 교시는 1:1 매핑으로
@@ -423,6 +441,14 @@ def _collect_hard_constraints(
          공결·출장·연수 등 특정 날짜(+교시)의 불가. 승인된 것만 반영합니다.
       5. 교사 주간 제약(TeacherConstraint, unavailable):
          매주 해당 요일·교시에 불가능한 교사는 시험 감독도 불가.
+      6. 복도감독 겸임 금지 (2026-10-04 추가, 요구사항: 복도감독 우선 배정):
+         같은 교시에 이미 복도감독(CorridorDutyAssignment)으로 배정된
+         교사는 교실감독 후보에서 제외합니다. 운영 순서를 "복도감독(과목
+         담당 교사 중심) 먼저 → 남는 교사로 교실감독"으로 정했기 때문에,
+         교실감독 배정 시점에 복도감독 결과가 이미 DB 에 있다면 반드시
+         존중해야 합니다. (반대 방향 — 복도감독이 교실감독 기존 배정을
+         피하는 것 — 은 assign_corridor_duty() 의 classroom_busy 에서
+         별도로 처리하므로, 어느 순서로 다시 실행해도 서로 겹치지 않습니다.)
 
     반환값 (모두 set/dict 조회용):
       busy: {(dow, period): set(teacher_id)} — 1번 제약
@@ -430,6 +456,7 @@ def _collect_hard_constraints(
       own_subject: {(class_id, subject_id): set(teacher_id)} — 3번 제약
       unavailable_days: {teacher_id: set(date)} / unavailable_slots: {(t_id, date, period)}
       exam_subject_of: {(period_id, grade_id): subject_id} — 시험 과목 조회용
+      corridor_busy: {period_id: set(teacher_id)} — 6번 제약
     """
     # ── 1. 수업 병행 검증용: 교시별 수업 중 교사 집합 ─────────────────────────
     # 시험 교시에 상응하는 일반 시간표의 (요일, 교시) 조합을 모아 한 번에 조회.
@@ -538,6 +565,15 @@ def _collect_hard_constraints(
                 if banned:
                     room_banned_subject[room.id] = banned
 
+    # ── 7. 복도감독 겸임 금지 (2026-10-04 추가) ──────────────────────────────
+    # CorridorDutyAssignment 는 "학년×교시"당 1건이지만, 교실감독 배제
+    # 판단은 "그 교시에 바쁜가"만 따지면 되므로 grade_id 는 버리고
+    # period_id → teacher_id 집합으로만 모읍니다.
+    corridor_busy: dict[int, set] = {}
+    for c in session.query(CorridorDutyAssignment).filter_by(exam_id=exam.id):
+        if c.teacher_id is not None:
+            corridor_busy.setdefault(c.period_id, set()).add(c.teacher_id)
+
     return {
         "busy": busy, "homeroom": homeroom, "own_subject": own_subject,
         "unavailable_days": unavailable_days,
@@ -546,6 +582,7 @@ def _collect_hard_constraints(
         "exam_subject_of": exam_subject_of,
         "room_banned_homeroom": room_banned_homeroom,
         "room_banned_subject": room_banned_subject,
+        "corridor_busy": corridor_busy,
     }
 
 
@@ -596,6 +633,14 @@ def _slot_is_allowed(teacher_id: int, slot: dict, hard: dict) -> bool:
         return False
     # 5. 매주 해당 요일·교시 불가 제약
     if (teacher_id, dow, period) in hard["weekly_unavailable"]:
+        return False
+    # 6. 복도감독 겸임 금지 (2026-10-04 추가) — 운영 순서상 복도감독을
+    # 먼저 배정하므로(assign_corridor_duty 를 assign_invigilations 보다
+    # 먼저 호출), 그 결과가 이미 있다면 그 교시의 교실감독 후보에서
+    # 제외합니다. 아직 복도감독을 배정하지 않았다면 hard["corridor_busy"]
+    # 가 비어 있어 이 검사는 자연히 통과됩니다(하위 호환 — 교실감독만
+    # 쓰는 기존 사용 흐름도 그대로 동작).
+    if teacher_id in hard["corridor_busy"].get(slot["period_id"], set()):
         return False
     return True
 
@@ -733,7 +778,15 @@ def assign_invigilations(
     session: Session, exam_id: int, preserve_existing: bool = True,
 ) -> tuple[bool, str]:
     """
-    시험 감독 자동 배정 (요구사항 2·3·5·6 종합).
+    시험 감독(교실감독) 자동 배정 (요구사항 2·3·5·6 종합).
+
+    호출 순서 중요 (2026-10-04): assign_corridor_duty() 를 먼저 실행한
+    뒤에 이 함수를 호출하세요. 그래야 그 교시에 복도감독으로 이미 쓰인
+    교사(과목 담당 교사 중심)가 교실감독 후보에서 자동 제외됩니다
+    (_collect_hard_constraints 의 corridor_busy 제약, 모듈 docstring의
+    "제공 함수와 호출 순서" 참조). 거꾸로(교실감독을 먼저) 호출해도
+    에러는 아니지만, 복도감독 후보가 교실감독에 먼저 소모되어 복도감독이
+    미배정으로 남을 위험이 있습니다.
 
     동작 순서:
       1. 시험 대상 학년의 반들을 대상으로 감독 슬롯을 생성합니다.
@@ -918,10 +971,19 @@ def assign_corridor_duty(
     아니라 학년×교시 단위, 후보는 "그 교시 시험 과목 담당 교사"로 한정)
     별도 테이블(CorridorDutyAssignment)로 관리합니다.
 
-    선행 조건: assign_invigilations() 가 먼저 실행돼 있어야 "이 교시에
-    이미 교실감독 중인 교사"를 겸임 후보에서 제외할 수 있습니다. 순서를
-    지키지 않아도 에러는 아니지만, 교실감독과 겹치는 배정이 나올 수 있어
-    먼저 호출하는 것을 권장합니다.
+    호출 순서 (2026-10-04 변경): assign_invigilations() 보다 먼저
+    호출하세요. "과목 담당 교사 중심으로 복도감독을 먼저 정하고, 남는
+    교사로 교실감독을 배정한다"는 실제 운영 방식을 반영한 순서입니다 —
+    후보군이 좁은(그 교시 시험 과목 담당 교사로 한정) 쪽을 먼저 확정해야,
+    후보군이 넓은 교실감독이 그 교사들을 먼저 다른 반에 써버려 복도감독이
+    미배정으로 남는 사고를 막을 수 있습니다(assign_invigilations() 의
+    hard["corridor_busy"] 가 이 함수의 결과를 읽어 교실감독 후보에서
+    제외하는 방식으로 연결됩니다).
+
+    아직 교실감독이 배정되지 않은 시점(이 함수가 먼저 실행된 경우)에는
+    아래 2번의 "이미 교실감독으로 배정된 교사" 집합이 비어 있는 게
+    정상입니다 — 역방향 호출(교실감독을 먼저 실행한 뒤 이 함수를 돌리는
+    경우)에도 안전하도록 그 검사는 그대로 남겨둡니다.
 
     동작:
       1. (교시, 학년)마다 그 교시 그 학년의 시험 과목 담당 교사 후보군을

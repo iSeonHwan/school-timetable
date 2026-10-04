@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QPushButton, QTableWidget,
     QTableWidgetItem, QFrame, QMessageBox, QHeaderView,
     QComboBox, QDateEdit, QTimeEdit, QCheckBox, QListWidget,
-    QListWidgetItem, QAbstractItemView,
+    QListWidgetItem, QAbstractItemView, QDialog, QTextEdit,
 )
 from PyQt6.QtCore import QDate, QTime, Qt
 from PyQt6.QtGui import QFont, QColor
@@ -44,9 +44,180 @@ from PyQt6.QtGui import QFont, QColor
 from database.connection import get_session
 from database.models import (
     AcademicTerm, Exam, ExamPeriod, InvigilationConstraint, Teacher,
-    Grade, SchoolClass, Subject, ExamRoom, ExamGradeDateExclusion,
+    Grade, SchoolClass, Subject, ExamRoom, ExamRoomStudent,
+    ExamGradeDateExclusion,
 )
 from core.exam_scheduler import rebuild_exam_periods
+
+
+class ExamRoomStudentDialog(QDialog):
+    """
+    혼합 시험실 수강 학생 명단 편집 다이얼로그 (2026-10-04 신규, 전부 선택 입력).
+
+    목적: ui/export/exam_export.py 의 export_room_assignment_notice_*
+    (학생 시험실 배치 안내문)를 자동 생성하려면 이 명단이 필요합니다.
+    명단을 하나도 등록하지 않아도 감독 자동 배정 자체는 전혀 영향받지
+    않으므로("완전히 선택"이라는 요구사항), 이 다이얼로그를 열지 않고
+    그냥 닫아도 아무 문제가 없습니다.
+
+    표로 한 줄씩 입력하는 것 외에, 학교 행정 시스템에서 뽑은 명단을
+    한꺼번에 붙여넣을 수 있는 텍스트 입력칸도 제공합니다 — 실제로는
+    "학번 이름" 수십~수백 줄을 손으로 하나씩 치기보다, 엑셀 등에서
+    복사해 붙여넣는 쪽이 훨씬 실용적이기 때문입니다.
+    """
+
+    def __init__(self, room: ExamRoom, parent=None):
+        super().__init__(parent)
+        self.room = room
+        self.setWindowTitle(f"학생 명단 — {room.label or f'시험실#{room.id}'}")
+        self.resize(560, 480)
+
+        # 이 시험실에 섞인 반만 "소속 반" 선택지로 제공합니다 — 전체 반
+        # 목록을 다 보여주면 관리자가 엉뚱한(이 시험실과 무관한) 반을
+        # 실수로 고를 수 있습니다.
+        try:
+            source_ids = json.loads(room.source_class_ids or "[]")
+        except (ValueError, TypeError):
+            source_ids = []
+        session = get_session()
+        try:
+            self._source_classes = (
+                session.query(SchoolClass).filter(SchoolClass.id.in_(source_ids)).all()
+                if source_ids else []
+            )
+            existing = (
+                session.query(ExamRoomStudent).filter_by(exam_room_id=room.id)
+                .order_by(ExamRoomStudent.student_number, ExamRoomStudent.student_name)
+                .all()
+            )
+            # 다이얼로그를 띄운 뒤 세션을 닫으므로, 표를 채울 때 필요한 값만
+            # 미리 튜플로 뽑아둡니다(세션 종료 후 지연 로딩(lazy load)
+            # 접근 시 DetachedInstanceError 가 나는 것을 방지).
+            existing_rows = [
+                (s.student_number or "", s.student_name or "", s.source_class_id)
+                for s in existing
+            ]
+        finally:
+            session.close()
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "학번을 기준 식별자로 쓰는 것을 권장합니다(이름은 완전 선택). "
+            "학번·이름이 둘 다 빈 줄은 저장 시 자동으로 제외됩니다.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;")
+        layout.addWidget(hint)
+
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["학번", "이름", "소속 반"])
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.tbl, stretch=1)
+        for number, name, class_id in existing_rows:
+            self._append_row(number, name, class_id)
+
+        row_btns = QHBoxLayout()
+        btn_add_row = QPushButton("행 추가")
+        btn_add_row.clicked.connect(lambda: self._append_row("", "", None))
+        row_btns.addWidget(btn_add_row)
+        btn_del_row = QPushButton("선택 행 삭제")
+        btn_del_row.clicked.connect(self._delete_selected_rows)
+        row_btns.addWidget(btn_del_row)
+        row_btns.addStretch()
+        layout.addLayout(row_btns)
+
+        layout.addWidget(QLabel(
+            "일괄 붙여넣기 — 한 줄에 \"학번 이름\" (이름은 생략 가능, 공백/탭/쉼표 구분):"))
+        self.txt_bulk = QTextEdit()
+        self.txt_bulk.setPlaceholderText("10101 김철수\n10102 이영희\n10103")
+        self.txt_bulk.setFixedHeight(80)
+        layout.addWidget(self.txt_bulk)
+        btn_bulk = QPushButton("붙여넣은 내용 표에 추가")
+        btn_bulk.clicked.connect(self._apply_bulk_paste)
+        layout.addWidget(btn_bulk)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("취소")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("저장")
+        btn_save.setStyleSheet(BTN_PRIMARY)
+        btn_save.clicked.connect(self._save)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def _append_row(self, number: str, name: str, class_id: int | None):
+        row = self.tbl.rowCount()
+        self.tbl.insertRow(row)
+        self.tbl.setItem(row, 0, QTableWidgetItem(number))
+        self.tbl.setItem(row, 1, QTableWidgetItem(name))
+        cmb = QComboBox()
+        cmb.addItem("(미지정)", None)
+        for sc in self._source_classes:
+            cmb.addItem(sc.display_name, sc.id)
+        idx = cmb.findData(class_id)
+        if idx >= 0:
+            cmb.setCurrentIndex(idx)
+        self.tbl.setCellWidget(row, 2, cmb)
+
+    def _delete_selected_rows(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.tbl.removeRow(row)
+
+    def _apply_bulk_paste(self):
+        """
+        붙여넣기 칸의 각 줄을 "학번 [이름]" 으로 해석해 표에 행을 추가합니다.
+
+        구분자를 공백·탭·쉼표 전부 허용하는 이유: 엑셀에서 복사하면
+        탭으로 구분되고, 사람이 손으로 치면 보통 공백이나 쉼표를 쓰므로,
+        어느 쪽을 붙여넣어도 그대로 동작하게 하기 위함입니다.
+        """
+        text = self.txt_bulk.toPlainText().strip()
+        if not text:
+            return
+        import re
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p for p in re.split(r"[\t,]+|\s+", line) if p]
+            number = parts[0] if parts else ""
+            name = " ".join(parts[1:]) if len(parts) > 1 else ""
+            self._append_row(number, name, None)
+        self.txt_bulk.clear()
+
+    def _save(self):
+        """
+        표 내용을 그대로 DB 에 반영합니다(기존 명단 전체 삭제 후 재생성).
+
+        "교체" 방식인 이유는 서버 API(PUT /exams/rooms/{id}/students,
+        ExamRoomStudentReplaceRequest)와 동일합니다 — 관리자 앱은 DB
+        직접 접근 구조라 그 API 를 호출하지 않지만, 정책은 그대로
+        맞춥니다(하나는 행 단위, 하나는 통째로 식이면 두 경로의 결과가
+        미묘하게 달라질 수 있음).
+        """
+        session = get_session()
+        try:
+            session.query(ExamRoomStudent).filter_by(exam_room_id=self.room.id).delete()
+            for row in range(self.tbl.rowCount()):
+                number = (self.tbl.item(row, 0).text() if self.tbl.item(row, 0) else "").strip()
+                name = (self.tbl.item(row, 1).text() if self.tbl.item(row, 1) else "").strip()
+                if not number and not name:
+                    continue   # 둘 다 빈 줄 — 조용히 건너뜀 (서버 정책과 동일)
+                cmb = self.tbl.cellWidget(row, 2)
+                class_id = cmb.currentData() if cmb else None
+                session.add(ExamRoomStudent(
+                    exam_room_id=self.room.id,
+                    student_number=number or None,
+                    student_name=name or None,
+                    source_class_id=class_id,
+                ))
+            session.commit()
+        finally:
+            session.close()
+        self.accept()
 
 # 공통 스타일 — 기존 설정 페이지(class_setup.py)와 동일한 톤을 유지합니다.
 HEADER_STYLE = "background:#1B4F8A; color:white; font-weight:bold; padding:6px;"
@@ -386,10 +557,21 @@ class ExamSetupWidget(QWidget):
         self.tbl_rooms.setMaximumHeight(120)
         f.addWidget(self.tbl_rooms)
 
+        room_btn_row = QHBoxLayout()
+        btn_students = QPushButton("학생 명단 관리 (선택)")
+        btn_students.setStyleSheet(BTN_PRIMARY)
+        btn_students.setToolTip(
+            "선택과목처럼 반 경계를 넘는 시험실의 수강 학생 명단을 등록합니다. "
+            "완전히 선택 입력이며, 등록하면 '학생 배치 안내문'을 자동 생성할 수 있습니다."
+        )
+        btn_students.clicked.connect(self._manage_room_students)
+        room_btn_row.addWidget(btn_students)
+
         btn_del = QPushButton("선택 시험실 삭제")
         btn_del.setStyleSheet(BTN_DANGER)
         btn_del.clicked.connect(self._delete_exam_room)
-        f.addWidget(btn_del)
+        room_btn_row.addWidget(btn_del)
+        f.addLayout(room_btn_row)
         return frame
 
     def _build_constraint_panel(self) -> QFrame:
@@ -998,6 +1180,30 @@ class ExamSetupWidget(QWidget):
                     str(r.student_count) if r.student_count is not None else "-"))
         finally:
             session.close()
+
+    def _manage_room_students(self):
+        """
+        선택한 혼합 시험실의 수강 학생 명단 편집 다이얼로그를 엽니다.
+
+        전부 선택 기능이므로, 시험실을 아직 선택하지 않았을 때 외에는
+        어떤 입력 검증도 여기서 막지 않습니다(다이얼로그 안에서 "둘 다
+        빈 줄은 저장 시 제외"만 처리) — 명단이 비어 있어도 저장하면
+        그냥 빈 명단으로 남을 뿐, 오류가 아닙니다.
+        """
+        row = self.tbl_rooms.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "안내", "명단을 등록할 시험실을 선택해 주세요.")
+            return
+        room_id = int(self.tbl_rooms.item(row, 0).text())
+        session = get_session()
+        try:
+            room = session.get(ExamRoom, room_id)
+            if room is None:
+                return
+            dialog = ExamRoomStudentDialog(room, parent=self)
+        finally:
+            session.close()
+        dialog.exec()
 
     def _delete_exam_room(self):
         """

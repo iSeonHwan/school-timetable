@@ -912,9 +912,53 @@ class ExamRoom(Base):
     period  = relationship("ExamPeriod", back_populates="rooms")
     grade   = relationship("Grade")
     subject = relationship("Subject")
+    # 수강 학생 명단 — 전부 선택 입력(ExamRoomStudent 참조). 시험실 삭제 시
+    # 명단도 함께 삭제 (고아 행이 남지 않도록)
+    students = relationship(
+        "ExamRoomStudent", back_populates="exam_room", cascade="all, delete-orphan"
+    )
 
     def __str__(self):
         return self.label or f"시험실#{self.id}"
+
+
+class ExamRoomStudent(Base):
+    """
+    혼합 시험실(ExamRoom) 수강 학생 명단 (2026-10-04 추가 — 전부 선택 입력).
+
+    목적: 선택과목처럼 같은 반 학생이 서로 다른 시험실로 흩어지는 경우,
+    시험 기간 중 "이 학생이 이 과목 시험을 어디서 보는지" 안내하는 문서를
+    자동 생성하기 위함(ui/export/exam_export.py 의
+    export_room_assignment_notice_pdf/csv). ExamRoom.student_count(머릿수)
+    만으로는 담임 제외·2인 1조 판단 등 감독 배정 자체는 충분히 동작하므로,
+    이 명단은 "안내문 생성"이라는 부가 목적에만 쓰이는 완전히 선택적인
+    데이터입니다 — 한 줄도 등록하지 않아도 시험 감독 자동 배정은 전혀
+    영향받지 않습니다.
+
+    student_number(학번)을 기본 식별자로 권장하는 이유: 이름은 동명이인
+    가능성·개인정보 민감도가 더 높아, 학번을 우선 식별자로 쓰고 이름은
+    화면·문서 표기 보조용으로만 완전히 선택 입력하게 합니다. 다만 둘 다
+    비어 있으면 그 줄이 "누구인지 전혀 알 수 없는" 무의미한 행이 되므로,
+    DB 자체는 둘 다 nullable 이지만 생성 API(server/api/exams.py) 에서
+    "최소 하나는 있어야 한다"를 검증합니다.
+
+    source_class_id 가 있으면(선택) 안내문에 "2-1 김철수(10203) → 세계사실"
+    처럼 원래 소속 반도 같이 표기할 수 있습니다 — 없어도 명단 자체는
+    동작하며, 그 경우 반 표기만 빠집니다.
+    """
+    __tablename__ = "exam_room_students"
+
+    id              = Column(Integer, primary_key=True)
+    exam_room_id    = Column(Integer, ForeignKey("exam_rooms.id"), nullable=False)
+    student_number  = Column(String(20), nullable=True)
+    student_name    = Column(String(30), nullable=True)
+    source_class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=True)
+
+    exam_room    = relationship("ExamRoom", back_populates="students")
+    source_class = relationship("SchoolClass")
+
+    def __str__(self):
+        return self.student_number or self.student_name or f"학생#{self.id}"
 
 
 class InvigilationAssignment(Base):

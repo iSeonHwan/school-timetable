@@ -160,6 +160,33 @@ def test_mixed_room_no_double_booking_with_class_slots(db, mixed_room_data):
     assert len(teacher_ids) == len(set(teacher_ids)), f"같은 교시 중복 배정: {teacher_ids}"
 
 
+def test_corridor_before_classroom_reserves_subject_teacher(db, mixed_room_data):
+    """
+    2026-10-04 순서 변경 검증: assign_corridor_duty() 를 먼저 실행하면,
+    복도감독으로 뽑힌 교사(T4 — 세계사 유일한 담당 교사)가 assign_
+    invigilations() 의 교실감독 후보에서 자동 제외된다.
+
+    T4 는 혼합 시험실(세계사)에는 담당 과목 금지로 이미 못 들어가지만,
+    같은 교시 3반(T3 담임) 교실감독에는 원래 "자유 교사"처럼 뽑힐 수
+    있었다 — 이게 바로 "남은 한계"로 지적됐던 충돌 지점이다. 복도감독을
+    먼저 확정해두면 그 경로가 하드 제약으로 막힌다.
+    """
+    data = mixed_room_data
+    ok, msg = assign_corridor_duty(db, data["exam"].id)
+    assert ok, msg
+    duty = db.query(CorridorDutyAssignment).filter_by(exam_id=data["exam"].id).first()
+    assert duty is not None
+    assert duty.teacher_id == data["teachers"]["t4"].id, "세계사 유일한 담당 교사(T4)가 복도감독으로 뽑혀야 함"
+
+    ok, msg = assign_invigilations(db, data["exam"].id)
+    assert ok, msg
+    all_slots = db.query(InvigilationAssignment).filter_by(exam_id=data["exam"].id).all()
+    assigned_ids = {a.teacher_id for a in all_slots}
+    assert data["teachers"]["t4"].id not in assigned_ids, (
+        "복도감독으로 이미 배정된 교사가 같은 교시 교실감독에도 배정됨"
+    )
+
+
 # ── 학년별 시험 미참여 날짜 (ExamGradeDateExclusion) ───────────────────────
 
 @pytest.fixture
