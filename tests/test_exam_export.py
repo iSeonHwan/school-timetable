@@ -337,8 +337,119 @@ def test_teacher_notice_markdown_includes_assignments_and_warning(db, tmp_path):
     assert "학생에게 배포하지 마세요" in text
     assert "[혼합] 세계사실" in text
 
-    # 감독 횟수 총평은 교실감독뿐 아니라 복도감독도 합산해야 함 —
-    # 최복도는 복도감독만 했으므로, 그 집계표에서도 빠지면 안 됨.
+    # 감독 횟수 총평: 교사 | 시험 정감독 | 시험 부감독 | 자습 정감독 |
+    # 자습 부감독 | 복도감독 | 합계. 박감독은 국어(공통 시험, pair 1)+
+    # 세계사(선택과목 혼합 시험실, pair 1) 모두 "시험 정감독"(2회), 최복도는
+    # 복도감독만 했으므로 그 열만 1회 — 합계는 각각 2회/1회로 같아야 한다.
     summary_section = text.split("## 교사별 감독 횟수")[1]
-    assert "박감독 | 2회" in summary_section
-    assert "최복도 | 1회" in summary_section
+    assert "| 박감독 | 2회 | 0회 | 0회 | 0회 | 2회 |" in summary_section
+    assert "| 최복도 | 0회 | 0회 | 0회 | 1회 | 1회 |" in summary_section
+
+
+def test_teacher_notice_markdown_separates_exam_and_self_study_duty(db, tmp_path):
+    """
+    같은 교사가 시험 감독(과목 있음)과 자습 감독(과목 없음)을 섞어서 맡으면,
+    감독 횟수 총평에서 두 횟수가 올바르게 나뉘어 집계된다.
+    """
+    from shared.models import AcademicTerm, ExamEntry
+    from ui.export.exam_export import export_teacher_invigilation_notice_markdown
+
+    term = AcademicTerm(year=2026, semester=2, is_current=True)
+    db.add(term); db.flush()
+    g1 = Grade(grade_number=1, name="1학년")
+    db.add(g1); db.flush()
+    c1 = SchoolClass(grade_id=g1.id, class_number=1, display_name="1-1", student_count=20)
+    db.add(c1); db.flush()
+    kor = Subject(name="국어", short_name="국")
+    db.add(kor); db.flush()
+    teacher = Teacher(name="정감독")
+    db.add(teacher); db.flush()
+
+    exam = Exam(
+        term_id=term.id, name="자습구분테스트", target_grade_ids=f"[{g1.id}]",
+        start_date=date(2026, 10, 5), end_date=date(2026, 10, 5),
+        first_period_start=time(9, 0), periods_per_day=2,
+        break_minutes=10, prep_minutes=5, exam_minutes=50, status="draft",
+    )
+    db.add(exam); db.flush()
+    p1 = ExamPeriod(exam_id=exam.id, exam_date=date(2026, 10, 5), period=1,
+                    start_time=time(9, 0), end_time=time(9, 50))
+    p2 = ExamPeriod(exam_id=exam.id, exam_date=date(2026, 10, 5), period=2,
+                    start_time=time(10, 0), end_time=time(10, 50))
+    db.add_all([p1, p2]); db.flush()
+
+    # 1교시: 국어 시험(과목 있음) → 시험 감독. 2교시: 과목 없음(자습) → 자습 감독.
+    db.add(ExamEntry(exam_id=exam.id, period_id=p1.id, grade_id=g1.id, subject_id=kor.id))
+    db.add(InvigilationAssignment(
+        exam_id=exam.id, period_id=p1.id, school_class_id=c1.id,
+        teacher_id=teacher.id, pair_index=1,
+    ))
+    db.add(InvigilationAssignment(
+        exam_id=exam.id, period_id=p2.id, school_class_id=c1.id,
+        teacher_id=teacher.id, pair_index=1,
+    ))
+    db.commit()
+
+    out = tmp_path / "notice.md"
+    export_teacher_invigilation_notice_markdown(db, exam, str(out))
+    text = out.read_text(encoding="utf-8")
+
+    # 본문 표에서도 자습 교시는 "자습"으로 표기돼야 함 (과목 없음을 "-" 로
+    # 뭉개지 않고 명시 — 학생 안내문의 "자습" 표기와 일관성 유지)
+    assert "| 1교시 | 1-1 | 국어 | 정감독 | - |" in text
+    assert "| 2교시 | 1-1 | 자습 | 정감독 | - |" in text
+
+    summary_section = text.split("## 교사별 감독 횟수")[1]
+    assert "| 정감독 | 1회 | 0회 | 1회 | 0회 | 2회 |" in summary_section
+
+
+def test_teacher_notice_markdown_separates_primary_and_secondary_duty(db, tmp_path):
+    """
+    2인 1조 시험실에서 정감독(pair_index=1)과 부감독(pair_index=2)을
+    맡은 교사가 감독 횟수 총평에서 서로 다른 열로 집계된다.
+    """
+    from shared.models import AcademicTerm, ExamEntry
+    from ui.export.exam_export import export_teacher_invigilation_notice_markdown
+
+    term = AcademicTerm(year=2026, semester=2, is_current=True)
+    db.add(term); db.flush()
+    g1 = Grade(grade_number=1, name="1학년")
+    db.add(g1); db.flush()
+    c1 = SchoolClass(grade_id=g1.id, class_number=1, display_name="1-1", student_count=30)
+    db.add(c1); db.flush()
+    kor = Subject(name="국어", short_name="국")
+    db.add(kor); db.flush()
+    primary = Teacher(name="정주임")
+    secondary = Teacher(name="부주임")
+    db.add_all([primary, secondary]); db.flush()
+
+    exam = Exam(
+        term_id=term.id, name="정부구분테스트", target_grade_ids=f"[{g1.id}]",
+        start_date=date(2026, 10, 5), end_date=date(2026, 10, 5),
+        first_period_start=time(9, 0), periods_per_day=1,
+        break_minutes=10, prep_minutes=5, exam_minutes=50,
+        pair_threshold=20, status="draft",
+    )
+    db.add(exam); db.flush()
+    p1 = ExamPeriod(exam_id=exam.id, exam_date=date(2026, 10, 5), period=1,
+                    start_time=time(9, 0), end_time=time(9, 50))
+    db.add(p1); db.flush()
+
+    db.add(ExamEntry(exam_id=exam.id, period_id=p1.id, grade_id=g1.id, subject_id=kor.id))
+    db.add(InvigilationAssignment(
+        exam_id=exam.id, period_id=p1.id, school_class_id=c1.id,
+        teacher_id=primary.id, pair_index=1,
+    ))
+    db.add(InvigilationAssignment(
+        exam_id=exam.id, period_id=p1.id, school_class_id=c1.id,
+        teacher_id=secondary.id, pair_index=2,
+    ))
+    db.commit()
+
+    out = tmp_path / "notice.md"
+    export_teacher_invigilation_notice_markdown(db, exam, str(out))
+    text = out.read_text(encoding="utf-8")
+
+    summary_section = text.split("## 교사별 감독 횟수")[1]
+    assert "| 정주임 | 1회 | 0회 | 0회 | 0회 | 1회 |" in summary_section
+    assert "| 부주임 | 0회 | 1회 | 0회 | 0회 | 1회 |" in summary_section

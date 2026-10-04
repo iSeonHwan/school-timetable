@@ -583,7 +583,32 @@ def export_teacher_invigilation_notice_markdown(session, exam: Exam, filepath: s
     잘못 설정해 학생용 출력에 감독표가 섞이는 사고가 날 수 있습니다.
 
     담는 내용: 날짜별 교실감독표(반/시험실·과목·1조·2조) + 복도감독표 +
-    교사별 감독 횟수 총평(형평성 확인용, export_invigilation_pdf 의 총평과 동일 취지).
+    교사별 감독 횟수 총평. 총평은 다음 기준으로 나눠 집계합니다:
+      1. "시험 감독" vs "자습감독" — 실제 학교 운영 사례(2학기 1회고사
+         시험감독표)에서도 "시험 누계"와 "자습 누계"를 분리해 썼고,
+         둘을 합친 숫자만으로는 "실제로 시험 감독(부정행위 감시 등
+         긴장도가 높은 업무)을 몇 번 했는지"를 알 수 없어 형평성
+         점검에 부족하기 때문입니다.
+      2. "정감독" vs "부감독" — 단, **시험 감독에만** 적용됩니다. 자습
+         감독은 정/부 구분을 두지 않습니다 — 실제로 자습 감독은 2인
+         1조로 운영하지 않으며("자습은 부감독이 없다"), 2인 1조는
+         시험 중 부정행위 방지를 위해 시험 감독에만 쓰는 제도이기
+         때문입니다. (core.exam_scheduler._build_slots() 는 현재
+         student_count 만으로 pair_total 을 정해 자습 교시라도
+         인원이 많으면 이론상 2번째 슬롯이 생길 수 있는데, 그 슬롯에
+         배정된 사람이 있어도 이 집계에서는 "정/부" 를 나누지 않고
+         그냥 "자습감독" 1 회로 합산합니다 — 자습에 부감독이라는
+         개념 자체가 없다는 실제 운영 기준을 보고서에서는 지키고,
+         스케줄러의 슬롯 생성 로직 자체를 바꾸는 것은 이 함수의
+         책임 밖이라 그대로 둔 것입니다.)
+
+    분류 기준:
+      - 교실/시험실 감독: 그 교시·학년(또는 시험실)에 실제 시험 과목이
+        있으면(ExamEntry 또는 ExamRoom.subject_id) "시험", 과목이 없으면
+        (자습 교시) "자습"으로 분류합니다. "시험"인 경우에만 pair_index==1
+        이면 "정감독", 2 면 "부감독"으로 더 나눕니다.
+      - 복도감독: 정/부·시험/자습 구분과 무관한 별도 열입니다 — pair_index
+        개념이 없는 1인 업무이기 때문입니다.
     """
     from database.models import ExamEntry, Subject, CorridorDutyAssignment, Grade
 
@@ -604,13 +629,34 @@ def export_teacher_invigilation_notice_markdown(session, exam: Exam, filepath: s
     subjects = {s.id: s for s in session.query(Subject)}
     entry_map = {(e.period_id, e.grade_id): subjects.get(e.subject_id) for e in entries}
 
+    def _slot_is_exam(kind: str, ref_id: int, period_id: int) -> bool:
+        """그 슬롯이 '시험 감독'인지(과목이 있는지) 판정 — '자습 감독'과의 분류 기준."""
+        if kind == "class":
+            cls = classes.get(ref_id)
+            if cls is None:
+                return False
+            return entry_map.get((period_id, cls.grade_id)) is not None
+        room = rooms.get(ref_id)
+        return room is not None and room.subject_id is not None
+
     # (period_id, kind, ref_id) → {pair_index: teacher_id or None}
     slot_map: dict = {}
-    duty_count: dict = {}
+    # 시험 감독만 정/부로 더 나눕니다 — 자습감독은 정/부 구분이 없습니다
+    # (함수 docstring의 분류 기준 설명 참조: "자습은 부감독이 없다").
+    exam_primary_count: dict = {}     # 시험 정감독
+    exam_secondary_count: dict = {}   # 시험 부감독
+    self_duty_count: dict = {}        # 자습감독 (정/부 구분 없음)
     for a in session.query(InvigilationAssignment).filter_by(exam_id=exam.id):
-        slot_map.setdefault(_slot_key(a), {})[a.pair_index] = a.teacher_id
-        if a.teacher_id is not None:
-            duty_count[a.teacher_id] = duty_count.get(a.teacher_id, 0) + 1
+        key = _slot_key(a)
+        slot_map.setdefault(key, {})[a.pair_index] = a.teacher_id
+        if a.teacher_id is None:
+            continue
+        if _slot_is_exam(key[1], key[2], key[0]):
+            bucket = exam_primary_count if a.pair_index == 1 else exam_secondary_count
+            bucket[a.teacher_id] = bucket.get(a.teacher_id, 0) + 1
+        else:
+            self_duty_count[a.teacher_id] = self_duty_count.get(a.teacher_id, 0) + 1
+    corridor_count: dict = {}   # 복도감독 — 아래 "복도감독" 섹션에서 채움
 
     def _teacher_name(tid):
         if tid is None:
@@ -647,14 +693,14 @@ def export_teacher_invigilation_notice_markdown(session, exam: Exam, filepath: s
                         continue
                     label = cls.display_name
                     subj = entry_map.get((p.id, cls.grade_id))
-                    subj_name = subj.name if subj else "-"
+                    subj_name = subj.name if subj else "자습"
                 else:
                     room = rooms.get(ref_id)
                     label = f"[혼합] {room.label}" if room and room.label else f"시험실#{ref_id}"
-                    subj_name = "-"
+                    subj_name = "자습"
                     if room is not None and room.subject_id is not None:
                         subj = subjects.get(room.subject_id)
-                        subj_name = subj.name if subj else "-"
+                        subj_name = subj.name if subj else "자습"
                 pair1 = _teacher_name(slots.get(1))
                 pair2 = _teacher_name(slots.get(2)) if 2 in slots else "-"
                 lines.append(f"| {p.period}교시 | {label} | {subj_name} | {pair1} | {pair2} |")
@@ -680,24 +726,32 @@ def export_teacher_invigilation_notice_markdown(session, exam: Exam, filepath: s
                 f"| {p.exam_date:%Y-%m-%d} | {p.period}교시 | "
                 f"{grade.name if grade else '-'} | {_teacher_name(c.teacher_id)} |"
             )
-            # 교실감독뿐 아니라 복도감독도 "감독 횟수"에 포함합니다 — 이
-            # 문서는 교실감독과 복도감독을 모두 보여주는 유일한 문서라서,
-            # 총평에서 복도감독만 쓴 교사(예: 최복도)가 빠지면 "이 교사는
-            # 이번 시험 기간에 하나도 안 했다"는 잘못된 인상을 줍니다.
-            # (ui/export/exam_export.py 의 다른 PDF/CSV 출력들은 교실감독
-            # 전용 문서라 복도감독을 세지 않는 것이 맞으므로 거기는 그대로
-            # 둡니다 — 이 함수에만 해당하는 보정입니다.)
+            # 복도감독은 정/부 구분이 없는 별도 집계입니다 — 함수 docstring의
+            # 분류 기준 설명 참조. 이 집계를 빼먹으면 복도감독만 한 교사
+            # (예: 최복도)가 총평에서 통째로 빠져 "이번 시험에 하나도
+            # 안 했다"는 잘못된 인상을 줍니다.
             if c.teacher_id is not None:
-                duty_count[c.teacher_id] = duty_count.get(c.teacher_id, 0) + 1
+                corridor_count[c.teacher_id] = corridor_count.get(c.teacher_id, 0) + 1
         lines.append("")
 
-    if duty_count:
-        lines.append("## 교사별 감독 횟수 (교실+복도 합산)")
+    all_teacher_ids = (
+        set(exam_primary_count) | set(exam_secondary_count)
+        | set(self_duty_count) | set(corridor_count)
+    )
+    if all_teacher_ids:
+        lines.append("## 교사별 감독 횟수")
         lines.append("")
-        lines.append("| 교사 | 횟수 |")
-        lines.append("|---|---|")
-        for tid, cnt in sorted(duty_count.items(), key=lambda kv: _teacher_name(kv[0])):
-            lines.append(f"| {_teacher_name(tid)} | {cnt}회 |")
+        lines.append("| 교사 | 시험 정감독 | 시험 부감독 | 자습감독 | 복도감독 | 합계 |")
+        lines.append("|---|---|---|---|---|---|")
+        for tid in sorted(all_teacher_ids, key=_teacher_name):
+            ep = exam_primary_count.get(tid, 0)
+            es = exam_secondary_count.get(tid, 0)
+            sd = self_duty_count.get(tid, 0)
+            cd = corridor_count.get(tid, 0)
+            total = ep + es + sd + cd
+            lines.append(
+                f"| {_teacher_name(tid)} | {ep}회 | {es}회 | {sd}회 | {cd}회 | {total}회 |"
+            )
         lines.append("")
 
     with open(filepath, "w", encoding="utf-8") as f:
